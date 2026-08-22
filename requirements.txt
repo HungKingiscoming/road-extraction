@@ -1,0 +1,8 @@
+# Kaggle GPU images already provide a CUDA-compatible torch + torchvision pair.
+# Do not reinstall them here: replacing Kaggle's pair can break CUDA support and
+# downloads several gigabytes. For a local machine, install PyTorch first from
+# https://pytorch.org/get-started/locally/ and then install this file.
+
+numpy>=1.24,<3
+Pillow>=9,<13
+tqdm>=4.65,<5
