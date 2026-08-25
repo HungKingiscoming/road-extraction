@@ -342,7 +342,7 @@ class SeparableConvBNAct(nn.Sequential):
 
 
 class RoadReconstructionDecoder(nn.Module):
-    """S8-to-S1 road decoder with S4/S2 skips and one centerline head."""
+    """S8-to-S1 decoder with one train-only S4 centerline head."""
 
     def __init__(
         self,
@@ -489,18 +489,18 @@ def binary_tversky_loss(
 
 
 class RoadSegCenterlineTverskyLoss(nn.Module):
-    """Main road CE+Dice and exactly one auxiliary centerline Tversky."""
+    """Compact road objective: weighted CE + Dice + centerline Tversky."""
 
     def __init__(
         self,
         road_class_weight: float = 2.0,
         main_dice_weight: float = 1.0,
-        aux_weight: float = 0.20,
+        aux_weight: float = 0.15,
         centerline_alpha: float = 0.30,
         centerline_beta: float = 0.70,
         skeleton_iterations: int = 8,
         centerline_dilation: int = 1,
-        fast_centerline_target: bool = True,
+        fast_centerline_target: bool = False,
     ) -> None:
         super().__init__()
         self.road_class_weight = float(road_class_weight)
@@ -528,39 +528,39 @@ class RoadSegCenterlineTverskyLoss(nn.Module):
         loss_main_dice = binary_dice_loss(road_probability, road_mask)
 
         with torch.no_grad():
-            target_dilation = self.centerline_dilation
+            # Skeletonize before reducing resolution.  This preserves narrow
+            # branches and intersections that can merge when the mask is
+            # max-pooled directly to S4.
             if self.fast_centerline_target:
-                # The auxiliary head lives at S4. Skeletonizing a 512x512 mask
-                # performs roughly 40 full-resolution pooling passes for the
-                # default settings. Pooling first preserves thin positives and
-                # cuts this auxiliary-target cost by well over an order of
-                # magnitude without changing the Tversky objective.
-                target_height, target_width = centerline_logits.shape[-2:]
-                scale = max(
-                    road_mask.shape[-2] / max(target_height, 1),
-                    road_mask.shape[-1] / max(target_width, 1),
+                intermediate_size = tuple(
+                    min(source, target_size * 2)
+                    for source, target_size in zip(
+                        road_mask.shape[-2:], centerline_logits.shape[-2:]
+                    )
                 )
                 skeleton_input = F.adaptive_max_pool2d(
-                    road_mask.float(), (target_height, target_width)
+                    road_mask.float(), intermediate_size
+                )
+                scale = max(
+                    road_mask.shape[-2] / max(intermediate_size[0], 1),
+                    road_mask.shape[-1] / max(intermediate_size[1], 1),
                 )
                 target_iterations = (
                     max(1, math.ceil(self.skeleton_iterations / scale))
                     if self.skeleton_iterations > 0
                     else 0
                 )
-                # The CLI dilation is expressed in input pixels. Convert it
-                # to the auxiliary grid so dilation=1 does not accidentally
-                # become a +/-4-pixel tolerance at S4.
                 target_dilation = max(
                     0, int(math.floor(self.centerline_dilation / scale + 0.5))
                 )
-                centerline_target = soft_skeletonize(
-                    skeleton_input, target_iterations
-                )
             else:
-                centerline_target = soft_skeletonize(
-                    road_mask.float(), self.skeleton_iterations
-                )
+                skeleton_input = road_mask.float()
+                target_iterations = self.skeleton_iterations
+                target_dilation = self.centerline_dilation
+
+            centerline_target = soft_skeletonize(
+                skeleton_input, target_iterations
+            )
             if target_dilation > 0:
                 kernel = 2 * target_dilation + 1
                 centerline_target = F.max_pool2d(
@@ -569,11 +569,9 @@ class RoadSegCenterlineTverskyLoss(nn.Module):
                     stride=1,
                     padding=target_dilation,
                 )
-            if centerline_target.shape[-2:] != centerline_logits.shape[-2:]:
-                # Full-resolution compatibility/ablation path.
-                centerline_target = F.adaptive_max_pool2d(
-                    centerline_target, centerline_logits.shape[-2:]
-                )
+            centerline_target = F.adaptive_max_pool2d(
+                centerline_target, centerline_logits.shape[-2:]
+            )
 
         loss_centerline = binary_tversky_loss(
             centerline_logits.float().sigmoid(),
