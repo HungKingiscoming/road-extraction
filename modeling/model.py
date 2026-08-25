@@ -184,8 +184,67 @@ class ProgressiveDAPPM(nn.Module):
         return self.activation(context + self.shortcut(x))
 
 
+class ControlledRoadFusion(nn.Module):
+    """Selectively inject semantic context into the persistent S8 detail path.
+
+    The two branches are normalized independently and concatenated so their
+    channel identities are not destroyed by an element-wise sum.  The detail
+    stream is the residual anchor; a small learnable per-channel scale lets
+    semantic information enter gradually.  One directional RepDepthwise block
+    refines the fused road geometry and is deployable as a single DW 5x5 conv.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        refine_blocks: int = 1,
+        deploy: bool = False,
+    ) -> None:
+        super().__init__()
+        self.detail_norm = nn.BatchNorm2d(channels)
+        self.semantic_norm = nn.BatchNorm2d(channels)
+        self.fusion_projection = ConvBNAct(
+            channels * 2,
+            channels,
+            1,
+            padding=0,
+            activation=False,
+        )
+        self.fusion_scale = nn.Parameter(
+            torch.full((1, channels, 1, 1), 0.10)
+        )
+        self.refinement = nn.Sequential(
+            *[
+                RepDepthwiseBlock(channels, deploy=deploy)
+                for _ in range(max(1, int(refine_blocks)))
+            ]
+        )
+        self.activation = nn.ReLU(inplace=True)
+
+    def forward(self, detail: Tensor, semantic: Tensor) -> Tensor:
+        if detail.shape[-2:] != semantic.shape[-2:]:
+            raise ValueError("Detail and semantic maps must be spatially aligned")
+        mixed = self.fusion_projection(
+            torch.cat(
+                (
+                    self.detail_norm(detail),
+                    self.semantic_norm(semantic),
+                ),
+                dim=1,
+            )
+        )
+        fused = self.activation(detail + self.fusion_scale * mixed)
+        return self.refinement(fused)
+
+
 class DualResolutionContext(nn.Module):
-    """Detail S8 and semantic S16/S32 branches with two bilateral fusions."""
+    """Persistent detail S8 stream plus semantic S16/S32 context stream.
+
+    There is one genuine bilateral interaction at S8 <-> S16.  S32 is used
+    only to gather broad DAPPM context; it returns to the saved S16 feature as
+    a gated residual before the final S8 fusion.  This avoids asking the S32
+    map to preserve thin roads and avoids a second heavy bilateral module.
+    """
 
     def __init__(
         self,
@@ -193,14 +252,14 @@ class DualResolutionContext(nn.Module):
         semantic_channels: int = 192,
         dappm_channels: int = 32,
         dappm_pool_sizes: Sequence[int] = (1, 2, 4, 8),
-        detail_blocks: Sequence[int] = (2, 2, 1),
+        detail_blocks: Sequence[int] = (2, 2),
         semantic_blocks: int = 2,
-        fusion_blocks: int = 2,
+        fusion_blocks: int = 1,
         deploy: bool = False,
     ) -> None:
         super().__init__()
-        if len(detail_blocks) != 3:
-            raise ValueError("detail_blocks must contain three stage depths")
+        if len(detail_blocks) != 2:
+            raise ValueError("detail_blocks must contain two stage depths")
         self.detail_projection = ConvBNAct(128, detail_channels, 1, padding=0)
         self.detail_stages = nn.ModuleList(
             _rep_stage(detail_channels, depth, deploy)
@@ -212,8 +271,7 @@ class DualResolutionContext(nn.Module):
             _rep_stage(semantic_channels, semantic_blocks, deploy),
         )
 
-        # S16 <-> S8. Only detail-to-semantic is zero-initialized, protecting
-        # the pretrained ResNet semantic representation at the start.
+        # The only bilateral exchange: semantic S16 <-> detail S8.
         self.semantic_to_detail_1 = ConvBNAct(
             256, detail_channels, 1, padding=0, activation=False
         )
@@ -223,42 +281,43 @@ class DualResolutionContext(nn.Module):
             3,
             stride=2,
             activation=False,
-            zero_init_bn=True,
         )
 
-        # S32 <-> S8. The detail path is downsampled twice to align exactly.
-        self.semantic_to_detail_2 = ConvBNAct(
-            semantic_channels,
-            detail_channels,
-            1,
-            padding=0,
-            activation=False,
+        # Cross-resolution exchange is residual and initially conservative.
+        # Semantic context is allowed to assist detail weakly, while the new
+        # detail branch cannot immediately disturb pretrained semantics.
+        self.semantic_to_detail_scale_1 = nn.Parameter(
+            torch.full((1, detail_channels, 1, 1), 0.10)
         )
-        intermediate_channels = max(128, detail_channels)
-        self.detail_to_semantic_2 = nn.Sequential(
-            ConvBNAct(
-                detail_channels,
-                intermediate_channels,
-                3,
-                stride=2,
-            ),
-            ConvBNAct(
-                intermediate_channels,
-                semantic_channels,
-                3,
-                stride=2,
-                activation=False,
-                zero_init_bn=True,
-            ),
+        self.detail_to_semantic_scale_1 = nn.Parameter(
+            torch.zeros(1, 256, 1, 1)
         )
 
         self.dappm = ProgressiveDAPPM(
             semantic_channels,
             dappm_channels,
-            detail_channels,
+            semantic_channels,
             pool_sizes=dappm_pool_sizes,
         )
-        self.final_refine = _rep_stage(detail_channels, fusion_blocks, deploy)
+        self.context_to_s16 = ConvBNAct(
+            semantic_channels,
+            256,
+            1,
+            padding=0,
+            activation=False,
+        )
+        self.context_scale = nn.Parameter(torch.full((1, 256, 1, 1), 0.10))
+        self.semantic_to_fusion = ConvBNAct(
+            256,
+            detail_channels,
+            1,
+            padding=0,
+        )
+        self.final_fusion = ControlledRoadFusion(
+            detail_channels,
+            refine_blocks=fusion_blocks,
+            deploy=deploy,
+        )
         self.activation = nn.ReLU(inplace=True)
 
     @staticmethod
@@ -272,33 +331,51 @@ class DualResolutionContext(nn.Module):
         detail_before, semantic_before = detail, semantic
         detail = self.activation(
             detail_before
-            + self._resize(
-                self.semantic_to_detail_1(semantic_before),
-                detail_before.shape[-2:],
-            )
+            + self.semantic_to_detail_scale_1
+            * self._resize(
+                    self.semantic_to_detail_1(semantic_before),
+                    detail_before.shape[-2:],
+                )
         )
         semantic = self.activation(
-            semantic_before + self.detail_to_semantic_1(detail_before)
+            semantic_before
+            + self.detail_to_semantic_scale_1
+            * self._resize(
+                self.detail_to_semantic_1(detail_before),
+                semantic_before.shape[-2:],
+            )
         )
 
+        # The detail stream continues at S8 after receiving semantic evidence.
         detail = self.detail_stages[1](detail)
-        semantic = self.semantic_downstage(semantic)
-        detail_before, semantic_before = detail, semantic
-        detail = self.activation(
-            detail_before
-            + self._resize(
-                self.semantic_to_detail_2(semantic_before),
-                detail_before.shape[-2:],
-            )
-        )
-        semantic = self.activation(
-            semantic_before + self.detail_to_semantic_2(detail_before)
-        )
 
-        detail = self.detail_stages[2](detail)
-        semantic = self.dappm(semantic)
-        semantic = self._resize(semantic, detail.shape[-2:])
-        return self.final_refine(detail + semantic)
+        # S32 gathers context, then returns to the saved S16 representation.
+        context_s32 = self.dappm(self.semantic_downstage(semantic))
+        context_s16 = self._resize(
+            self.context_to_s16(context_s32), semantic.shape[-2:]
+        )
+        semantic = self.activation(semantic + self.context_scale * context_s16)
+
+        semantic_s8 = self._resize(
+            self.semantic_to_fusion(semantic), detail.shape[-2:]
+        )
+        return self.final_fusion(detail, semantic_s8)
+
+    @torch.no_grad()
+    def gate_statistics(self) -> Dict[str, float]:
+        """Small diagnostics showing whether each information route is used."""
+        gates = {
+            "semantic_to_detail": self.semantic_to_detail_scale_1,
+            "detail_to_semantic": self.detail_to_semantic_scale_1,
+            "s32_context_to_s16": self.context_scale,
+            "semantic_to_final": self.final_fusion.fusion_scale,
+        }
+        statistics: Dict[str, float] = {}
+        for name, gate in gates.items():
+            detached = gate.detach().float()
+            statistics[f"{name}_abs_mean"] = float(detached.abs().mean().cpu())
+            statistics[f"{name}_abs_max"] = float(detached.abs().max().cpu())
+        return statistics
 
 
 class DualBranchRoadNet(nn.Module):
@@ -319,9 +396,9 @@ class DualBranchRoadNet(nn.Module):
         semantic_channels: int = 192,
         dappm_channels: int = 32,
         dappm_pool_sizes: Sequence[int] = (1, 2, 4, 8),
-        detail_blocks: Sequence[int] = (2, 2, 1),
+        detail_blocks: Sequence[int] = (2, 2),
         semantic_blocks: int = 2,
-        fusion_blocks: int = 2,
+        fusion_blocks: int = 1,
         decoder_s4_channels: int = 64,
         decoder_s2_channels: int = 32,
         full_channels: int = 24,
