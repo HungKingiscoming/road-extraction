@@ -14,7 +14,7 @@ from time import perf_counter
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
 from tqdm import tqdm
 
 import torch
@@ -364,8 +364,84 @@ def random_crop_pair(
     )
 
 
+def road_guided_occlusion(
+    image: np.ndarray,
+    mask: np.ndarray,
+    probability: float,
+    max_patches: int,
+) -> np.ndarray:
+    """Synthesize shadows/vegetation/vehicles over labeled road pixels.
+
+    The segmentation target is deliberately unchanged, forcing the semantic
+    branch to infer short hidden road segments from surrounding continuity.
+    Occluders are kept local so the augmentation does not create an impossible
+    reconstruction problem.
+    """
+    if probability <= 0.0 or not mask.any() or random.random() >= probability:
+        return image
+
+    road_y, road_x = np.nonzero(mask)
+    height, width = mask.shape
+    pil = Image.fromarray(np.ascontiguousarray(image))
+    number = random.randint(1, max(1, int(max_patches)))
+
+    for _ in range(number):
+        index = random.randrange(len(road_y))
+        center_y, center_x = int(road_y[index]), int(road_x[index])
+        short_side = random.randint(
+            max(3, round(min(height, width) * 0.006)),
+            max(5, round(min(height, width) * 0.018)),
+        )
+        long_side = random.randint(short_side, max(short_side + 1, short_side * 3))
+        if random.random() < 0.5:
+            box_width, box_height = long_side, short_side
+        else:
+            box_width, box_height = short_side, long_side
+        x0, y0 = center_x - box_width // 2, center_y - box_height // 2
+        x1, y1 = center_x + box_width // 2, center_y + box_height // 2
+
+        alpha = Image.new("L", (width, height), 0)
+        draw = ImageDraw.Draw(alpha)
+        if random.random() < 0.65:
+            draw.ellipse((x0, y0, x1, y1), fill=random.randint(125, 210))
+            alpha = alpha.filter(ImageFilter.GaussianBlur(random.uniform(1.0, 3.0)))
+        else:
+            draw.rounded_rectangle(
+                (x0, y0, x1, y1),
+                radius=max(1, short_side // 4),
+                fill=random.randint(150, 230),
+            )
+
+        mode = random.choice(("shadow", "shadow", "vegetation", "vehicle"))
+        if mode == "shadow":
+            factor = random.uniform(0.30, 0.65)
+            overlay = ImageEnhance.Brightness(pil).enhance(factor)
+        elif mode == "vegetation":
+            color = (
+                random.randint(25, 85),
+                random.randint(65, 135),
+                random.randint(20, 75),
+            )
+            overlay = Image.new("RGB", (width, height), color)
+        else:
+            value = random.randint(135, 235)
+            tint = random.randint(-15, 15)
+            color = (
+                int(np.clip(value + tint, 0, 255)),
+                value,
+                int(np.clip(value - tint, 0, 255)),
+            )
+            overlay = Image.new("RGB", (width, height), color)
+        pil = Image.composite(overlay, pil, alpha)
+
+    return np.asarray(pil, dtype=np.uint8).copy()
+
+
 def augment_pair(
-    image: np.ndarray, mask: np.ndarray
+    image: np.ndarray,
+    mask: np.ndarray,
+    road_occlusion_probability: float = 0.0,
+    road_occlusion_max_patches: int = 2,
 ) -> Tuple[np.ndarray, np.ndarray]:
     if random.random() < 0.5:
         image, mask = image[:, ::-1], mask[:, ::-1]
@@ -388,6 +464,12 @@ def augment_pair(
     if random.random() < 0.15:
         noise = np.random.normal(0.0, random.uniform(2.0, 7.0), image.shape)
         image = np.clip(image.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+    image = road_guided_occlusion(
+        image,
+        mask,
+        probability=road_occlusion_probability,
+        max_patches=road_occlusion_max_patches,
+    )
     return image, np.ascontiguousarray(mask)
 
 
@@ -405,12 +487,16 @@ class RoadCropDataset(Dataset):
         road_crop_probability: float,
         road_crop_min_fraction: float,
         road_crop_tries: int,
+        road_occlusion_probability: float,
+        road_occlusion_max_patches: int,
     ) -> None:
         self.pairs = list(pairs)
         self.crop_size = int(crop_size)
         self.road_crop_probability = float(road_crop_probability)
         self.road_crop_min_fraction = float(road_crop_min_fraction)
         self.road_crop_tries = int(road_crop_tries)
+        self.road_occlusion_probability = float(road_occlusion_probability)
+        self.road_occlusion_max_patches = int(road_occlusion_max_patches)
 
     def __len__(self) -> int:
         return len(self.pairs)
@@ -428,7 +514,12 @@ class RoadCropDataset(Dataset):
             self.road_crop_min_fraction,
             self.road_crop_tries,
         )
-        image, mask = augment_pair(image, mask)
+        image, mask = augment_pair(
+            image,
+            mask,
+            road_occlusion_probability=self.road_occlusion_probability,
+            road_occlusion_max_patches=self.road_occlusion_max_patches,
+        )
         return image_to_tensor(image), torch.from_numpy(mask).long()
 
 
@@ -520,6 +611,8 @@ def make_loaders(
         road_crop_probability=args.road_crop_probability,
         road_crop_min_fraction=args.road_crop_min_fraction,
         road_crop_tries=args.road_crop_tries,
+        road_occlusion_probability=args.road_occlusion_probability,
+        road_occlusion_max_patches=args.road_occlusion_max_patches,
     )
     val_dataset = RoadNativeValidationDataset(val_pairs)
     train_sampler: Optional[DistributedSampler]
@@ -753,15 +846,26 @@ def train_one_epoch(
     model.train()
     base_model = unwrap_model(model)
     base_model.enforce_frozen_norm_eval(args.freeze_encoder_bn)
-    if args.aux_warmup_epochs:
-        aux_scale = min(1.0, (epoch + 1) / args.aux_warmup_epochs)
+    if epoch < args.aux_start_epoch:
+        aux_scale = 0.0
+    elif args.aux_warmup_epochs:
+        aux_scale = min(
+            1.0,
+            (epoch - args.aux_start_epoch + 1) / args.aux_warmup_epochs,
+        )
     else:
         aux_scale = 1.0
     criterion.aux_weight = args.aux_weight * aux_scale
 
     meters = {
         name: RunningAverage()
-        for name in ("total", "main_ce", "main_dice", "aux", "road_fraction")
+        for name in (
+            "total",
+            "main_ce",
+            "main_dice",
+            "centerline",
+            "road_fraction",
+        )
     }
     optimizer.zero_grad(set_to_none=True)
     successful_updates, skipped_nonfinite = 0, 0
@@ -1221,9 +1325,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split_seed", type=int, default=3407)
 
     parser.add_argument("--crop_size", type=int, default=1024)
-    parser.add_argument("--road_crop_probability", type=float, default=0.70)
+    parser.add_argument("--road_crop_probability", type=float, default=0.60)
     parser.add_argument("--road_crop_min_fraction", type=float, default=0.002)
     parser.add_argument("--road_crop_tries", type=int, default=8)
+    parser.add_argument(
+        "--road_occlusion_probability",
+        type=float,
+        default=0.0,
+        help="Probability of placing short synthetic occluders on road pixels",
+    )
+    parser.add_argument(
+        "--road_occlusion_max_patches",
+        type=int,
+        default=2,
+    )
 
     parser.add_argument("--detail_channels", type=int, default=96)
     parser.add_argument("--semantic_channels", type=int, default=192)
@@ -1232,10 +1347,10 @@ def parse_args() -> argparse.Namespace:
         "--dappm_pool_sizes", nargs="+", type=int, default=(1, 2, 4, 8)
     )
     parser.add_argument(
-        "--detail_blocks", nargs=3, type=int, default=(2, 2, 1)
+        "--detail_blocks", nargs=2, type=int, default=(2, 2)
     )
     parser.add_argument("--semantic_blocks", type=int, default=2)
-    parser.add_argument("--fusion_blocks", type=int, default=2)
+    parser.add_argument("--fusion_blocks", type=int, default=1)
     parser.add_argument("--decoder_s4_channels", type=int, default=64)
     parser.add_argument("--decoder_s2_channels", type=int, default=32)
     parser.add_argument("--full_channels", type=int, default=24)
@@ -1280,7 +1395,13 @@ def parse_args() -> argparse.Namespace:
         help="Positive value skips the startup mask scan and uses this CE weight",
     )
     parser.add_argument("--main_dice_weight", type=float, default=1.0)
-    parser.add_argument("--aux_weight", type=float, default=0.20)
+    parser.add_argument("--aux_weight", type=float, default=0.15)
+    parser.add_argument(
+        "--aux_start_epoch",
+        type=int,
+        default=5,
+        help="Keep centerline supervision off before this zero-based epoch",
+    )
     parser.add_argument("--aux_warmup_epochs", type=int, default=5)
     parser.add_argument("--centerline_alpha", type=float, default=0.30)
     parser.add_argument("--centerline_beta", type=float, default=0.70)
@@ -1289,8 +1410,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fast_centerline_target",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Skeletonize directly at the auxiliary S4 resolution",
+        default=False,
+        help="Use an S2 intermediate skeleton target instead of full resolution",
     )
 
     parser.add_argument(
@@ -1384,6 +1505,15 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("centerline_alpha + centerline_beta must be positive")
     if args.centerline_dilation < 0:
         raise ValueError("centerline_dilation cannot be negative")
+    if not 0.0 <= args.road_occlusion_probability <= 1.0:
+        raise ValueError("road_occlusion_probability must be in [0, 1]")
+    if args.road_occlusion_max_patches < 1:
+        raise ValueError("road_occlusion_max_patches must be positive")
+    for name in ("aux_weight",):
+        if getattr(args, name) < 0.0:
+            raise ValueError(f"{name} cannot be negative")
+    if args.aux_start_epoch < 0 or args.aux_warmup_epochs < 0:
+        raise ValueError("Centerline start/warmup epochs cannot be negative")
     if args.progressive_unfreeze:
         epochs = (
             args.unfreeze_dual_branch_epoch,
@@ -1572,7 +1702,7 @@ def main() -> None:
     )
     rank_zero_print(
         f"shared ResNet34 to S8 | detail={args.detail_channels}ch S8 | "
-        f"semantic={args.semantic_channels}ch S32 | DAPPM="
+        f"semantic anchor=256ch S16 | context={args.semantic_channels}ch S32 | DAPPM="
         f"{args.dappm_channels}ch grids={tuple(args.dappm_pool_sizes)}"
     )
     rank_zero_print(
@@ -1585,12 +1715,13 @@ def main() -> None:
         f"road CE weight={road_weight:.3f}"
     )
     rank_zero_print(
-        "loss=weighted CE + Dice + auxiliary_weight*centerline Tversky "
-        f"(alpha={args.centerline_alpha:.2f}, beta={args.centerline_beta:.2f})"
+        "loss=weighted CE + Dice + centerline Tversky "
+        f"(centerline max={args.aux_weight:.2f}, starts epoch "
+        f"{args.aux_start_epoch + 1})"
     )
     rank_zero_print(
         "centerline target="
-        + ("fast S4 morphology" if args.fast_centerline_target else "full resolution")
+        + ("fast S2 morphology" if args.fast_centerline_target else "full resolution")
     )
     rank_zero_print(
         f"progressive_unfreeze={args.progressive_unfreeze} | "
@@ -1621,6 +1752,7 @@ def main() -> None:
             epoch,
             args,
         )
+        gate_metrics = unwrap_model(model).dual_branch.gate_statistics()
         validation_metrics: Dict[str, float] = {}
         should_validate = (epoch + 1) % args.val_interval == 0 or epoch + 1 == args.epochs
         if should_validate:
@@ -1638,7 +1770,12 @@ def main() -> None:
                 f"fixed@.50 road IoU={fixed:.5f} | "
                 f"calibrated road IoU={calibrated:.5f} "
                 f"@{validation_metrics['calibrated_threshold']:.2f} | "
-                f"F1={validation_metrics['fixed_f1']:.5f}"
+                f"F1={validation_metrics['fixed_f1']:.5f} | "
+                f"gates s2d/d2s/ctx/final="
+                f"{gate_metrics['semantic_to_detail_abs_mean']:.3f}/"
+                f"{gate_metrics['detail_to_semantic_abs_mean']:.3f}/"
+                f"{gate_metrics['s32_context_to_s16_abs_mean']:.3f}/"
+                f"{gate_metrics['semantic_to_final_abs_mean']:.3f}"
             )
             if is_main_process():
                 state = checkpoint_state(
@@ -1683,6 +1820,7 @@ def main() -> None:
                     "phase": phase_name,
                     "trainable_parameters": trainable,
                     "train": train_metrics,
+                    "fusion_gates": gate_metrics,
                     "validation": validation_metrics,
                 },
             )
