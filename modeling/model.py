@@ -1,4 +1,4 @@
-
+from __future__ import annotations
 
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence, Tuple
@@ -80,9 +80,9 @@ def _build_resnet34(
 
 
 class TruncatedResNet34(nn.Module):
-    """Return ResNet features C2/S2, C4/S4, C8/S8, and C16/S16."""
+    """Return pretrained ResNet features through layer4 (S32)."""
 
-    out_channels = (64, 64, 128, 256)
+    out_channels = (64, 64, 128, 256, 512)
 
     def __init__(
         self,
@@ -99,13 +99,17 @@ class TruncatedResNet34(nn.Module):
         self.layer1 = backbone.layer1
         self.layer2 = backbone.layer2
         self.layer3 = backbone.layer3
+        self.layer4 = backbone.layer4
 
-    def forward(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    def forward(
+        self, x: Tensor
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         stem_s2 = self.stem(x)
         shallow_s4 = self.layer1(self.maxpool(stem_s2))
         shared_s8 = self.layer2(shallow_s4)
         semantic_s16 = self.layer3(shared_s8)
-        return stem_s2, shallow_s4, shared_s8, semantic_s16
+        semantic_s32 = self.layer4(semantic_s16)
+        return stem_s2, shallow_s4, shared_s8, semantic_s16, semantic_s32
 
 
 def _rep_stage(channels: int, blocks: int, deploy: bool) -> nn.Sequential:
@@ -237,6 +241,81 @@ class ControlledRoadFusion(nn.Module):
         return self.refinement(fused)
 
 
+def _group_count(channels: int, maximum: int = 8) -> int:
+    """Largest small GroupNorm divisor, robust for small per-GPU batches."""
+    for groups in range(min(maximum, int(channels)), 0, -1):
+        if int(channels) % groups == 0:
+            return groups
+    return 1
+
+
+class ResidualSpatialGate(nn.Module):
+    """Predict one spatial modulation map for a residual exchange.
+
+    The gate sees independently normalized target and projected-source
+    features.  Its output is ``2 * sigmoid(logits)`` rather than a plain
+    sigmoid.  Zero-initializing the last convolution therefore starts the
+    gate at exactly one, making the spatial variant initially identical to
+    the original channel-scaled residual exchange.  Training can then
+    suppress clutter and strengthen road-shaped regions without an abrupt
+    change to the pretrained feature distribution.
+    """
+
+    def __init__(
+        self,
+        target_channels: int,
+        source_channels: int,
+        hidden_channels: int,
+    ) -> None:
+        super().__init__()
+        hidden_channels = max(8, int(hidden_channels))
+        self.target_norm = nn.GroupNorm(
+            _group_count(target_channels), target_channels
+        )
+        self.source_norm = nn.GroupNorm(
+            _group_count(source_channels), source_channels
+        )
+        self.mix = nn.Sequential(
+            nn.Conv2d(
+                target_channels + source_channels,
+                hidden_channels,
+                3,
+                padding=1,
+                bias=False,
+            ),
+            nn.GroupNorm(
+                _group_count(hidden_channels), hidden_channels
+            ),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden_channels, 1, 1, bias=True),
+        )
+        nn.init.zeros_(self.mix[-1].weight)
+        nn.init.zeros_(self.mix[-1].bias)
+        self.register_buffer(
+            "last_mean", torch.ones((), dtype=torch.float32), persistent=False
+        )
+        self.register_buffer(
+            "last_std", torch.zeros((), dtype=torch.float32), persistent=False
+        )
+
+    def forward(self, target: Tensor, projected_source: Tensor) -> Tensor:
+        if target.shape[-2:] != projected_source.shape[-2:]:
+            raise ValueError("Spatial-gate inputs must be spatially aligned")
+        logits = self.mix(
+            torch.cat(
+                (
+                    self.target_norm(target),
+                    self.source_norm(projected_source),
+                ),
+                dim=1,
+            )
+        )
+        gate = 2.0 * torch.sigmoid(logits)
+        self.last_mean.copy_(gate.detach().float().mean())
+        self.last_std.copy_(gate.detach().float().std(unbiased=False))
+        return gate
+
+
 class DualResolutionContext(nn.Module):
     """Persistent detail S8 stream plus semantic S16/S32 context stream.
 
@@ -255,20 +334,33 @@ class DualResolutionContext(nn.Module):
         detail_blocks: Sequence[int] = (2, 2),
         semantic_blocks: int = 2,
         fusion_blocks: int = 1,
+        bilateral_fusion: str = "spatial",
         deploy: bool = False,
     ) -> None:
         super().__init__()
         if len(detail_blocks) != 2:
             raise ValueError("detail_blocks must contain two stage depths")
+        bilateral_fusion = str(bilateral_fusion).lower()
+        if bilateral_fusion not in {"static", "spatial"}:
+            raise ValueError(
+                "bilateral_fusion must be either 'static' or 'spatial'"
+            )
+        self.bilateral_fusion = bilateral_fusion
         self.detail_projection = ConvBNAct(128, detail_channels, 1, padding=0)
         self.detail_stages = nn.ModuleList(
             _rep_stage(detail_channels, depth, deploy)
             for depth in detail_blocks
         )
 
-        self.semantic_downstage = nn.Sequential(
-            ConvBNAct(256, semantic_channels, 3, stride=2),
-            _rep_stage(semantic_channels, semantic_blocks, deploy),
+        # Pretrained ResNet layer4 now supplies S32 semantics.  A 1x1 adapter
+        # replaces the previous randomly initialized stride-2 semantic stage;
+        # ``semantic_blocks`` is retained in the public signature so old
+        # experiment commands remain valid, but no extra S32 blocks are added.
+        _ = semantic_blocks
+        # Keep the original checkpoint key name.  The epoch-230 baseline stores
+        # these tensors under ``dual_branch.semantic_projection.*``.
+        self.semantic_projection = ConvBNAct(
+            512, semantic_channels, 1, padding=0
         )
 
         # The only bilateral exchange: semantic S16 <-> detail S8.
@@ -292,6 +384,22 @@ class DualResolutionContext(nn.Module):
         self.detail_to_semantic_scale_1 = nn.Parameter(
             torch.zeros(1, 256, 1, 1)
         )
+        if bilateral_fusion == "spatial":
+            # Single-channel spatial gates are intentionally used instead of
+            # C-channel attention maps.  Road/background selection is mainly
+            # spatial, while the existing learned residual scales retain
+            # channel selectivity with far fewer parameters and less risk of
+            # overfitting Massachusetts.
+            self.semantic_to_detail_spatial_gate_1 = ResidualSpatialGate(
+                detail_channels,
+                detail_channels,
+                hidden_channels=max(16, min(64, detail_channels // 2)),
+            )
+            self.detail_to_semantic_spatial_gate_1 = ResidualSpatialGate(
+                256,
+                256,
+                hidden_channels=32,
+            )
 
         self.dappm = ProgressiveDAPPM(
             semantic_channels,
@@ -324,33 +432,55 @@ class DualResolutionContext(nn.Module):
     def _resize(x: Tensor, size: Tuple[int, int]) -> Tensor:
         return F.interpolate(x, size=size, mode="bilinear", align_corners=False)
 
-    def forward(self, shared_s8: Tensor, semantic_s16: Tensor) -> Tensor:
+    def forward(
+        self,
+        shared_s8: Tensor,
+        semantic_s16: Tensor,
+        semantic_s32: Tensor,
+    ) -> Tensor:
         detail = self.detail_stages[0](self.detail_projection(shared_s8))
         semantic = semantic_s16
 
         detail_before, semantic_before = detail, semantic
+        semantic_delta = self._resize(
+            self.semantic_to_detail_1(semantic_before),
+            detail_before.shape[-2:],
+        )
+        detail_delta = self._resize(
+            self.detail_to_semantic_1(detail_before),
+            semantic_before.shape[-2:],
+        )
+        if self.bilateral_fusion == "spatial":
+            semantic_delta = (
+                self.semantic_to_detail_spatial_gate_1(
+                    detail_before, semantic_delta
+                )
+                * semantic_delta
+            )
+            detail_delta = (
+                self.detail_to_semantic_spatial_gate_1(
+                    semantic_before, detail_delta
+                )
+                * detail_delta
+            )
         detail = self.activation(
             detail_before
             + self.semantic_to_detail_scale_1
-            * self._resize(
-                    self.semantic_to_detail_1(semantic_before),
-                    detail_before.shape[-2:],
-                )
+            * semantic_delta
         )
         semantic = self.activation(
             semantic_before
             + self.detail_to_semantic_scale_1
-            * self._resize(
-                self.detail_to_semantic_1(detail_before),
-                semantic_before.shape[-2:],
-            )
+            * detail_delta
         )
 
         # The detail stream continues at S8 after receiving semantic evidence.
         detail = self.detail_stages[1](detail)
 
         # S32 gathers context, then returns to the saved S16 representation.
-        context_s32 = self.dappm(self.semantic_downstage(semantic))
+        context_s32 = self.dappm(
+            self.semantic_projection(semantic_s32)
+        )
         context_s16 = self._resize(
             self.context_to_s16(context_s32), semantic.shape[-2:]
         )
@@ -375,6 +505,19 @@ class DualResolutionContext(nn.Module):
             detached = gate.detach().float()
             statistics[f"{name}_abs_mean"] = float(detached.abs().mean().cpu())
             statistics[f"{name}_abs_max"] = float(detached.abs().max().cpu())
+        if self.bilateral_fusion == "spatial":
+            statistics["semantic_to_detail_spatial_mean"] = float(
+                self.semantic_to_detail_spatial_gate_1.last_mean.cpu()
+            )
+            statistics["detail_to_semantic_spatial_mean"] = float(
+                self.detail_to_semantic_spatial_gate_1.last_mean.cpu()
+            )
+            statistics["semantic_to_detail_spatial_std"] = float(
+                self.semantic_to_detail_spatial_gate_1.last_std.cpu()
+            )
+            statistics["detail_to_semantic_spatial_std"] = float(
+                self.detail_to_semantic_spatial_gate_1.last_std.cpu()
+            )
         return statistics
 
 
@@ -384,7 +527,7 @@ class DualBranchRoadNet(nn.Module):
     PHASE_NAMES = {
         0: "head_only",
         1: "head_plus_dual_branch",
-        2: "plus_resnet_layer3",
+        2: "plus_resnet_layer3_layer4",
         3: "plus_resnet_layer2",
         4: "all_trainable",
     }
@@ -399,6 +542,7 @@ class DualBranchRoadNet(nn.Module):
         detail_blocks: Sequence[int] = (2, 2),
         semantic_blocks: int = 2,
         fusion_blocks: int = 1,
+        bilateral_fusion: str = "spatial",
         decoder_s4_channels: int = 64,
         decoder_s2_channels: int = 32,
         full_channels: int = 24,
@@ -420,6 +564,7 @@ class DualBranchRoadNet(nn.Module):
             detail_blocks=detail_blocks,
             semantic_blocks=semantic_blocks,
             fusion_blocks=fusion_blocks,
+            bilateral_fusion=bilateral_fusion,
             deploy=deploy,
         )
         self.decode_head = RoadReconstructionDecoder(
@@ -438,28 +583,30 @@ class DualBranchRoadNet(nn.Module):
     def forward(self, image: Tensor):
         output_size = image.shape[-2:]
         if not self.training or self.current_phase >= 4:
-            stem, shallow, shared, semantic = self.encoder(image)
+            stem, shallow, shared, semantic, context = self.encoder(image)
         elif self.current_phase <= 1:
             with torch.no_grad():
-                stem, shallow, shared, semantic = self.encoder(image)
+                stem, shallow, shared, semantic, context = self.encoder(image)
         elif self.current_phase == 2:
             with torch.no_grad():
                 stem = self.encoder.stem(image)
                 shallow = self.encoder.layer1(self.encoder.maxpool(stem))
                 shared = self.encoder.layer2(shallow)
             semantic = self.encoder.layer3(shared)
+            context = self.encoder.layer4(semantic)
         else:
             with torch.no_grad():
                 stem = self.encoder.stem(image)
                 shallow = self.encoder.layer1(self.encoder.maxpool(stem))
             shared = self.encoder.layer2(shallow)
             semantic = self.encoder.layer3(shared)
+            context = self.encoder.layer4(semantic)
 
         if self.training and self.current_phase == 0:
             with torch.no_grad():
-                fused = self.dual_branch(shared, semantic)
+                fused = self.dual_branch(shared, semantic, context)
         else:
-            fused = self.dual_branch(shared, semantic)
+            fused = self.dual_branch(shared, semantic, context)
         return self.decode_head(stem, shallow, fused, output_size)
 
     def set_trainable_phase(self, phase: int) -> str:
@@ -474,7 +621,7 @@ class DualBranchRoadNet(nn.Module):
         if self.current_phase == 0:
             frozen_modules.append(self.dual_branch)
         if self.current_phase <= 1:
-            frozen_modules.append(self.encoder.layer3)
+            frozen_modules.extend((self.encoder.layer3, self.encoder.layer4))
         if self.current_phase <= 2:
             frozen_modules.append(self.encoder.layer2)
         if self.current_phase <= 3:
@@ -494,7 +641,7 @@ class DualBranchRoadNet(nn.Module):
         if self.current_phase >= 1:
             modules.append(self.dual_branch)
         if self.current_phase >= 2:
-            modules.append(self.encoder.layer3)
+            modules.extend((self.encoder.layer3, self.encoder.layer4))
         if self.current_phase >= 3:
             modules.append(self.encoder.layer2)
         if self.current_phase >= 4:
@@ -510,7 +657,11 @@ class DualBranchRoadNet(nn.Module):
         return {
             "head": self.decode_head.parameters(),
             "dual_branch": self.dual_branch.parameters(),
-            "layer3": self.encoder.layer3.parameters(),
+            "layer3": (
+                parameter
+                for module in (self.encoder.layer3, self.encoder.layer4)
+                for parameter in module.parameters()
+            ),
             "layer2": self.encoder.layer2.parameters(),
             "early_encoder": (
                 parameter
@@ -536,6 +687,7 @@ def build_model(args) -> DualBranchRoadNet:
         detail_blocks=tuple(int(value) for value in args.detail_blocks),
         semantic_blocks=int(args.semantic_blocks),
         fusion_blocks=int(args.fusion_blocks),
+        bilateral_fusion=str(getattr(args, "bilateral_fusion", "static")),
         decoder_s4_channels=int(args.decoder_s4_channels),
         decoder_s2_channels=int(args.decoder_s2_channels),
         full_channels=int(args.full_channels),
