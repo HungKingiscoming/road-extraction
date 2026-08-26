@@ -1,12 +1,3 @@
-"""DualBranchRoadNet training aligned with RoadWeave's native-crop protocol.
-
-Training uses native 1024x1024 random crops and the RoadWeave augmentation
-recipe. Validation uses native-resolution 1024/512 sliding windows with Hann
-probability blending, matching the standalone native test script. Optimizer
-accumulation, cosine scheduling, EMA updates, DDP, and checkpointing retain the
-safer implementations from the original DualBranchRoadNet trainer.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -37,8 +28,8 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
-from modeling.decoder import RoadSegCenterlineTverskyLoss
-from modeling.model import DualBranchRoadNet, build_model
+from modeling_core.decoder import RoadSegCenterlineTverskyLoss
+from modeling_core.model import DualBranchRoadNet, build_model
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
@@ -245,16 +236,13 @@ def configure_dataset_paths(args: argparse.Namespace) -> None:
     if args.dataset == "massachusetts":
         root = Path(
             args.data_root
-            or "/kaggle/input/datasets/datnguyentien204/massachu/massachusets"
+            or "/kaggle/input/datasets/balraj98/"
+            "massachusetts-roads-dataset/tiff"
         )
-        args.train_image_dir = args.train_image_dir or str(root / "images")
-        args.train_mask_dir = args.train_mask_dir or str(root / "labels")
-        args.train_list = args.train_list or str(root / "train.txt")
-        args.test_list = args.test_list or str(root / "test.txt")
-        # This dataset has no validation txt. test.txt is used only as the
-        # evaluation loader; no random validation/test split is created.
-        args.val_image_dir = None
-        args.val_mask_dir = None
+        args.train_image_dir = args.train_image_dir or str(root / "train")
+        args.train_mask_dir = args.train_mask_dir or str(root / "train_labels")
+        args.val_image_dir = args.val_image_dir or str(root / "val")
+        args.val_mask_dir = args.val_mask_dir or str(root / "val_labels")
         return
 
     root = Path(
@@ -296,72 +284,6 @@ def read_binary_mask(path: Path) -> np.ndarray:
         mask = mask.max(axis=2)
     threshold = 0 if int(mask.max(initial=0)) <= 1 else 127
     return (mask > threshold).astype(np.uint8)
-
-
-def resize_pair(
-    image: np.ndarray, mask: np.ndarray, size: int
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Resize the complete image/mask pair to a square; never crop."""
-    image_pil = Image.fromarray(np.ascontiguousarray(image))
-    mask_pil = Image.fromarray((np.ascontiguousarray(mask) * 255).astype(np.uint8))
-    resampling = getattr(Image, "Resampling", Image)
-    image = np.asarray(
-        image_pil.resize((size, size), resample=resampling.BILINEAR),
-        dtype=np.uint8,
-    ).copy()
-    mask = np.asarray(
-        mask_pil.resize((size, size), resample=resampling.NEAREST),
-        dtype=np.uint8,
-    )
-    mask = (mask > 127).astype(np.uint8)
-    return image, np.ascontiguousarray(mask)
-
-
-def pairs_from_list(
-    image_dir: str | Path,
-    mask_dir: str | Path,
-    list_path: str | Path,
-) -> List[Tuple[Path, Path]]:
-    """Build image/mask pairs in exactly the order given by a txt split file.
-
-    Each non-empty line may contain either a filename/path or multiple columns;
-    the first column is treated as the image identifier. Extensions and common
-    suffixes such as _sat/_mask/_label are normalized through sample_key().
-    """
-    image_dir, mask_dir, list_path = Path(image_dir), Path(mask_dir), Path(list_path)
-    if not list_path.is_file():
-        raise FileNotFoundError(f"Split txt not found: {list_path}")
-
-    images = index_files(image_dir)
-    masks = index_files(mask_dir)
-    pairs: List[Tuple[Path, Path]] = []
-    missing: List[str] = []
-    seen: set[str] = set()
-
-    with list_path.open("r", encoding="utf-8-sig") as handle:
-        for raw_line in handle:
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            first_field = line.replace(",", " ").split()[0]
-            key = sample_key(Path(first_field))
-            if key in seen:
-                continue
-            seen.add(key)
-            image_path, mask_path = images.get(key), masks.get(key)
-            if image_path is None or mask_path is None:
-                missing.append(first_field)
-                continue
-            pairs.append((image_path, mask_path))
-
-    if missing:
-        raise RuntimeError(
-            f"{list_path} contains {len(missing)} samples that could not be paired. "
-            f"First missing entries: {missing[:10]}"
-        )
-    if not pairs:
-        raise RuntimeError(f"No image/mask pairs resolved from {list_path}")
-    return pairs
 
 
 def pad_pair_to_size(
@@ -558,47 +480,23 @@ def image_to_tensor(image: np.ndarray) -> Tensor:
 
 
 class RoadCropDataset(Dataset):
-    """Native-resolution random crops with the RoadWeave augmentation recipe.
-
-    Cropping is deliberately performed before normalization.  A 1024 crop
-    therefore preserves the original road width and matches 1024 sliding-window
-    validation/inference.
-    """
-
     def __init__(
         self,
         pairs: Sequence[Tuple[Path, Path]],
         crop_size: int,
+        road_crop_probability: float,
+        road_crop_min_fraction: float,
+        road_crop_tries: int,
         road_occlusion_probability: float,
         road_occlusion_max_patches: int,
     ) -> None:
         self.pairs = list(pairs)
         self.crop_size = int(crop_size)
+        self.road_crop_probability = float(road_crop_probability)
+        self.road_crop_min_fraction = float(road_crop_min_fraction)
+        self.road_crop_tries = int(road_crop_tries)
         self.road_occlusion_probability = float(road_occlusion_probability)
         self.road_occlusion_max_patches = int(road_occlusion_max_patches)
-        try:
-            import albumentations as A
-        except ImportError as error:
-            raise ImportError(
-                "Native-crop training requires albumentations, as does "
-                "RoadWeave. Install it with: pip install albumentations"
-            ) from error
-        self.crop = A.RandomCrop(self.crop_size, self.crop_size)
-        self.augmentation = A.Compose(
-            [
-                A.HorizontalFlip(p=0.5),
-                A.VerticalFlip(p=0.5),
-                A.Transpose(p=0.5),
-                A.RandomRotate90(p=0.5),
-                A.RandomBrightnessContrast(0.2, 0.2, p=0.5),
-                A.HueSaturationValue(10, 15, 10, p=0.3),
-                A.GaussNoise(std_range=(0.05, 0.15), p=0.2),
-                A.Normalize(
-                    mean=(0.485, 0.456, 0.406),
-                    std=(0.229, 0.224, 0.225),
-                ),
-            ]
-        )
 
     def __len__(self) -> int:
         return len(self.pairs)
@@ -608,28 +506,24 @@ class RoadCropDataset(Dataset):
         image, mask = read_rgb(image_path), read_binary_mask(mask_path)
         if image.shape[:2] != mask.shape:
             raise RuntimeError(f"Shape mismatch: {image_path} vs {mask_path}")
-
-        image, mask = pad_pair_to_size(image, mask, self.crop_size)
-        cropped = self.crop(image=image, mask=mask)
-        image = np.ascontiguousarray(cropped["image"])
-        mask = np.ascontiguousarray(cropped["mask"])
-        image = road_guided_occlusion(
+        image, mask = random_crop_pair(
             image,
             mask,
-            probability=self.road_occlusion_probability,
-            max_patches=self.road_occlusion_max_patches,
+            self.crop_size,
+            self.road_crop_probability,
+            self.road_crop_min_fraction,
+            self.road_crop_tries,
         )
-        transformed = self.augmentation(image=image, mask=mask)
-        x = torch.from_numpy(
-            np.ascontiguousarray(transformed["image"].transpose(2, 0, 1))
-        ).float()
-        y = torch.from_numpy(np.ascontiguousarray(transformed["mask"])).long()
-        return x, y
+        image, mask = augment_pair(
+            image,
+            mask,
+            road_occlusion_probability=self.road_occlusion_probability,
+            road_occlusion_max_patches=self.road_occlusion_max_patches,
+        )
+        return image_to_tensor(image), torch.from_numpy(mask).long()
 
 
-class RoadNativeEvaluationDataset(Dataset):
-    """Return untouched native images for sliding-window validation."""
-
+class RoadNativeValidationDataset(Dataset):
     def __init__(self, pairs: Sequence[Tuple[Path, Path]]) -> None:
         self.pairs = list(pairs)
 
@@ -651,28 +545,6 @@ def resolve_splits(
     List[Tuple[Path, Path]],
     List[Tuple[Path, Path]],
 ]:
-    if args.dataset == "massachusetts":
-        train_pairs = pairs_from_list(
-            args.train_image_dir, args.train_mask_dir, args.train_list
-        )
-        test_pairs = pairs_from_list(
-            args.train_image_dir, args.train_mask_dir, args.test_list
-        )
-        train_keys = {sample_key(image) for image, _ in train_pairs}
-        test_keys = {sample_key(image) for image, _ in test_pairs}
-        overlap = train_keys & test_keys
-        if overlap:
-            raise RuntimeError(
-                f"train.txt and test.txt overlap on {len(overlap)} samples; "
-                f"examples={sorted(overlap)[:10]}"
-            )
-        rank_zero_print(
-            f"TXT split: train={len(train_pairs)}, val=0, test={len(test_pairs)} | "
-            f"train.txt={args.train_list} | test.txt={args.test_list}"
-        )
-        return train_pairs, [], test_pairs
-
-    # Keep the previous DeepGlobe behavior unchanged.
     all_pairs = build_pairs(args.train_image_dir, args.train_mask_dir)
     if args.val_image_dir and args.val_mask_dir:
         val_images, val_masks = Path(args.val_image_dir), Path(args.val_mask_dir)
@@ -736,23 +608,13 @@ def make_loaders(
     train_dataset = RoadCropDataset(
         train_pairs,
         crop_size=args.crop_size,
+        road_crop_probability=args.road_crop_probability,
+        road_crop_min_fraction=args.road_crop_min_fraction,
+        road_crop_tries=args.road_crop_tries,
         road_occlusion_probability=args.road_occlusion_probability,
         road_occlusion_max_patches=args.road_occlusion_max_patches,
     )
-
-    evaluation_pairs = val_pairs if val_pairs else test_pairs
-    if not evaluation_pairs:
-        raise RuntimeError("No validation/test pairs are available for evaluation")
-    if not val_pairs and test_pairs:
-        total_test = len(evaluation_pairs)
-        evaluation_pairs = evaluation_pairs[: min(args.test_eval_images, total_test)]
-        rank_zero_print(
-            f"No validation split: using first {len(evaluation_pairs)}/{total_test} "
-            f"images from test.txt every {args.val_interval} epochs; "
-            "best.pt is selected by fixed@0.50 F1."
-        )
-    val_dataset = RoadNativeEvaluationDataset(evaluation_pairs)
-
+    val_dataset = RoadNativeValidationDataset(val_pairs)
     train_sampler: Optional[DistributedSampler]
     if args.distributed:
         train_sampler = DistributedSampler(
@@ -1123,7 +985,7 @@ def hann_weight(tile_size: int, device: torch.device) -> Tensor:
 
 
 @torch.inference_mode()
-def sliding_window_probability(
+def sliding_window_logits(
     model: nn.Module,
     image: Tensor,
     tile_size: int,
@@ -1143,7 +1005,7 @@ def sliding_window_probability(
     ys = sliding_positions(height, tile_size, overlap)
     xs = sliding_positions(width, tile_size, overlap)
     coordinates = [(y, x) for y in ys for x in xs]
-    accumulator = torch.zeros((1, 1, height, width), device=device)
+    accumulator = torch.zeros((1, 2, height, width), device=device)
     normalizer = torch.zeros((1, 1, height, width), device=device)
     weight = hann_weight(tile_size, device)
     for start in range(0, len(coordinates), tile_batch_size):
@@ -1159,13 +1021,12 @@ def sliding_window_probability(
             device_type=device.type, dtype=torch.float16, enabled=use_amp
         ):
             logits = model(tiles)
-            if isinstance(logits, tuple):
-                logits = logits[-1]
-            probabilities = logits.softmax(dim=1)[:, 1:2]
-        probabilities = probabilities.float()
+        if isinstance(logits, tuple):
+            logits = logits[-1]
+        logits = logits.float()
         for index, (y, x) in enumerate(batch_coordinates):
             accumulator[:, :, y : y + tile_size, x : x + tile_size] += (
-                probabilities[index : index + 1] * weight
+                logits[index : index + 1] * weight
             )
             normalizer[:, :, y : y + tile_size, x : x + tile_size] += weight
     return (accumulator / normalizer.clamp_min_(1e-6))[
@@ -1250,17 +1111,14 @@ def validate(
     negative_hist = torch.zeros(bins, dtype=torch.int64, device=device)
     totals = torch.zeros(10, dtype=torch.float64, device=device)
     progress = tqdm(
-        loader,
-        desc="Native sliding evaluation",
-        leave=False,
-        disable=not is_main_process(),
+        loader, desc="Native validation", leave=False, disable=not is_main_process()
     )
     for images, masks, _ in progress:
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
         if args.channels_last:
             images = images.contiguous(memory_format=torch.channels_last)
-        probability = sliding_window_probability(
+        logits = sliding_window_logits(
             model,
             images,
             args.val_tile_size,
@@ -1269,7 +1127,7 @@ def validate(
             device,
             args.use_amp,
         )
-        probability = probability[:, 0]
+        probability = logits.softmax(dim=1)[:, 1]
         target = masks > 0
         prediction = probability >= 0.5
         tp, fp, fn, tn = confusion_counts(prediction, target)
@@ -1326,7 +1184,6 @@ def resolve_checkpoint_path(path: str | Path) -> Path:
         return path
     if path.is_dir():
         preferred = (
-            "best.pt",
             "best_fixed_road_iou.pt",
             "best_calibrated_road_iou.pt",
             "last.pt",
@@ -1456,8 +1313,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data_root", default=None)
     parser.add_argument("--train_image_dir", default=None)
     parser.add_argument("--train_mask_dir", default=None)
-    parser.add_argument("--train_list", default=None)
-    parser.add_argument("--test_list", default=None)
     parser.add_argument("--val_image_dir", default=None)
     parser.add_argument("--val_mask_dir", default=None)
     parser.add_argument("--val_ratio", type=float, default=0.10)
@@ -1469,22 +1324,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--split_seed", type=int, default=3407)
 
-    parser.add_argument(
-        "--crop_size",
-        "--resize_size",
-        dest="crop_size",
-        type=int,
-        default=1024,
-        help=(
-            "Native random-crop size used for training; --resize_size is kept "
-            "only as a legacy alias"
-        ),
-    )
-    # Accepted for compatibility with older commands. Uniform random cropping
-    # is intentional here because it reproduces RoadWeave's sampling protocol.
-    parser.add_argument("--road_crop_probability", type=float, default=0.0, help=argparse.SUPPRESS)
-    parser.add_argument("--road_crop_min_fraction", type=float, default=0.0, help=argparse.SUPPRESS)
-    parser.add_argument("--road_crop_tries", type=int, default=1, help=argparse.SUPPRESS)
+    parser.add_argument("--crop_size", type=int, default=1024)
+    parser.add_argument("--road_crop_probability", type=float, default=0.60)
+    parser.add_argument("--road_crop_min_fraction", type=float, default=0.002)
+    parser.add_argument("--road_crop_tries", type=int, default=8)
     parser.add_argument(
         "--road_occlusion_probability",
         type=float,
@@ -1538,10 +1381,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backbone_lr_factor", type=float, default=0.20)
     parser.add_argument("--early_encoder_lr_factor", type=float, default=0.10)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--warmup_epochs", type=int, default=3)
+    parser.add_argument("--warmup_epochs", type=int, default=5)
     parser.add_argument("--warmup_start_factor", type=float, default=0.10)
-    parser.add_argument("--min_lr_ratio", type=float, default=0.0)
-    parser.add_argument("--grad_clip", type=float, default=5.0)
+    parser.add_argument("--min_lr_ratio", type=float, default=0.02)
+    parser.add_argument("--grad_clip", type=float, default=3.0)
     parser.add_argument("--ema_decay", type=float, default=0.999)
 
     parser.add_argument("--road_weight_cap", type=float, default=2.0)
@@ -1598,15 +1441,9 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--val_tile_size", type=int, default=1024)
-    parser.add_argument("--val_overlap", type=int, default=512)
+    parser.add_argument("--val_overlap", type=int, default=256)
     parser.add_argument("--val_tile_batch_size", type=int, default=2)
-    parser.add_argument("--val_interval", type=int, default=10)
-    parser.add_argument(
-        "--test_eval_images",
-        type=int,
-        default=61,
-        help="For Massachusetts without val, evaluate only the first N test.txt images",
-    )
+    parser.add_argument("--val_interval", type=int, default=1)
     parser.add_argument("--threshold_min", type=float, default=0.20)
     parser.add_argument("--threshold_max", type=float, default=0.80)
     parser.add_argument("--threshold_step", type=float, default=0.02)
@@ -1632,13 +1469,8 @@ def parse_args() -> argparse.Namespace:
 def validate_args(args: argparse.Namespace) -> None:
     if args.crop_size < 64 or args.crop_size % 16:
         raise ValueError("crop_size must be >=64 and divisible by 16")
-    if args.dataset == "massachusetts":
-        if not args.train_list or not args.test_list:
-            raise ValueError("Massachusetts requires --train_list and --test_list")
     if args.val_overlap < 0 or args.val_overlap >= args.val_tile_size:
         raise ValueError("val_overlap must satisfy 0 <= overlap < tile size")
-    if args.test_eval_images < 1:
-        raise ValueError("test_eval_images must be >= 1")
     if args.batch_size < 1 or args.accumulation_steps < 1:
         raise ValueError("batch_size and accumulation_steps must be positive")
     if args.fixed_road_weight is not None and args.fixed_road_weight <= 0.0:
@@ -1839,17 +1671,12 @@ def main() -> None:
         fast_centerline_target=args.fast_centerline_target,
     ).to(device)
 
-    start_epoch, best_fixed, best_calibrated, best_f1 = 0, -1.0, -1.0, -1.0
+    start_epoch, best_fixed, best_calibrated = 0, -1.0, -1.0
     if args.resume:
         start_epoch, best_fixed, best_calibrated, loaded = resume_training(
             model, ema, optimizer, scheduler, scaler, args.resume, device
         )
-        _, resume_checkpoint = safe_torch_load(args.resume, device)
-        if isinstance(resume_checkpoint, dict):
-            best_f1 = float(resume_checkpoint.get("best_f1", -1.0))
-        rank_zero_print(
-            f"Resumed exact training state from {loaded} | best F1={best_f1:.5f}"
-        )
+        rank_zero_print(f"Resumed exact training state from {loaded}")
 
     total_parameters = sum(parameter.numel() for parameter in model.parameters())
     if distributed:
@@ -1870,7 +1697,7 @@ def main() -> None:
         f"AMP={args.use_amp} | channels_last={args.channels_last}"
     )
     rank_zero_print(
-        f"native random crop={args.crop_size} | batch/GPU={args.batch_size} | "
+        f"crop={args.crop_size} | batch/GPU={args.batch_size} | "
         f"accumulation={args.accumulation_steps} | effective batch={effective_batch}"
     )
     rank_zero_print(
@@ -1927,13 +1754,7 @@ def main() -> None:
         )
         gate_metrics = unwrap_model(model).dual_branch.gate_statistics()
         validation_metrics: Dict[str, float] = {}
-        # Massachusetts has no val.txt in this setup. Reproduce the requested
-        # protocol: evaluate the first N test.txt samples every val_interval epochs.
-        has_validation_split = bool(val_pairs)
-        should_validate = (
-            (epoch + 1) % args.val_interval == 0
-            or epoch + 1 == args.epochs
-        )
+        should_validate = (epoch + 1) % args.val_interval == 0 or epoch + 1 == args.epochs
         if should_validate:
             if distributed_active():
                 for tensor in ema.module.state_dict().values():
@@ -1941,18 +1762,12 @@ def main() -> None:
             validation_metrics = validate(ema.module, val_loader, device, args)
             fixed = validation_metrics["fixed_road_iou"]
             calibrated = validation_metrics["calibrated_road_iou"]
-            fixed_f1 = validation_metrics["fixed_f1"]
-            fixed_improved = fixed > best_fixed
-            calibrated_improved = calibrated > best_calibrated
-            f1_improved = fixed_f1 > best_f1
-            best_fixed = max(best_fixed, fixed)
-            best_calibrated = max(best_calibrated, calibrated)
-            best_f1 = max(best_f1, fixed_f1)
-            evaluation_name = "validation" if has_validation_split else f"test_first_{len(val_loader.dataset)}"
+            fixed_improved, calibrated_improved = fixed > best_fixed, calibrated > best_calibrated
+            best_fixed, best_calibrated = max(best_fixed, fixed), max(best_calibrated, calibrated)
             rank_zero_print(
                 f"train loss={train_metrics['total']:.5f} | "
                 f"throughput={train_metrics['images_per_second']:.1f} img/s | "
-                f"{evaluation_name} fixed@.50 road IoU={fixed:.5f} | "
+                f"fixed@.50 road IoU={fixed:.5f} | "
                 f"calibrated road IoU={calibrated:.5f} "
                 f"@{validation_metrics['calibrated_threshold']:.2f} | "
                 f"F1={validation_metrics['fixed_f1']:.5f} | "
@@ -1975,12 +1790,6 @@ def main() -> None:
                     validation_metrics,
                     args,
                 )
-                state["best_f1"] = best_f1
-                if f1_improved:
-                    atomic_torch_save(state, save_dir / "best.pt")
-                    rank_zero_print(
-                        f"New best fixed@0.50 F1={best_f1:.5f}; saved best.pt"
-                    )
                 if fixed_improved:
                     atomic_torch_save(state, save_dir / "best_fixed_road_iou.pt")
                 if calibrated_improved:
@@ -2001,7 +1810,6 @@ def main() -> None:
                 validation_metrics,
                 args,
             )
-            state["best_f1"] = best_f1
             atomic_torch_save(state, save_dir / "last.pt")
 
         if is_main_process():
