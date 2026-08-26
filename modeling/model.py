@@ -1,4 +1,4 @@
-from __future__ import annotations
+
 
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence, Tuple
@@ -80,7 +80,7 @@ def _build_resnet34(
 
 
 class TruncatedResNet34(nn.Module):
-    """Return features through S16 and expose pretrained layer4 for S32."""
+    """Return ResNet features C2/S2, C4/S4, C8/S8, and C16/S16."""
 
     out_channels = (64, 64, 128, 256)
 
@@ -99,9 +99,6 @@ class TruncatedResNet34(nn.Module):
         self.layer1 = backbone.layer1
         self.layer2 = backbone.layer2
         self.layer3 = backbone.layer3
-        # Kept as an encoder stage so progressive unfreezing and differential
-        # encoder learning rates also apply to the pretrained S32 semantics.
-        self.layer4 = backbone.layer4
 
     def forward(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         stem_s2 = self.stem(x)
@@ -263,21 +260,15 @@ class DualResolutionContext(nn.Module):
         super().__init__()
         if len(detail_blocks) != 2:
             raise ValueError("detail_blocks must contain two stage depths")
-        # Retained in the public constructor for compatibility with existing
-        # command lines.  The randomly initialized semantic RepVGG downstage
-        # has been replaced by pretrained ResNet-34 layer4.
-        del semantic_blocks
         self.detail_projection = ConvBNAct(128, detail_channels, 1, padding=0)
         self.detail_stages = nn.ModuleList(
             _rep_stage(detail_channels, depth, deploy)
             for depth in detail_blocks
         )
 
-        self.semantic_projection = ConvBNAct(
-            512,
-            semantic_channels,
-            1,
-            padding=0,
+        self.semantic_downstage = nn.Sequential(
+            ConvBNAct(256, semantic_channels, 3, stride=2),
+            _rep_stage(semantic_channels, semantic_blocks, deploy),
         )
 
         # The only bilateral exchange: semantic S16 <-> detail S8.
@@ -328,81 +319,42 @@ class DualResolutionContext(nn.Module):
             deploy=deploy,
         )
         self.activation = nn.ReLU(inplace=True)
-        self._last_contribution_ratios: Dict[str, Tensor] = {}
 
     @staticmethod
     def _resize(x: Tensor, size: Tuple[int, int]) -> Tensor:
         return F.interpolate(x, size=size, mode="bilinear", align_corners=False)
 
-    @staticmethod
-    @torch.no_grad()
-    def _contribution_ratio(update: Tensor, anchor: Tensor) -> Tensor:
-        return update.detach().abs().mean() / (
-            anchor.detach().abs().mean() + 1.0e-6
-        )
-
-    def forward(
-        self,
-        shared_s8: Tensor,
-        semantic_s16: Tensor,
-        semantic_layer4: nn.Module,
-        freeze_semantic_layer4: bool = False,
-    ) -> Tensor:
+    def forward(self, shared_s8: Tensor, semantic_s16: Tensor) -> Tensor:
         detail = self.detail_stages[0](self.detail_projection(shared_s8))
         semantic = semantic_s16
 
         detail_before, semantic_before = detail, semantic
-        semantic_to_detail_update = (
-            self.semantic_to_detail_scale_1
+        detail = self.activation(
+            detail_before
+            + self.semantic_to_detail_scale_1
             * self._resize(
-                self.semantic_to_detail_1(semantic_before),
-                detail_before.shape[-2:],
-            )
+                    self.semantic_to_detail_1(semantic_before),
+                    detail_before.shape[-2:],
+                )
         )
-        detail = self.activation(detail_before + semantic_to_detail_update)
-
-        detail_to_semantic_update = (
-            self.detail_to_semantic_scale_1
+        semantic = self.activation(
+            semantic_before
+            + self.detail_to_semantic_scale_1
             * self._resize(
                 self.detail_to_semantic_1(detail_before),
                 semantic_before.shape[-2:],
             )
         )
-        semantic = self.activation(semantic_before + detail_to_semantic_update)
 
         # The detail stream continues at S8 after receiving semantic evidence.
         detail = self.detail_stages[1](detail)
 
-        # Pretrained ResNet-34 layer4 supplies S32 semantics.  In the frozen
-        # phases it must run without autograd even though the surrounding
-        # newly initialized context branch remains trainable.
-        if self.training and freeze_semantic_layer4:
-            with torch.no_grad():
-                semantic_s32 = semantic_layer4(semantic)
-        else:
-            semantic_s32 = semantic_layer4(semantic)
-        semantic_s32 = self.semantic_projection(semantic_s32)
-
         # S32 gathers context, then returns to the saved S16 representation.
-        context_s32 = self.dappm(semantic_s32)
+        context_s32 = self.dappm(self.semantic_downstage(semantic))
         context_s16 = self._resize(
             self.context_to_s16(context_s32), semantic.shape[-2:]
         )
-        context_update = self.context_scale * context_s16
-        semantic_before_context = semantic
-        semantic = self.activation(semantic_before_context + context_update)
-
-        self._last_contribution_ratios = {
-            "d2s_ratio": self._contribution_ratio(
-                detail_to_semantic_update, semantic_before
-            ),
-            "s2d_ratio": self._contribution_ratio(
-                semantic_to_detail_update, detail_before
-            ),
-            "context_ratio": self._contribution_ratio(
-                context_update, semantic_before_context
-            ),
-        }
+        semantic = self.activation(semantic + self.context_scale * context_s16)
 
         semantic_s8 = self._resize(
             self.semantic_to_fusion(semantic), detail.shape[-2:]
@@ -423,8 +375,6 @@ class DualResolutionContext(nn.Module):
             detached = gate.detach().float()
             statistics[f"{name}_abs_mean"] = float(detached.abs().mean().cpu())
             statistics[f"{name}_abs_max"] = float(detached.abs().max().cpu())
-        for name, ratio in self._last_contribution_ratios.items():
-            statistics[name] = float(ratio.detach().float().cpu())
         return statistics
 
 
@@ -434,7 +384,7 @@ class DualBranchRoadNet(nn.Module):
     PHASE_NAMES = {
         0: "head_only",
         1: "head_plus_dual_branch",
-        2: "plus_resnet_layer3_layer4",
+        2: "plus_resnet_layer3",
         3: "plus_resnet_layer2",
         4: "all_trainable",
     }
@@ -507,21 +457,9 @@ class DualBranchRoadNet(nn.Module):
 
         if self.training and self.current_phase == 0:
             with torch.no_grad():
-                fused = self.dual_branch(
-                    shared,
-                    semantic,
-                    self.encoder.layer4,
-                    freeze_semantic_layer4=True,
-                )
+                fused = self.dual_branch(shared, semantic)
         else:
-            fused = self.dual_branch(
-                shared,
-                semantic,
-                self.encoder.layer4,
-                freeze_semantic_layer4=(
-                    self.training and self.current_phase <= 1
-                ),
-            )
+            fused = self.dual_branch(shared, semantic)
         return self.decode_head(stem, shallow, fused, output_size)
 
     def set_trainable_phase(self, phase: int) -> str:
@@ -536,9 +474,7 @@ class DualBranchRoadNet(nn.Module):
         if self.current_phase == 0:
             frozen_modules.append(self.dual_branch)
         if self.current_phase <= 1:
-            frozen_modules.extend(
-                (self.encoder.layer3, self.encoder.layer4)
-            )
+            frozen_modules.append(self.encoder.layer3)
         if self.current_phase <= 2:
             frozen_modules.append(self.encoder.layer2)
         if self.current_phase <= 3:
@@ -558,7 +494,7 @@ class DualBranchRoadNet(nn.Module):
         if self.current_phase >= 1:
             modules.append(self.dual_branch)
         if self.current_phase >= 2:
-            modules.extend((self.encoder.layer3, self.encoder.layer4))
+            modules.append(self.encoder.layer3)
         if self.current_phase >= 3:
             modules.append(self.encoder.layer2)
         if self.current_phase >= 4:
@@ -574,13 +510,7 @@ class DualBranchRoadNet(nn.Module):
         return {
             "head": self.decode_head.parameters(),
             "dual_branch": self.dual_branch.parameters(),
-            # Keep the existing optimizer-group key so train.py needs no
-            # change. Phase 2 now unfreezes both pretrained deep stages.
-            "layer3": (
-                parameter
-                for module in (self.encoder.layer3, self.encoder.layer4)
-                for parameter in module.parameters()
-            ),
+            "layer3": self.encoder.layer3.parameters(),
             "layer2": self.encoder.layer2.parameters(),
             "early_encoder": (
                 parameter
