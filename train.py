@@ -1,3 +1,12 @@
+"""DualBranchRoadNet training aligned with RoadWeave's native-crop protocol.
+
+Training uses native 1024x1024 random crops and the RoadWeave augmentation
+recipe. Validation uses native-resolution 1024/512 sliding windows with Hann
+probability blending, matching the standalone native test script. Optimizer
+accumulation, cosine scheduling, EMA updates, DDP, and checkpointing retain the
+safer implementations from the original DualBranchRoadNet trainer.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -548,18 +557,48 @@ def image_to_tensor(image: np.ndarray) -> Tensor:
     return torch.from_numpy(np.ascontiguousarray(image.transpose(2, 0, 1)))
 
 
-class RoadResizeDataset(Dataset):
+class RoadCropDataset(Dataset):
+    """Native-resolution random crops with the RoadWeave augmentation recipe.
+
+    Cropping is deliberately performed before normalization.  A 1024 crop
+    therefore preserves the original road width and matches 1024 sliding-window
+    validation/inference.
+    """
+
     def __init__(
         self,
         pairs: Sequence[Tuple[Path, Path]],
-        resize_size: int,
+        crop_size: int,
         road_occlusion_probability: float,
         road_occlusion_max_patches: int,
     ) -> None:
         self.pairs = list(pairs)
-        self.resize_size = int(resize_size)
+        self.crop_size = int(crop_size)
         self.road_occlusion_probability = float(road_occlusion_probability)
         self.road_occlusion_max_patches = int(road_occlusion_max_patches)
+        try:
+            import albumentations as A
+        except ImportError as error:
+            raise ImportError(
+                "Native-crop training requires albumentations, as does "
+                "RoadWeave. Install it with: pip install albumentations"
+            ) from error
+        self.crop = A.RandomCrop(self.crop_size, self.crop_size)
+        self.augmentation = A.Compose(
+            [
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+                A.Transpose(p=0.5),
+                A.RandomRotate90(p=0.5),
+                A.RandomBrightnessContrast(0.2, 0.2, p=0.5),
+                A.HueSaturationValue(10, 15, 10, p=0.3),
+                A.GaussNoise(std_range=(0.05, 0.15), p=0.2),
+                A.Normalize(
+                    mean=(0.485, 0.456, 0.406),
+                    std=(0.229, 0.224, 0.225),
+                ),
+            ]
+        )
 
     def __len__(self) -> int:
         return len(self.pairs)
@@ -570,23 +609,29 @@ class RoadResizeDataset(Dataset):
         if image.shape[:2] != mask.shape:
             raise RuntimeError(f"Shape mismatch: {image_path} vs {mask_path}")
 
-        # IMPORTANT: preserve the complete field of view. No random crop.
-        image, mask = resize_pair(image, mask, self.resize_size)
-        image, mask = augment_pair(
+        image, mask = pad_pair_to_size(image, mask, self.crop_size)
+        cropped = self.crop(image=image, mask=mask)
+        image = np.ascontiguousarray(cropped["image"])
+        mask = np.ascontiguousarray(cropped["mask"])
+        image = road_guided_occlusion(
             image,
             mask,
-            road_occlusion_probability=self.road_occlusion_probability,
-            road_occlusion_max_patches=self.road_occlusion_max_patches,
+            probability=self.road_occlusion_probability,
+            max_patches=self.road_occlusion_max_patches,
         )
-        return image_to_tensor(image), torch.from_numpy(mask).long()
+        transformed = self.augmentation(image=image, mask=mask)
+        x = torch.from_numpy(
+            np.ascontiguousarray(transformed["image"].transpose(2, 0, 1))
+        ).float()
+        y = torch.from_numpy(np.ascontiguousarray(transformed["mask"])).long()
+        return x, y
 
 
-class RoadResizeEvaluationDataset(Dataset):
-    def __init__(
-        self, pairs: Sequence[Tuple[Path, Path]], resize_size: int
-    ) -> None:
+class RoadNativeEvaluationDataset(Dataset):
+    """Return untouched native images for sliding-window validation."""
+
+    def __init__(self, pairs: Sequence[Tuple[Path, Path]]) -> None:
         self.pairs = list(pairs)
-        self.resize_size = int(resize_size)
 
     def __len__(self) -> int:
         return len(self.pairs)
@@ -596,7 +641,6 @@ class RoadResizeEvaluationDataset(Dataset):
         image, mask = read_rgb(image_path), read_binary_mask(mask_path)
         if image.shape[:2] != mask.shape:
             raise RuntimeError(f"Shape mismatch: {image_path} vs {mask_path}")
-        image, mask = resize_pair(image, mask, self.resize_size)
         return image_to_tensor(image), torch.from_numpy(mask).long(), image_path.stem
 
 
@@ -689,9 +733,9 @@ def make_loaders(
     Optional[DistributedSampler],
 ]:
     train_pairs, val_pairs, test_pairs = resolve_splits(args)
-    train_dataset = RoadResizeDataset(
+    train_dataset = RoadCropDataset(
         train_pairs,
-        resize_size=args.resize_size,
+        crop_size=args.crop_size,
         road_occlusion_probability=args.road_occlusion_probability,
         road_occlusion_max_patches=args.road_occlusion_max_patches,
     )
@@ -707,9 +751,7 @@ def make_loaders(
             f"images from test.txt every {args.val_interval} epochs; "
             "best.pt is selected by fixed@0.50 F1."
         )
-    val_dataset = RoadResizeEvaluationDataset(
-        evaluation_pairs, resize_size=args.resize_size
-    )
+    val_dataset = RoadNativeEvaluationDataset(evaluation_pairs)
 
     train_sampler: Optional[DistributedSampler]
     if args.distributed:
@@ -1081,7 +1123,7 @@ def hann_weight(tile_size: int, device: torch.device) -> Tensor:
 
 
 @torch.inference_mode()
-def sliding_window_logits(
+def sliding_window_probability(
     model: nn.Module,
     image: Tensor,
     tile_size: int,
@@ -1101,7 +1143,7 @@ def sliding_window_logits(
     ys = sliding_positions(height, tile_size, overlap)
     xs = sliding_positions(width, tile_size, overlap)
     coordinates = [(y, x) for y in ys for x in xs]
-    accumulator = torch.zeros((1, 2, height, width), device=device)
+    accumulator = torch.zeros((1, 1, height, width), device=device)
     normalizer = torch.zeros((1, 1, height, width), device=device)
     weight = hann_weight(tile_size, device)
     for start in range(0, len(coordinates), tile_batch_size):
@@ -1117,12 +1159,13 @@ def sliding_window_logits(
             device_type=device.type, dtype=torch.float16, enabled=use_amp
         ):
             logits = model(tiles)
-        if isinstance(logits, tuple):
-            logits = logits[-1]
-        logits = logits.float()
+            if isinstance(logits, tuple):
+                logits = logits[-1]
+            probabilities = logits.softmax(dim=1)[:, 1:2]
+        probabilities = probabilities.float()
         for index, (y, x) in enumerate(batch_coordinates):
             accumulator[:, :, y : y + tile_size, x : x + tile_size] += (
-                logits[index : index + 1] * weight
+                probabilities[index : index + 1] * weight
             )
             normalizer[:, :, y : y + tile_size, x : x + tile_size] += weight
     return (accumulator / normalizer.clamp_min_(1e-6))[
@@ -1207,14 +1250,17 @@ def validate(
     negative_hist = torch.zeros(bins, dtype=torch.int64, device=device)
     totals = torch.zeros(10, dtype=torch.float64, device=device)
     progress = tqdm(
-        loader, desc="Resize-1024 evaluation", leave=False, disable=not is_main_process()
+        loader,
+        desc="Native sliding evaluation",
+        leave=False,
+        disable=not is_main_process(),
     )
     for images, masks, _ in progress:
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
         if args.channels_last:
             images = images.contiguous(memory_format=torch.channels_last)
-        logits = sliding_window_logits(
+        probability = sliding_window_probability(
             model,
             images,
             args.val_tile_size,
@@ -1223,7 +1269,7 @@ def validate(
             device,
             args.use_amp,
         )
-        probability = logits.softmax(dim=1)[:, 1]
+        probability = probability[:, 0]
         target = masks > 0
         prediction = probability >= 0.5
         tp, fp, fn, tn = confusion_counts(prediction, target)
@@ -1424,15 +1470,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split_seed", type=int, default=3407)
 
     parser.add_argument(
-        "--resize_size",
         "--crop_size",
-        dest="resize_size",
+        "--resize_size",
+        dest="crop_size",
         type=int,
         default=1024,
-        help="Resize the full training/evaluation image and mask; --crop_size is a legacy alias",
+        help=(
+            "Native random-crop size used for training; --resize_size is kept "
+            "only as a legacy alias"
+        ),
     )
-    # Legacy flags are accepted so old Kaggle commands do not fail, but they
-    # are intentionally ignored because this version never crops.
+    # Accepted for compatibility with older commands. Uniform random cropping
+    # is intentional here because it reproduces RoadWeave's sampling protocol.
     parser.add_argument("--road_crop_probability", type=float, default=0.0, help=argparse.SUPPRESS)
     parser.add_argument("--road_crop_min_fraction", type=float, default=0.0, help=argparse.SUPPRESS)
     parser.add_argument("--road_crop_tries", type=int, default=1, help=argparse.SUPPRESS)
@@ -1489,10 +1538,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backbone_lr_factor", type=float, default=0.20)
     parser.add_argument("--early_encoder_lr_factor", type=float, default=0.10)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--warmup_epochs", type=int, default=5)
+    parser.add_argument("--warmup_epochs", type=int, default=3)
     parser.add_argument("--warmup_start_factor", type=float, default=0.10)
-    parser.add_argument("--min_lr_ratio", type=float, default=0.02)
-    parser.add_argument("--grad_clip", type=float, default=3.0)
+    parser.add_argument("--min_lr_ratio", type=float, default=0.0)
+    parser.add_argument("--grad_clip", type=float, default=5.0)
     parser.add_argument("--ema_decay", type=float, default=0.999)
 
     parser.add_argument("--road_weight_cap", type=float, default=2.0)
@@ -1549,7 +1598,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--val_tile_size", type=int, default=1024)
-    parser.add_argument("--val_overlap", type=int, default=256)
+    parser.add_argument("--val_overlap", type=int, default=512)
     parser.add_argument("--val_tile_batch_size", type=int, default=2)
     parser.add_argument("--val_interval", type=int, default=10)
     parser.add_argument(
@@ -1581,8 +1630,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if args.resize_size < 64 or args.resize_size % 16:
-        raise ValueError("resize_size must be >=64 and divisible by 16")
+    if args.crop_size < 64 or args.crop_size % 16:
+        raise ValueError("crop_size must be >=64 and divisible by 16")
     if args.dataset == "massachusetts":
         if not args.train_list or not args.test_list:
             raise ValueError("Massachusetts requires --train_list and --test_list")
@@ -1821,7 +1870,7 @@ def main() -> None:
         f"AMP={args.use_amp} | channels_last={args.channels_last}"
     )
     rank_zero_print(
-        f"resize(full image)={args.resize_size} | batch/GPU={args.batch_size} | "
+        f"native random crop={args.crop_size} | batch/GPU={args.batch_size} | "
         f"accumulation={args.accumulation_steps} | effective batch={effective_batch}"
     )
     rank_zero_print(
