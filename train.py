@@ -700,9 +700,12 @@ def make_loaders(
     if not evaluation_pairs:
         raise RuntimeError("No validation/test pairs are available for evaluation")
     if not val_pairs and test_pairs:
+        total_test = len(evaluation_pairs)
+        evaluation_pairs = evaluation_pairs[: min(args.test_eval_images, total_test)]
         rank_zero_print(
-            "No validation split was provided: test.txt will be evaluated only "
-            "after the final training epoch."
+            f"No validation split: using first {len(evaluation_pairs)}/{total_test} "
+            f"images from test.txt every {args.val_interval} epochs; "
+            "best.pt is selected by fixed@0.50 F1."
         )
     val_dataset = RoadResizeEvaluationDataset(
         evaluation_pairs, resize_size=args.resize_size
@@ -1277,6 +1280,7 @@ def resolve_checkpoint_path(path: str | Path) -> Path:
         return path
     if path.is_dir():
         preferred = (
+            "best.pt",
             "best_fixed_road_iou.pt",
             "best_calibrated_road_iou.pt",
             "last.pt",
@@ -1547,7 +1551,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_tile_size", type=int, default=1024)
     parser.add_argument("--val_overlap", type=int, default=256)
     parser.add_argument("--val_tile_batch_size", type=int, default=2)
-    parser.add_argument("--val_interval", type=int, default=1)
+    parser.add_argument("--val_interval", type=int, default=10)
+    parser.add_argument(
+        "--test_eval_images",
+        type=int,
+        default=61,
+        help="For Massachusetts without val, evaluate only the first N test.txt images",
+    )
     parser.add_argument("--threshold_min", type=float, default=0.20)
     parser.add_argument("--threshold_max", type=float, default=0.80)
     parser.add_argument("--threshold_step", type=float, default=0.02)
@@ -1578,6 +1588,8 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("Massachusetts requires --train_list and --test_list")
     if args.val_overlap < 0 or args.val_overlap >= args.val_tile_size:
         raise ValueError("val_overlap must satisfy 0 <= overlap < tile size")
+    if args.test_eval_images < 1:
+        raise ValueError("test_eval_images must be >= 1")
     if args.batch_size < 1 or args.accumulation_steps < 1:
         raise ValueError("batch_size and accumulation_steps must be positive")
     if args.fixed_road_weight is not None and args.fixed_road_weight <= 0.0:
@@ -1778,12 +1790,17 @@ def main() -> None:
         fast_centerline_target=args.fast_centerline_target,
     ).to(device)
 
-    start_epoch, best_fixed, best_calibrated = 0, -1.0, -1.0
+    start_epoch, best_fixed, best_calibrated, best_f1 = 0, -1.0, -1.0, -1.0
     if args.resume:
         start_epoch, best_fixed, best_calibrated, loaded = resume_training(
             model, ema, optimizer, scheduler, scaler, args.resume, device
         )
-        rank_zero_print(f"Resumed exact training state from {loaded}")
+        _, resume_checkpoint = safe_torch_load(args.resume, device)
+        if isinstance(resume_checkpoint, dict):
+            best_f1 = float(resume_checkpoint.get("best_f1", -1.0))
+        rank_zero_print(
+            f"Resumed exact training state from {loaded} | best F1={best_f1:.5f}"
+        )
 
     total_parameters = sum(parameter.numel() for parameter in model.parameters())
     if distributed:
@@ -1861,13 +1878,12 @@ def main() -> None:
         )
         gate_metrics = unwrap_model(model).dual_branch.gate_statistics()
         validation_metrics: Dict[str, float] = {}
-        # With no validation split, do not repeatedly inspect test.txt during
-        # training. The test split is evaluated once, after the final epoch.
+        # Massachusetts has no val.txt in this setup. Reproduce the requested
+        # protocol: evaluate the first N test.txt samples every val_interval epochs.
         has_validation_split = bool(val_pairs)
         should_validate = (
-            ((epoch + 1) % args.val_interval == 0 or epoch + 1 == args.epochs)
-            if has_validation_split
-            else (epoch + 1 == args.epochs)
+            (epoch + 1) % args.val_interval == 0
+            or epoch + 1 == args.epochs
         )
         if should_validate:
             if distributed_active():
@@ -1876,9 +1892,14 @@ def main() -> None:
             validation_metrics = validate(ema.module, val_loader, device, args)
             fixed = validation_metrics["fixed_road_iou"]
             calibrated = validation_metrics["calibrated_road_iou"]
-            fixed_improved, calibrated_improved = fixed > best_fixed, calibrated > best_calibrated
-            best_fixed, best_calibrated = max(best_fixed, fixed), max(best_calibrated, calibrated)
-            evaluation_name = "validation" if has_validation_split else "test"
+            fixed_f1 = validation_metrics["fixed_f1"]
+            fixed_improved = fixed > best_fixed
+            calibrated_improved = calibrated > best_calibrated
+            f1_improved = fixed_f1 > best_f1
+            best_fixed = max(best_fixed, fixed)
+            best_calibrated = max(best_calibrated, calibrated)
+            best_f1 = max(best_f1, fixed_f1)
+            evaluation_name = "validation" if has_validation_split else f"test_first_{len(val_loader.dataset)}"
             rank_zero_print(
                 f"train loss={train_metrics['total']:.5f} | "
                 f"throughput={train_metrics['images_per_second']:.1f} img/s | "
@@ -1905,6 +1926,12 @@ def main() -> None:
                     validation_metrics,
                     args,
                 )
+                state["best_f1"] = best_f1
+                if f1_improved:
+                    atomic_torch_save(state, save_dir / "best.pt")
+                    rank_zero_print(
+                        f"New best fixed@0.50 F1={best_f1:.5f}; saved best.pt"
+                    )
                 if fixed_improved:
                     atomic_torch_save(state, save_dir / "best_fixed_road_iou.pt")
                 if calibrated_improved:
@@ -1925,6 +1952,7 @@ def main() -> None:
                 validation_metrics,
                 args,
             )
+            state["best_f1"] = best_f1
             atomic_torch_save(state, save_dir / "last.pt")
 
         if is_main_process():
