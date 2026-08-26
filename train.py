@@ -28,8 +28,8 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
-from modeling_core.decoder import RoadSegCenterlineTverskyLoss
-from modeling_core.model import DualBranchRoadNet, build_model
+from modeling.decoder import RoadSegCenterlineTverskyLoss
+from modeling.model import DualBranchRoadNet, build_model
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
