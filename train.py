@@ -236,13 +236,16 @@ def configure_dataset_paths(args: argparse.Namespace) -> None:
     if args.dataset == "massachusetts":
         root = Path(
             args.data_root
-            or "/kaggle/input/datasets/balraj98/"
-            "massachusetts-roads-dataset/tiff"
+            or "/kaggle/input/datasets/datnguyentien204/massachu/massachusets"
         )
-        args.train_image_dir = args.train_image_dir or str(root / "train")
-        args.train_mask_dir = args.train_mask_dir or str(root / "train_labels")
-        args.val_image_dir = args.val_image_dir or str(root / "val")
-        args.val_mask_dir = args.val_mask_dir or str(root / "val_labels")
+        args.train_image_dir = args.train_image_dir or str(root / "images")
+        args.train_mask_dir = args.train_mask_dir or str(root / "labels")
+        args.train_list = args.train_list or str(root / "train.txt")
+        args.test_list = args.test_list or str(root / "test.txt")
+        # This dataset has no validation txt. test.txt is used only as the
+        # evaluation loader; no random validation/test split is created.
+        args.val_image_dir = None
+        args.val_mask_dir = None
         return
 
     root = Path(
@@ -284,6 +287,72 @@ def read_binary_mask(path: Path) -> np.ndarray:
         mask = mask.max(axis=2)
     threshold = 0 if int(mask.max(initial=0)) <= 1 else 127
     return (mask > threshold).astype(np.uint8)
+
+
+def resize_pair(
+    image: np.ndarray, mask: np.ndarray, size: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Resize the complete image/mask pair to a square; never crop."""
+    image_pil = Image.fromarray(np.ascontiguousarray(image))
+    mask_pil = Image.fromarray((np.ascontiguousarray(mask) * 255).astype(np.uint8))
+    resampling = getattr(Image, "Resampling", Image)
+    image = np.asarray(
+        image_pil.resize((size, size), resample=resampling.BILINEAR),
+        dtype=np.uint8,
+    ).copy()
+    mask = np.asarray(
+        mask_pil.resize((size, size), resample=resampling.NEAREST),
+        dtype=np.uint8,
+    )
+    mask = (mask > 127).astype(np.uint8)
+    return image, np.ascontiguousarray(mask)
+
+
+def pairs_from_list(
+    image_dir: str | Path,
+    mask_dir: str | Path,
+    list_path: str | Path,
+) -> List[Tuple[Path, Path]]:
+    """Build image/mask pairs in exactly the order given by a txt split file.
+
+    Each non-empty line may contain either a filename/path or multiple columns;
+    the first column is treated as the image identifier. Extensions and common
+    suffixes such as _sat/_mask/_label are normalized through sample_key().
+    """
+    image_dir, mask_dir, list_path = Path(image_dir), Path(mask_dir), Path(list_path)
+    if not list_path.is_file():
+        raise FileNotFoundError(f"Split txt not found: {list_path}")
+
+    images = index_files(image_dir)
+    masks = index_files(mask_dir)
+    pairs: List[Tuple[Path, Path]] = []
+    missing: List[str] = []
+    seen: set[str] = set()
+
+    with list_path.open("r", encoding="utf-8-sig") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            first_field = line.replace(",", " ").split()[0]
+            key = sample_key(Path(first_field))
+            if key in seen:
+                continue
+            seen.add(key)
+            image_path, mask_path = images.get(key), masks.get(key)
+            if image_path is None or mask_path is None:
+                missing.append(first_field)
+                continue
+            pairs.append((image_path, mask_path))
+
+    if missing:
+        raise RuntimeError(
+            f"{list_path} contains {len(missing)} samples that could not be paired. "
+            f"First missing entries: {missing[:10]}"
+        )
+    if not pairs:
+        raise RuntimeError(f"No image/mask pairs resolved from {list_path}")
+    return pairs
 
 
 def pad_pair_to_size(
@@ -479,22 +548,16 @@ def image_to_tensor(image: np.ndarray) -> Tensor:
     return torch.from_numpy(np.ascontiguousarray(image.transpose(2, 0, 1)))
 
 
-class RoadCropDataset(Dataset):
+class RoadResizeDataset(Dataset):
     def __init__(
         self,
         pairs: Sequence[Tuple[Path, Path]],
-        crop_size: int,
-        road_crop_probability: float,
-        road_crop_min_fraction: float,
-        road_crop_tries: int,
+        resize_size: int,
         road_occlusion_probability: float,
         road_occlusion_max_patches: int,
     ) -> None:
         self.pairs = list(pairs)
-        self.crop_size = int(crop_size)
-        self.road_crop_probability = float(road_crop_probability)
-        self.road_crop_min_fraction = float(road_crop_min_fraction)
-        self.road_crop_tries = int(road_crop_tries)
+        self.resize_size = int(resize_size)
         self.road_occlusion_probability = float(road_occlusion_probability)
         self.road_occlusion_max_patches = int(road_occlusion_max_patches)
 
@@ -506,14 +569,9 @@ class RoadCropDataset(Dataset):
         image, mask = read_rgb(image_path), read_binary_mask(mask_path)
         if image.shape[:2] != mask.shape:
             raise RuntimeError(f"Shape mismatch: {image_path} vs {mask_path}")
-        image, mask = random_crop_pair(
-            image,
-            mask,
-            self.crop_size,
-            self.road_crop_probability,
-            self.road_crop_min_fraction,
-            self.road_crop_tries,
-        )
+
+        # IMPORTANT: preserve the complete field of view. No random crop.
+        image, mask = resize_pair(image, mask, self.resize_size)
         image, mask = augment_pair(
             image,
             mask,
@@ -523,9 +581,12 @@ class RoadCropDataset(Dataset):
         return image_to_tensor(image), torch.from_numpy(mask).long()
 
 
-class RoadNativeValidationDataset(Dataset):
-    def __init__(self, pairs: Sequence[Tuple[Path, Path]]) -> None:
+class RoadResizeEvaluationDataset(Dataset):
+    def __init__(
+        self, pairs: Sequence[Tuple[Path, Path]], resize_size: int
+    ) -> None:
         self.pairs = list(pairs)
+        self.resize_size = int(resize_size)
 
     def __len__(self) -> int:
         return len(self.pairs)
@@ -535,6 +596,7 @@ class RoadNativeValidationDataset(Dataset):
         image, mask = read_rgb(image_path), read_binary_mask(mask_path)
         if image.shape[:2] != mask.shape:
             raise RuntimeError(f"Shape mismatch: {image_path} vs {mask_path}")
+        image, mask = resize_pair(image, mask, self.resize_size)
         return image_to_tensor(image), torch.from_numpy(mask).long(), image_path.stem
 
 
@@ -545,6 +607,28 @@ def resolve_splits(
     List[Tuple[Path, Path]],
     List[Tuple[Path, Path]],
 ]:
+    if args.dataset == "massachusetts":
+        train_pairs = pairs_from_list(
+            args.train_image_dir, args.train_mask_dir, args.train_list
+        )
+        test_pairs = pairs_from_list(
+            args.train_image_dir, args.train_mask_dir, args.test_list
+        )
+        train_keys = {sample_key(image) for image, _ in train_pairs}
+        test_keys = {sample_key(image) for image, _ in test_pairs}
+        overlap = train_keys & test_keys
+        if overlap:
+            raise RuntimeError(
+                f"train.txt and test.txt overlap on {len(overlap)} samples; "
+                f"examples={sorted(overlap)[:10]}"
+            )
+        rank_zero_print(
+            f"TXT split: train={len(train_pairs)}, val=0, test={len(test_pairs)} | "
+            f"train.txt={args.train_list} | test.txt={args.test_list}"
+        )
+        return train_pairs, [], test_pairs
+
+    # Keep the previous DeepGlobe behavior unchanged.
     all_pairs = build_pairs(args.train_image_dir, args.train_mask_dir)
     if args.val_image_dir and args.val_mask_dir:
         val_images, val_masks = Path(args.val_image_dir), Path(args.val_mask_dir)
@@ -605,16 +689,25 @@ def make_loaders(
     Optional[DistributedSampler],
 ]:
     train_pairs, val_pairs, test_pairs = resolve_splits(args)
-    train_dataset = RoadCropDataset(
+    train_dataset = RoadResizeDataset(
         train_pairs,
-        crop_size=args.crop_size,
-        road_crop_probability=args.road_crop_probability,
-        road_crop_min_fraction=args.road_crop_min_fraction,
-        road_crop_tries=args.road_crop_tries,
+        resize_size=args.resize_size,
         road_occlusion_probability=args.road_occlusion_probability,
         road_occlusion_max_patches=args.road_occlusion_max_patches,
     )
-    val_dataset = RoadNativeValidationDataset(val_pairs)
+
+    evaluation_pairs = val_pairs if val_pairs else test_pairs
+    if not evaluation_pairs:
+        raise RuntimeError("No validation/test pairs are available for evaluation")
+    if not val_pairs and test_pairs:
+        rank_zero_print(
+            "No validation split was provided: test.txt will be evaluated only "
+            "after the final training epoch."
+        )
+    val_dataset = RoadResizeEvaluationDataset(
+        evaluation_pairs, resize_size=args.resize_size
+    )
+
     train_sampler: Optional[DistributedSampler]
     if args.distributed:
         train_sampler = DistributedSampler(
@@ -1111,7 +1204,7 @@ def validate(
     negative_hist = torch.zeros(bins, dtype=torch.int64, device=device)
     totals = torch.zeros(10, dtype=torch.float64, device=device)
     progress = tqdm(
-        loader, desc="Native validation", leave=False, disable=not is_main_process()
+        loader, desc="Resize-1024 evaluation", leave=False, disable=not is_main_process()
     )
     for images, masks, _ in progress:
         images = images.to(device, non_blocking=True)
@@ -1313,6 +1406,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data_root", default=None)
     parser.add_argument("--train_image_dir", default=None)
     parser.add_argument("--train_mask_dir", default=None)
+    parser.add_argument("--train_list", default=None)
+    parser.add_argument("--test_list", default=None)
     parser.add_argument("--val_image_dir", default=None)
     parser.add_argument("--val_mask_dir", default=None)
     parser.add_argument("--val_ratio", type=float, default=0.10)
@@ -1324,10 +1419,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--split_seed", type=int, default=3407)
 
-    parser.add_argument("--crop_size", type=int, default=1024)
-    parser.add_argument("--road_crop_probability", type=float, default=0.60)
-    parser.add_argument("--road_crop_min_fraction", type=float, default=0.002)
-    parser.add_argument("--road_crop_tries", type=int, default=8)
+    parser.add_argument(
+        "--resize_size",
+        "--crop_size",
+        dest="resize_size",
+        type=int,
+        default=1024,
+        help="Resize the full training/evaluation image and mask; --crop_size is a legacy alias",
+    )
+    # Legacy flags are accepted so old Kaggle commands do not fail, but they
+    # are intentionally ignored because this version never crops.
+    parser.add_argument("--road_crop_probability", type=float, default=0.0, help=argparse.SUPPRESS)
+    parser.add_argument("--road_crop_min_fraction", type=float, default=0.0, help=argparse.SUPPRESS)
+    parser.add_argument("--road_crop_tries", type=int, default=1, help=argparse.SUPPRESS)
     parser.add_argument(
         "--road_occlusion_probability",
         type=float,
@@ -1467,8 +1571,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if args.crop_size < 64 or args.crop_size % 16:
-        raise ValueError("crop_size must be >=64 and divisible by 16")
+    if args.resize_size < 64 or args.resize_size % 16:
+        raise ValueError("resize_size must be >=64 and divisible by 16")
+    if args.dataset == "massachusetts":
+        if not args.train_list or not args.test_list:
+            raise ValueError("Massachusetts requires --train_list and --test_list")
     if args.val_overlap < 0 or args.val_overlap >= args.val_tile_size:
         raise ValueError("val_overlap must satisfy 0 <= overlap < tile size")
     if args.batch_size < 1 or args.accumulation_steps < 1:
@@ -1697,7 +1804,7 @@ def main() -> None:
         f"AMP={args.use_amp} | channels_last={args.channels_last}"
     )
     rank_zero_print(
-        f"crop={args.crop_size} | batch/GPU={args.batch_size} | "
+        f"resize(full image)={args.resize_size} | batch/GPU={args.batch_size} | "
         f"accumulation={args.accumulation_steps} | effective batch={effective_batch}"
     )
     rank_zero_print(
@@ -1754,7 +1861,14 @@ def main() -> None:
         )
         gate_metrics = unwrap_model(model).dual_branch.gate_statistics()
         validation_metrics: Dict[str, float] = {}
-        should_validate = (epoch + 1) % args.val_interval == 0 or epoch + 1 == args.epochs
+        # With no validation split, do not repeatedly inspect test.txt during
+        # training. The test split is evaluated once, after the final epoch.
+        has_validation_split = bool(val_pairs)
+        should_validate = (
+            ((epoch + 1) % args.val_interval == 0 or epoch + 1 == args.epochs)
+            if has_validation_split
+            else (epoch + 1 == args.epochs)
+        )
         if should_validate:
             if distributed_active():
                 for tensor in ema.module.state_dict().values():
@@ -1764,10 +1878,11 @@ def main() -> None:
             calibrated = validation_metrics["calibrated_road_iou"]
             fixed_improved, calibrated_improved = fixed > best_fixed, calibrated > best_calibrated
             best_fixed, best_calibrated = max(best_fixed, fixed), max(best_calibrated, calibrated)
+            evaluation_name = "validation" if has_validation_split else "test"
             rank_zero_print(
                 f"train loss={train_metrics['total']:.5f} | "
                 f"throughput={train_metrics['images_per_second']:.1f} img/s | "
-                f"fixed@.50 road IoU={fixed:.5f} | "
+                f"{evaluation_name} fixed@.50 road IoU={fixed:.5f} | "
                 f"calibrated road IoU={calibrated:.5f} "
                 f"@{validation_metrics['calibrated_threshold']:.2f} | "
                 f"F1={validation_metrics['fixed_f1']:.5f} | "
