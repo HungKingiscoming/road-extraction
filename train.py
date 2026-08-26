@@ -203,6 +203,51 @@ def build_pairs(image_dir: str | Path, mask_dir: str | Path) -> List[Tuple[Path,
     return [(images[key], masks[key]) for key in common]
 
 
+def pairs_from_list(
+    image_dir: str | Path,
+    mask_dir: str | Path,
+    list_path: str | Path,
+) -> List[Tuple[Path, Path]]:
+    """Resolve pairs in exactly the order given by a txt split file."""
+    image_dir = Path(image_dir)
+    mask_dir = Path(mask_dir)
+    list_path = Path(list_path)
+    if not list_path.is_file():
+        raise FileNotFoundError(f"Split txt not found: {list_path}")
+
+    images = index_files(image_dir)
+    masks = index_files(mask_dir)
+    pairs: List[Tuple[Path, Path]] = []
+    missing: List[str] = []
+    seen: set[str] = set()
+
+    with list_path.open("r", encoding="utf-8-sig") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            first_field = line.replace(",", " ").split()[0]
+            key = sample_key(Path(first_field))
+            if key in seen:
+                continue
+            seen.add(key)
+            image_path = images.get(key)
+            mask_path = masks.get(key)
+            if image_path is None or mask_path is None:
+                missing.append(first_field)
+                continue
+            pairs.append((image_path, mask_path))
+
+    if missing:
+        raise RuntimeError(
+            f"{list_path} contains {len(missing)} unpaired samples. "
+            f"First missing entries: {missing[:10]}"
+        )
+    if not pairs:
+        raise RuntimeError(f"No image/mask pairs resolved from {list_path}")
+    return pairs
+
+
 def _first_existing_pair(
     candidates: Sequence[Tuple[Path, Path]],
 ) -> Tuple[Path, Path]:
@@ -236,13 +281,14 @@ def configure_dataset_paths(args: argparse.Namespace) -> None:
     if args.dataset == "massachusetts":
         root = Path(
             args.data_root
-            or "/kaggle/input/datasets/balraj98/"
-            "massachusetts-roads-dataset/tiff"
+            or "/kaggle/input/datasets/datnguyentien204/massachu/massachusets"
         )
-        args.train_image_dir = args.train_image_dir or str(root / "train")
-        args.train_mask_dir = args.train_mask_dir or str(root / "train_labels")
-        args.val_image_dir = args.val_image_dir or str(root / "val")
-        args.val_mask_dir = args.val_mask_dir or str(root / "val_labels")
+        args.train_image_dir = args.train_image_dir or str(root / "images")
+        args.train_mask_dir = args.train_mask_dir or str(root / "labels")
+        args.train_list = args.train_list or str(root / "train.txt")
+        args.test_list = args.test_list or str(root / "test.txt")
+        args.val_image_dir = None
+        args.val_mask_dir = None
         return
 
     root = Path(
@@ -545,6 +591,35 @@ def resolve_splits(
     List[Tuple[Path, Path]],
     List[Tuple[Path, Path]],
 ]:
+    if args.dataset == "massachusetts":
+        train_pairs = pairs_from_list(
+            args.train_image_dir, args.train_mask_dir, args.train_list
+        )
+        listed_test_pairs = pairs_from_list(
+            args.train_image_dir, args.train_mask_dir, args.test_list
+        )
+        train_keys = {sample_key(image) for image, _ in train_pairs}
+        listed_test_keys = {sample_key(image) for image, _ in listed_test_pairs}
+        overlap = train_keys & listed_test_keys
+        if overlap:
+            raise RuntimeError(
+                f"train.txt and test.txt overlap on {len(overlap)} samples; "
+                f"examples={sorted(overlap)[:10]}"
+            )
+        if args.test_eval_images >= len(listed_test_pairs):
+            raise ValueError(
+                "test_eval_images must be smaller than the number of test.txt "
+                "samples so a non-empty final test split remains"
+            )
+        val_pairs = listed_test_pairs[: args.test_eval_images]
+        test_pairs = listed_test_pairs[args.test_eval_images :]
+        rank_zero_print(
+            f"TXT split: train={len(train_pairs)}, val={len(val_pairs)}, "
+            f"test={len(test_pairs)} | val=first {args.test_eval_images} entries "
+            f"of {args.test_list}"
+        )
+        return train_pairs, val_pairs, test_pairs
+
     all_pairs = build_pairs(args.train_image_dir, args.train_mask_dir)
     if args.val_image_dir and args.val_mask_dir:
         val_images, val_masks = Path(args.val_image_dir), Path(args.val_mask_dir)
@@ -1228,14 +1303,17 @@ def transfer_weights(
         state = checkpoint.get(fallback, checkpoint.get("state_dict"))
     if not isinstance(state, dict):
         raise KeyError(f"No '{weights}', model, ema, or state_dict weights found")
-    try:
-        model.load_state_dict(clean_state_dict(state), strict=True)
-    except RuntimeError as error:
+    cleaned = clean_state_dict(state)
+    result = model.load_state_dict(cleaned, strict=False)
+    allowed_missing = all(
+        "spatial_gate" in key for key in result.missing_keys
+    )
+    if result.unexpected_keys or not allowed_missing:
         raise RuntimeError(
             "Transfer checkpoint architecture does not match DualBranchRoadNet. "
-            "DeepGlobe pretraining and Massachusetts fine-tuning must use the "
-            "same branch/decoder/DAPPM configuration."
-        ) from error
+            f"Missing={result.missing_keys}, unexpected={result.unexpected_keys}. "
+            "Only newly introduced spatial-gate tensors may be absent."
+        )
     return checkpoint_path
 
 
@@ -1313,6 +1391,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data_root", default=None)
     parser.add_argument("--train_image_dir", default=None)
     parser.add_argument("--train_mask_dir", default=None)
+    parser.add_argument("--train_list", default=None)
+    parser.add_argument("--test_list", default=None)
     parser.add_argument("--val_image_dir", default=None)
     parser.add_argument("--val_mask_dir", default=None)
     parser.add_argument("--val_ratio", type=float, default=0.10)
@@ -1351,6 +1431,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--semantic_blocks", type=int, default=2)
     parser.add_argument("--fusion_blocks", type=int, default=1)
+    parser.add_argument(
+        "--bilateral_fusion",
+        choices=("static", "spatial"),
+        default="spatial",
+        help=(
+            "static reproduces the original channel-scaled residual exchange; "
+            "spatial adds lightweight location-adaptive gates in both directions"
+        ),
+    )
     parser.add_argument("--decoder_s4_channels", type=int, default=64)
     parser.add_argument("--decoder_s2_channels", type=int, default=32)
     parser.add_argument("--full_channels", type=int, default=24)
@@ -1444,6 +1533,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_overlap", type=int, default=256)
     parser.add_argument("--val_tile_batch_size", type=int, default=2)
     parser.add_argument("--val_interval", type=int, default=1)
+    parser.add_argument(
+        "--test_eval_images",
+        type=int,
+        default=61,
+        help=(
+            "For the Massachusetts txt protocol, reserve the first N test.txt "
+            "entries for validation and keep the remainder for final testing"
+        ),
+    )
     parser.add_argument("--threshold_min", type=float, default=0.20)
     parser.add_argument("--threshold_max", type=float, default=0.80)
     parser.add_argument("--threshold_step", type=float, default=0.02)
@@ -1473,6 +1571,11 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("val_overlap must satisfy 0 <= overlap < tile size")
     if args.batch_size < 1 or args.accumulation_steps < 1:
         raise ValueError("batch_size and accumulation_steps must be positive")
+    if args.dataset == "massachusetts":
+        if not args.train_list or not args.test_list:
+            raise ValueError("Massachusetts requires --train_list and --test_list")
+        if args.test_eval_images < 1:
+            raise ValueError("test_eval_images must be positive")
     if args.fixed_road_weight is not None and args.fixed_road_weight <= 0.0:
         raise ValueError("fixed_road_weight must be positive")
     if not 0.0 < args.val_ratio < 1.0:
@@ -1711,6 +1814,10 @@ def main() -> None:
         f"detail blocks={tuple(args.detail_blocks)}"
     )
     rank_zero_print(
+        f"bilateral fusion={args.bilateral_fusion} | "
+        "loss and directional decoder unchanged"
+    )
+    rank_zero_print(
         f"parameters={total_parameters:,} | imbalance={imbalance:.3f} | "
         f"road CE weight={road_weight:.3f}"
     )
@@ -1776,6 +1883,16 @@ def main() -> None:
                 f"{gate_metrics['detail_to_semantic_abs_mean']:.3f}/"
                 f"{gate_metrics['s32_context_to_s16_abs_mean']:.3f}/"
                 f"{gate_metrics['semantic_to_final_abs_mean']:.3f}"
+                + (
+                    " | spatial mean s2d/d2s="
+                    f"{gate_metrics['semantic_to_detail_spatial_mean']:.3f}/"
+                    f"{gate_metrics['detail_to_semantic_spatial_mean']:.3f}"
+                    " std="
+                    f"{gate_metrics['semantic_to_detail_spatial_std']:.3f}/"
+                    f"{gate_metrics['detail_to_semantic_spatial_std']:.3f}"
+                    if args.bilateral_fusion == "spatial"
+                    else ""
+                )
             )
             if is_main_process():
                 state = checkpoint_state(
