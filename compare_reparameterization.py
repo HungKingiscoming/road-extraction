@@ -1,7 +1,7 @@
 """One-file comparison of multi-branch and reparameterized inference.
 
 Loads one DualBranchRoadNet checkpoint, builds both forms, checks FP32 output
-equivalence, benchmarks latency/throughput/VRAM, and evaluates both forms on
+equivalence, benchmarks FLOPs/latency/throughput/VRAM, and evaluates both forms on
 the same Massachusetts subset with native-resolution sliding-window inference.
 Models run sequentially on CUDA to keep memory use suitable for a Kaggle T4.
 
@@ -133,6 +133,40 @@ def amp_settings(mode: str, device: torch.device) -> Tuple[bool, torch.dtype]:
     return True, torch.float16
 
 
+def register_mac_hooks(
+    model: nn.Module,
+) -> Tuple[Dict[str, int], List[torch.utils.hooks.RemovableHandle]]:
+    """Count Conv/Linear MACs during one forward pass without extra packages.
+
+    The reported compute follows the common convention ``1 MAC = 2 FLOPs``.
+    BatchNorm, activations, interpolation, pooling, and elementwise operations
+    are intentionally excluded so the number is comparable to most CNN FLOPs
+    profilers and directly exposes the effect of fusing convolution branches.
+    """
+    counter = {"macs": 0}
+    handles: List[torch.utils.hooks.RemovableHandle] = []
+
+    def conv_hook(module: nn.Conv2d, _inputs: Tuple[Tensor, ...], output: Tensor) -> None:
+        if not torch.is_tensor(output):
+            return
+        kernel_h, kernel_w = module.kernel_size
+        multiplications_per_output = (
+            kernel_h * kernel_w * module.in_channels // module.groups
+        )
+        counter["macs"] += int(output.numel()) * multiplications_per_output
+
+    def linear_hook(module: nn.Linear, _inputs: Tuple[Tensor, ...], output: Tensor) -> None:
+        if torch.is_tensor(output):
+            counter["macs"] += int(output.numel()) * int(module.in_features)
+
+    for module in model.modules():
+        if isinstance(module, nn.Conv2d):
+            handles.append(module.register_forward_hook(conv_hook))
+        elif isinstance(module, nn.Linear):
+            handles.append(module.register_forward_hook(linear_hook))
+    return counter, handles
+
+
 @torch.inference_mode()
 def profile_model(
     model_cpu: nn.Module,
@@ -149,7 +183,13 @@ def profile_model(
         model = model.to(memory_format=torch.channels_last)
         x = x.contiguous(memory_format=torch.channels_last)
 
-    fp32_output = main_logits(model(x)).float().cpu()
+    mac_counter, mac_handles = register_mac_hooks(model)
+    try:
+        fp32_output = main_logits(model(x)).float().cpu()
+    finally:
+        for handle in mac_handles:
+            handle.remove()
+    macs_per_image = float(mac_counter["macs"]) / float(input_cpu.shape[0])
     enabled, dtype = amp_settings(amp, device)
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -180,6 +220,10 @@ def profile_model(
 
     latency_ms = total_ms / repeats
     result = {
+        "macs_per_image": macs_per_image,
+        "flops_per_image": 2.0 * macs_per_image,
+        "gmacs_per_image": macs_per_image / 1e9,
+        "gflops_per_image": 2.0 * macs_per_image / 1e9,
         "latency_ms": latency_ms,
         "throughput_images_per_second": 1000.0 * input_cpu.shape[0] / latency_ms,
         "peak_allocated_bytes": peak_bytes,
@@ -650,6 +694,10 @@ def main() -> None:
             training_output, deploy_output, atol=args.atol, rtol=args.rtol
         ))
         speedup = training_profile["latency_ms"] / deploy_profile["latency_ms"]
+        flops_reduction = 1.0 - (
+            deploy_profile["flops_per_image"]
+            / training_profile["flops_per_image"]
+        )
         result["training_form"].update(training_profile)
         result["deploy_form"].update(deploy_profile)
         result["equivalence"] = {
@@ -660,6 +708,7 @@ def main() -> None:
             "rtol": args.rtol,
         }
         result["benchmark_speedup"] = speedup
+        result["flops_reduction_fraction"] = flops_reduction
 
         print("-" * 88)
         print("SYNTHETIC TILE BENCHMARK")
@@ -675,6 +724,16 @@ def main() -> None:
         print(
             f"State size : train={mib(training_stats['state_bytes']):.2f} MiB | "
             f"deploy={mib(deploy_stats['state_bytes']):.2f} MiB"
+        )
+        print(
+            f"Compute    : train={training_profile['gmacs_per_image']:.3f} GMACs / "
+            f"{training_profile['gflops_per_image']:.3f} GFLOPs | "
+            f"deploy={deploy_profile['gmacs_per_image']:.3f} GMACs / "
+            f"{deploy_profile['gflops_per_image']:.3f} GFLOPs"
+        )
+        print(
+            f"FLOPs cut  : {100.0 * flops_reduction:.2f}% "
+            f"(Conv/Linear only; 1 MAC = 2 FLOPs)"
         )
         print(
             f"Latency    : train={training_profile['latency_ms']:.3f} ms | "
