@@ -1,12 +1,14 @@
-"""Native-resolution Massachusetts road evaluation with sliding window + TTA.
+"""Trainer-matched native Massachusetts evaluation with optional TTA.
 
-Designed for checkpoints produced by train_fixed.py / DualBranchRoadNet.
-The test images are NOT resized. Each native-resolution image is evaluated by
-1024x1024 sliding windows (configurable) and blended with a Hann weight map.
+The default inference path reproduces train.py validation: native resolution,
+ImageNet normalization, reflect padding, 1024x1024 sliding tiles, 512-pixel
+overlap, Hann-weighted LOGIT blending, then one final softmax.  Optional flip4
+or D4 TTA applies this complete path to each transformed full image, reverses
+the transform on the blended logits, averages logits, and only then softmaxes.
 
-Metrics:
-  1) POOLED / micro: TP/FP/FN are summed over all evaluated images.
-  2) MEAN-IMG / macro: F1 (and IoU) are computed per image, then averaged.
+The default ``test117`` subset excludes the first 61 test.txt entries used for
+checkpoint selection.  Threshold search is intentionally restricted to
+``val61`` so the final test set cannot be used for calibration by accident.
 """
 from __future__ import annotations
 
@@ -138,8 +140,8 @@ def resolve_checkpoint(path: str | Path) -> Path:
         return path
     if path.is_dir():
         for name in (
-            "best.pt",
             "best_fixed_road_iou.pt",
+            "best.pt",
             "best_calibrated_road_iou.pt",
             "last.pt",
         ):
@@ -233,7 +235,7 @@ def main_logits(output) -> Tensor:
 
 
 @torch.inference_mode()
-def sliding_probability(
+def sliding_logits(
     model: nn.Module,
     x: Tensor,
     window: int,
@@ -242,7 +244,7 @@ def sliding_probability(
     amp: str,
     channels_last: bool,
 ) -> Tensor:
-    """Return road probability [1,1,H,W] for one normalized native image."""
+    """Return trainer-matched Hann-blended logits [1,2,H,W]."""
     if x.ndim != 4 or x.shape[0] != 1:
         raise ValueError("Expected x with shape [1, C, H, W]")
     if stride < 1 or stride > window:
@@ -261,7 +263,7 @@ def sliding_probability(
     xs = sliding_positions(width, window, stride)
     coordinates = [(y, xx) for y in ys for xx in xs]
 
-    accumulator = torch.zeros((1, 1, height, width), device=device, dtype=torch.float32)
+    accumulator = torch.zeros((1, 2, height, width), device=device, dtype=torch.float32)
     normalizer = torch.zeros((1, 1, height, width), device=device, dtype=torch.float32)
     weight = hann_weight(window, device)
     amp_enabled, amp_dtype = amp_settings(amp, device)
@@ -281,17 +283,43 @@ def sliding_probability(
             enabled=amp_enabled,
         ):
             logits = main_logits(model(tiles))
-            probabilities = logits.softmax(dim=1)[:, 1:2]
-        probabilities = probabilities.float()
+        logits = logits.float()
 
         for index, (y, xx) in enumerate(batch_coords):
             accumulator[:, :, y : y + window, xx : xx + window] += (
-                probabilities[index : index + 1] * weight
+                logits[index : index + 1] * weight
             )
             normalizer[:, :, y : y + window, xx : xx + window] += weight
 
-    probability = accumulator / normalizer.clamp_min_(1e-6)
-    return probability[:, :, :original_h, :original_w]
+    blended = accumulator / normalizer.clamp_min_(1e-6)
+    return blended[:, :, :original_h, :original_w]
+
+
+def tta_tags(mode: str) -> Tuple[str, ...]:
+    if mode == "none":
+        return ("r0",)
+    if mode == "flip4":
+        # identity, horizontal, vertical, and horizontal+vertical
+        return ("r0", "fr0", "fr2", "r2")
+    if mode == "d4":
+        return ("r0", "r1", "r2", "r3", "fr0", "fr1", "fr2", "fr3")
+    raise ValueError(f"Unsupported TTA mode: {mode}")
+
+
+def apply_tta(tensor: Tensor, tag: str) -> Tensor:
+    flipped = tag.startswith("f")
+    rotations = int(tag[-1])
+    output = torch.rot90(tensor, rotations, dims=(-2, -1))
+    if flipped:
+        output = torch.flip(output, dims=(-1,))
+    return output
+
+
+def invert_tta(tensor: Tensor, tag: str) -> Tensor:
+    flipped = tag.startswith("f")
+    rotations = int(tag[-1])
+    output = torch.flip(tensor, dims=(-1,)) if flipped else tensor
+    return torch.rot90(output, -rotations, dims=(-2, -1))
 
 
 @torch.inference_mode()
@@ -300,23 +328,19 @@ def predict_image(
     image: np.ndarray,
     window: int = 1024,
     stride: int = 512,
-    tta: bool = True,
+    tta_mode: str = "none",
     amp: str = "auto",
     tile_batch_size: int = 1,
     channels_last: bool = True,
 ) -> np.ndarray:
-    """Native-resolution sliding prediction with optional 4-way flip TTA."""
+    """Run trainer-matched inference and optional full-image logit TTA."""
     x = image_to_tensor(image)
 
-    # dims refer to [N,C,H,W]. Each prediction is flipped back before averaging.
-    flip_sets: Sequence[Tuple[int, ...]] = (
-        ((), (3,), (2,), (2, 3)) if tta else ((),)
-    )
-
-    total: Tensor | None = None
-    for dims in flip_sets:
-        x_aug = torch.flip(x, dims=dims) if dims else x
-        p = sliding_probability(
+    total_logits: Tensor | None = None
+    tags = tta_tags(tta_mode)
+    for tag in tags:
+        x_aug = apply_tta(x, tag)
+        logits = sliding_logits(
             model,
             x_aug,
             window=window,
@@ -325,13 +349,13 @@ def predict_image(
             amp=amp,
             channels_last=channels_last,
         )
-        if dims:
-            p = torch.flip(p, dims=dims)
-        total = p if total is None else total + p
+        logits = invert_tta(logits, tag)
+        total_logits = logits if total_logits is None else total_logits + logits
 
-    assert total is not None
-    total /= float(len(flip_sets))
-    return total[0, 0].cpu().numpy()
+    assert total_logits is not None
+    mean_logits = total_logits / float(len(tags))
+    probability = mean_logits.softmax(dim=1)[:, 1]
+    return probability[0].cpu().numpy()
 
 
 def counts(pred: np.ndarray, gt: np.ndarray) -> Tuple[int, int, int, int]:
@@ -350,20 +374,48 @@ def metrics_from_counts(tp: int, fp: int, fn: int, tn: int) -> Dict[str, float]:
     f1 = 2.0 * precision * recall / max(precision + recall, 1e-12)
     iou = tp / max(tp + fp + fn, 1)
     accuracy = (tp + tn) / max(tp + fp + fn + tn, 1)
+    background_iou = tn / max(tn + fp + fn, 1)
     return {
         "precision": precision,
         "recall": recall,
         "f1": f1,
         "iou": iou,
+        "background_iou": background_iou,
+        "miou": 0.5 * (iou + background_iou),
         "accuracy": accuracy,
     }
+
+
+def relaxed_components(
+    pred: np.ndarray,
+    gt: np.ndarray,
+    buffer_px: int,
+) -> Tuple[int, int, int, int]:
+    pred_t = torch.from_numpy(pred.astype(np.float32))[None, None]
+    gt_t = torch.from_numpy(gt.astype(np.float32))[None, None]
+    kernel = 2 * buffer_px + 1
+    pred_dilated = F.max_pool2d(
+        pred_t, kernel, stride=1, padding=buffer_px
+    ) > 0
+    gt_dilated = F.max_pool2d(
+        gt_t, kernel, stride=1, padding=buffer_px
+    ) > 0
+    pred_b = pred_t.bool()
+    gt_b = gt_t.bool()
+    return (
+        int((pred_b & gt_dilated).sum()),
+        int((gt_b & pred_dilated).sum()),
+        int(pred_b.sum()),
+        int(gt_b.sum()),
+    )
 
 
 def score_maps(
     probabilities: Sequence[np.ndarray],
     ground_truths: Sequence[np.ndarray],
     threshold: float,
-) -> Tuple[Dict[str, float], float, float]:
+    relaxed_buffer_px: int,
+) -> Tuple[Dict[str, float], float, float, float]:
     if len(probabilities) != len(ground_truths):
         raise ValueError("probabilities and ground_truths must have equal length")
     if not probabilities:
@@ -372,6 +424,7 @@ def score_maps(
     pooled = [0, 0, 0, 0]
     per_image_f1: List[float] = []
     per_image_iou: List[float] = []
+    relaxed = [0, 0, 0, 0]
 
     for probability, gt in zip(probabilities, ground_truths):
         pred = probability >= threshold
@@ -381,13 +434,36 @@ def score_maps(
         m = metrics_from_counts(tp, fp, fn, tn)
         per_image_f1.append(m["f1"])
         per_image_iou.append(m["iou"])
+        components = relaxed_components(pred, gt, relaxed_buffer_px)
+        for i, value in enumerate(components):
+            relaxed[i] += value
 
     pooled_metrics = metrics_from_counts(*pooled)
+    relaxed_precision = relaxed[0] / max(relaxed[2], 1)
+    relaxed_recall = relaxed[1] / max(relaxed[3], 1)
+    relaxed_f1 = (
+        2.0 * relaxed_precision * relaxed_recall
+        / max(relaxed_precision + relaxed_recall, 1e-12)
+    )
     return (
         pooled_metrics,
         float(np.mean(per_image_f1)),
         float(np.mean(per_image_iou)),
+        float(relaxed_f1),
     )
+
+
+def pooled_metrics_at_threshold(
+    probabilities: Sequence[np.ndarray],
+    ground_truths: Sequence[np.ndarray],
+    threshold: float,
+) -> Dict[str, float]:
+    pooled = [0, 0, 0, 0]
+    for probability, gt in zip(probabilities, ground_truths):
+        values = counts(probability >= threshold, gt)
+        for index, value in enumerate(values):
+            pooled[index] += value
+    return metrics_from_counts(*pooled)
 
 
 def load_cache(path: Path) -> Tuple[List[np.ndarray], List[np.ndarray], List[str]]:
@@ -410,7 +486,9 @@ def save_cache(
     prob_objects = np.empty(len(probabilities), dtype=object)
     gt_objects = np.empty(len(ground_truths), dtype=object)
     for index, probability in enumerate(probabilities):
-        prob_objects[index] = probability.astype(np.float16)
+        # Keep float32 so reloading a cache cannot move pixels across the
+        # fixed/calibrated threshold and change the reported IoU.
+        prob_objects[index] = probability.astype(np.float32)
     for index, gt in enumerate(ground_truths):
         gt_objects[index] = gt.astype(np.uint8)
     np.savez_compressed(
@@ -426,10 +504,25 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         description="Native-resolution DualBranchRoadNet evaluation",
     )
-    ap.add_argument("--ckpt", required=True, help="best.pt, last.pt, or checkpoint directory")
+    ap.add_argument(
+        "--ckpt",
+        required=True,
+        help="Exact checkpoint file is recommended",
+    )
     ap.add_argument("--weights", choices=("ema", "model"), default="ema")
     ap.add_argument("--thr", type=float, default=0.50)
-    ap.add_argument("--tta", action=argparse.BooleanOptionalAction, default=False)
+    ap.add_argument(
+        "--tta-mode",
+        choices=("none", "flip4", "d4"),
+        default="none",
+        help="none exactly matches trainer validation; flip4/d4 add logit TTA",
+    )
+    ap.add_argument(
+        "--tta",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Legacy alias: --tta selects flip4 and --no-tta selects none",
+    )
     ap.add_argument("--window", type=int, default=1024)
     ap.add_argument("--stride", type=int, default=512)
     ap.add_argument("--tile-batch-size", type=int, default=1)
@@ -438,7 +531,29 @@ def parse_args() -> argparse.Namespace:
         choices=("auto", "float16", "bfloat16", "none"),
         default="auto",
     )
-    ap.add_argument("--limit", type=int, default=None, help="First N test.txt images; omit for all")
+    ap.add_argument(
+        "--subset",
+        choices=("val61", "test117", "all178", "custom"),
+        default="test117",
+        help="Safe Massachusetts split; custom uses the supplied list unchanged",
+    )
+    ap.add_argument("--val-count", type=int, default=61)
+    ap.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional debug limit applied after subset selection",
+    )
+    ap.add_argument(
+        "--search-threshold",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Search pooled-IoU threshold; permitted only on val61",
+    )
+    ap.add_argument("--threshold-min", type=float, default=0.20)
+    ap.add_argument("--threshold-max", type=float, default=0.80)
+    ap.add_argument("--threshold-step", type=float, default=0.02)
+    ap.add_argument("--relaxed-buffer-px", type=int, default=3)
     ap.add_argument("--out", default=None, help="Optional .npz probability/GT cache")
 
     root = "/kaggle/input/datasets/datnguyentien204/massachu/massachusets"
@@ -456,6 +571,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.tta is not None:
+        args.tta_mode = "flip4" if args.tta else "none"
     if not 0.0 <= args.thr <= 1.0:
         raise ValueError("--thr must be in [0, 1]")
     if args.window < 32:
@@ -466,24 +583,52 @@ def main() -> None:
         raise ValueError("--tile-batch-size must be >= 1")
     if args.limit is not None and args.limit < 1:
         raise ValueError("--limit must be >= 1")
+    if args.val_count < 1:
+        raise ValueError("--val-count must be positive")
+    if args.relaxed_buffer_px < 0:
+        raise ValueError("--relaxed-buffer-px cannot be negative")
+    if args.threshold_step <= 0:
+        raise ValueError("--threshold-step must be positive")
+    if not 0.0 <= args.threshold_min <= args.threshold_max <= 1.0:
+        raise ValueError("Threshold search range must be inside [0, 1]")
+    if args.search_threshold and args.subset != "val61":
+        raise ValueError(
+            "Threshold search is allowed only on --subset val61; "
+            "reuse the selected threshold on test117"
+        )
 
     root = Path(args.data_root)
     image_dir = Path(args.image_dir) if args.image_dir else root / "images"
     mask_dir = Path(args.mask_dir) if args.mask_dir else root / "labels"
     test_list = Path(args.test_list) if args.test_list else root / "test.txt"
 
-    pairs = pairs_from_list(image_dir, mask_dir, test_list)
+    all_pairs = pairs_from_list(image_dir, mask_dir, test_list)
+    if args.subset == "val61":
+        pairs = all_pairs[: args.val_count]
+    elif args.subset == "test117":
+        pairs = all_pairs[args.val_count :]
+    else:
+        pairs = all_pairs
+    if not pairs:
+        raise RuntimeError(f"Subset {args.subset} contains no images")
     if args.limit is not None:
         pairs = pairs[: args.limit]
+    expected_names = [image_path.stem for image_path, _ in pairs]
 
     cache = Path(args.out) if args.out else None
     if cache is not None and cache.exists():
         print(f"Loading cached native probabilities: {cache}")
         probabilities, ground_truths, names = load_cache(cache)
-        if args.limit is not None:
-            probabilities = probabilities[: args.limit]
-            ground_truths = ground_truths[: args.limit]
-            names = names[: args.limit]
+        if len(probabilities) != len(pairs) or len(ground_truths) != len(pairs):
+            raise RuntimeError(
+                f"Cache has {len(probabilities)} predictions but subset "
+                f"{args.subset} requires {len(pairs)}; use a new --out path"
+            )
+        if names and names != expected_names:
+            raise RuntimeError(
+                "Cache image order does not match the selected subset; "
+                "use a new --out path"
+            )
     else:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         model, checkpoint, ckpt_path = load_model(
@@ -498,11 +643,12 @@ def main() -> None:
         print(f"Epoch      : {epoch if epoch > 0 else 'unknown'}")
         print(f"Device     : {device}")
         print(f"Test list  : {test_list}")
+        print(f"Subset     : {args.subset} (val_count={args.val_count})")
         print(f"Images     : {len(pairs)}")
         print(
             f"Inference  : native resolution | window={args.window} | "
             f"stride={args.stride} | overlap={args.window - args.stride} | "
-            f"TTA={args.tta} | AMP={args.amp}"
+            f"Hann LOGIT blending | TTA={args.tta_mode} | AMP={args.amp}"
         )
 
         probabilities: List[np.ndarray] = []
@@ -520,7 +666,7 @@ def main() -> None:
                 image,
                 window=args.window,
                 stride=args.stride,
-                tta=args.tta,
+                tta_mode=args.tta_mode,
                 amp=args.amp,
                 tile_batch_size=args.tile_batch_size,
                 channels_last=args.channels_last,
@@ -545,8 +691,11 @@ def main() -> None:
             save_cache(cache, probabilities, ground_truths, names)
             print(f"Saved cache: {cache}")
 
-    pooled, mean_f1, mean_iou = score_maps(
-        probabilities, ground_truths, args.thr
+    pooled, mean_f1, mean_iou, relaxed_f1 = score_maps(
+        probabilities,
+        ground_truths,
+        args.thr,
+        args.relaxed_buffer_px,
     )
     print("=" * 72)
     print(f"THRESHOLD {args.thr:.3f}")
@@ -555,9 +704,31 @@ def main() -> None:
         f"R={pooled['recall']:.4f} "
         f"F1={pooled['f1']:.4f} "
         f"IoU={pooled['iou']:.4f} "
+        f"BG-IoU={pooled['background_iou']:.4f} "
+        f"mIoU={pooled['miou']:.4f} "
         f"Acc={pooled['accuracy']:.4f}"
     )
     print(f"MEAN-IMG F1={mean_f1:.4f} IoU={mean_iou:.4f}")
+    print(
+        f"RELAXED ±{args.relaxed_buffer_px}px F1={relaxed_f1:.4f}"
+    )
+
+    if args.search_threshold:
+        best_threshold = args.thr
+        best_iou = -1.0
+        threshold = args.threshold_min
+        while threshold <= args.threshold_max + 1e-9:
+            candidate = pooled_metrics_at_threshold(
+                probabilities, ground_truths, threshold
+            )
+            if candidate["iou"] > best_iou:
+                best_iou = candidate["iou"]
+                best_threshold = threshold
+            threshold += args.threshold_step
+        print(
+            f"VAL-CALIBRATED threshold={best_threshold:.2f} "
+            f"pooled road IoU={best_iou:.4f}"
+        )
     print("=" * 72)
 
 
