@@ -621,6 +621,39 @@ def resolve_splits(
         return train_pairs, val_pairs, test_pairs
 
     all_pairs = build_pairs(args.train_image_dir, args.train_mask_dir)
+    if args.deepglobe_train_count is not None:
+        total = len(all_pairs)
+        train_count = int(args.deepglobe_train_count)
+        val_from_test_count = int(args.deepglobe_val_from_test_count)
+        if not 0 < train_count < total:
+            raise ValueError(
+                "deepglobe_train_count must be positive and smaller than the "
+                f"number of labeled pairs ({total})"
+            )
+        test_count = total - train_count
+        if not 0 < val_from_test_count <= test_count:
+            raise ValueError(
+                "deepglobe_val_from_test_count must be in [1, "
+                f"{test_count}] for this split"
+            )
+
+        # Paper-compatible overlapping protocol: choose the training set at
+        # random, retain every remaining pair as test, and take validation as
+        # a deterministic subset of that full test set.  Validation therefore
+        # overlaps test by design; this is recorded explicitly in the manifest.
+        generator = np.random.default_rng(args.split_seed)
+        indices = generator.permutation(total)
+        train_pairs = [all_pairs[int(i)] for i in indices[:train_count]]
+        test_pairs = [all_pairs[int(i)] for i in indices[train_count:]]
+        val_pairs = test_pairs[:val_from_test_count]
+        rank_zero_print(
+            "DeepGlobe overlapping paper split: "
+            f"train={len(train_pairs)}, val={len(val_pairs)} "
+            f"(subset of test), test={len(test_pairs)}, "
+            f"val-test overlap={len(val_pairs)}, seed={args.split_seed}"
+        )
+        return train_pairs, val_pairs, test_pairs
+
     if args.val_image_dir and args.val_mask_dir:
         val_images, val_masks = Path(args.val_image_dir), Path(args.val_mask_dir)
         if val_images.is_dir() and val_masks.is_dir():
@@ -1403,6 +1436,24 @@ def parse_args() -> argparse.Namespace:
         help="Held out and never evaluated during training when no labeled val exists",
     )
     parser.add_argument("--split_seed", type=int, default=3407)
+    parser.add_argument(
+        "--deepglobe_train_count",
+        type=int,
+        default=None,
+        help=(
+            "Exact randomly selected DeepGlobe training count. When set, all "
+            "remaining pairs form test and ratios are ignored."
+        ),
+    )
+    parser.add_argument(
+        "--deepglobe_val_from_test_count",
+        type=int,
+        default=0,
+        help=(
+            "Take exactly this many validation pairs from the beginning of "
+            "the shuffled DeepGlobe test set; test still retains every pair."
+        ),
+    )
 
     parser.add_argument("--crop_size", type=int, default=1024)
     parser.add_argument("--road_crop_probability", type=float, default=0.60)
@@ -1576,6 +1627,20 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("Massachusetts requires --train_list and --test_list")
         if args.test_eval_images < 1:
             raise ValueError("test_eval_images must be positive")
+        if (
+            args.deepglobe_train_count is not None
+            or args.deepglobe_val_from_test_count != 0
+        ):
+            raise ValueError("DeepGlobe exact-split flags cannot be used for Massachusetts")
+    elif args.deepglobe_train_count is None:
+        if args.deepglobe_val_from_test_count != 0:
+            raise ValueError(
+                "deepglobe_val_from_test_count requires deepglobe_train_count"
+            )
+    elif args.deepglobe_val_from_test_count < 1:
+        raise ValueError(
+            "deepglobe_val_from_test_count must be positive with an exact split"
+        )
     if args.fixed_road_weight is not None and args.fixed_road_weight <= 0.0:
         raise ValueError("fixed_road_weight must be positive")
     if not 0.0 < args.val_ratio < 1.0:
@@ -1636,12 +1701,20 @@ def save_split_manifest(
     test_pairs: Sequence[Tuple[Path, Path]],
     split_seed: int,
 ) -> None:
+    train_keys = {sample_key(image) for image, _ in train_pairs}
+    val_keys = {sample_key(image) for image, _ in val_pairs}
+    test_keys = {sample_key(image) for image, _ in test_pairs}
     manifest = {
         "split_seed": int(split_seed),
         "counts": {
             "train": len(train_pairs),
             "val": len(val_pairs),
             "test": len(test_pairs),
+        },
+        "overlap_counts": {
+            "train_val": len(train_keys & val_keys),
+            "train_test": len(train_keys & test_keys),
+            "val_test": len(val_keys & test_keys),
         },
         "train": [[str(image), str(mask)] for image, mask in train_pairs],
         "val": [[str(image), str(mask)] for image, mask in val_pairs],
