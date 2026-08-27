@@ -1,10 +1,11 @@
 """Trainer-matched native Massachusetts evaluation with optional TTA.
 
 The default inference path reproduces train.py validation: native resolution,
-ImageNet normalization, reflect padding, 1024x1024 sliding tiles, 512-pixel
-overlap, Hann-weighted LOGIT blending, then one final softmax.  Optional flip4
-or D4 TTA applies this complete path to each transformed full image, reverses
-the transform on the blended logits, averages logits, and only then softmaxes.
+ImageNet normalization, reflect padding, checkpoint-saved validation tile size
+and overlap, and Hann-weighted LOGIT blending. Optional flip4 or D4 TTA applies
+this complete path to each transformed full image and inverse-transforms the
+complete blended map. TTA views can be merged as probabilities (recommended)
+or logits.
 
 ``roadx3`` is a compatibility profile for the supplied roadx.infer code: pad
 the full image to a stride multiple, use identity + horizontal + vertical
@@ -430,11 +431,12 @@ def predict_image(
     window: int = 1024,
     stride: int = 512,
     tta_mode: str = "none",
+    tta_merge: str = "probabilities",
     amp: str = "auto",
     tile_batch_size: int = 1,
     channels_last: bool = True,
 ) -> np.ndarray:
-    """Run trainer-matched inference and optional full-image logit TTA."""
+    """Run trainer-matched sliding inference with optional full-image TTA."""
     x = image_to_tensor(image)
 
     if tta_mode == "roadx3":
@@ -467,6 +469,7 @@ def predict_image(
         return mean_probability[0, 0, :original_h, :original_w].cpu().numpy()
 
     total_logits: Tensor | None = None
+    total_probability: Tensor | None = None
     tags = tta_tags(tta_mode)
     for tag in tags:
         x_aug = apply_tta(x, tag)
@@ -480,12 +483,26 @@ def predict_image(
             channels_last=channels_last,
         )
         logits = invert_tta(logits, tag)
-        total_logits = logits if total_logits is None else total_logits + logits
+        if tta_merge == "probabilities":
+            probability = road_probability(logits)
+            total_probability = (
+                probability
+                if total_probability is None
+                else total_probability + probability
+            )
+        elif tta_merge == "logits":
+            total_logits = logits if total_logits is None else total_logits + logits
+        else:
+            raise ValueError(f"Unsupported TTA merge mode: {tta_merge}")
+
+    if tta_merge == "probabilities":
+        assert total_probability is not None
+        mean_probability = total_probability / float(len(tags))
+        return mean_probability[0, 0].cpu().numpy()
 
     assert total_logits is not None
     mean_logits = total_logits / float(len(tags))
-    probability = mean_logits.softmax(dim=1)[:, 1]
-    return probability[0].cpu().numpy()
+    return road_probability(mean_logits)[0, 0].cpu().numpy()
 
 
 def counts(pred: np.ndarray, gt: np.ndarray) -> Tuple[int, int, int, int]:
@@ -647,7 +664,16 @@ def parse_args() -> argparse.Namespace:
         default="none",
         help=(
             "none matches trainer validation; roadx3 uses corrected 3-view "
-            "RoadX probability TTA; flip4/d4 use trainer-style logit TTA"
+            "RoadX TTA; flip4/d4 retain trainer-matched sliding inference"
+        ),
+    )
+    ap.add_argument(
+        "--tta-merge",
+        choices=("probabilities", "logits"),
+        default="probabilities",
+        help=(
+            "how to average trainer-style TTA views; probability averaging is "
+            "the recommended model-averaging default"
         ),
     )
     ap.add_argument(
@@ -656,8 +682,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Legacy alias: --tta selects flip4 and --no-tta selects none",
     )
-    ap.add_argument("--window", type=int, default=1024)
-    ap.add_argument("--stride", type=int, default=512)
+    ap.add_argument(
+        "--window",
+        type=int,
+        default=None,
+        help="auto-read checkpoint args.val_tile_size when omitted",
+    )
+    ap.add_argument(
+        "--stride",
+        type=int,
+        default=None,
+        help="auto-compute window - checkpoint args.val_overlap when omitted",
+    )
     ap.add_argument("--tile-batch-size", type=int, default=1)
     ap.add_argument(
         "--amp",
@@ -708,9 +744,15 @@ def main() -> None:
         args.tta_mode = "flip4" if args.tta else "none"
     if not 0.0 <= args.thr <= 1.0:
         raise ValueError("--thr must be in [0, 1]")
-    if args.window < 32:
+    if args.window is not None and args.window < 32:
         raise ValueError("--window must be >= 32")
-    if args.stride < 1 or args.stride > args.window:
+    if args.stride is not None and args.stride < 1:
+        raise ValueError("--stride must be >= 1")
+    if (
+        args.window is not None
+        and args.stride is not None
+        and args.stride > args.window
+    ):
         raise ValueError("--stride must satisfy 1 <= stride <= window")
     if args.tile_batch_size < 1:
         raise ValueError("--tile-batch-size must be >= 1")
@@ -770,6 +812,24 @@ def main() -> None:
             weights=args.weights,
             channels_last=args.channels_last,
         )
+        checkpoint_args = checkpoint["args"]
+        saved_window = int(checkpoint_args.get("val_tile_size", 1024))
+        saved_overlap = int(checkpoint_args.get("val_overlap", 256))
+        window = saved_window if args.window is None else int(args.window)
+        stride = (
+            window - saved_overlap
+            if args.stride is None
+            else int(args.stride)
+        )
+        if window < 32:
+            raise ValueError("Resolved inference window must be >= 32")
+        if stride < 1 or stride > window:
+            raise ValueError(
+                "Resolved stride must satisfy 1 <= stride <= window; "
+                f"checkpoint val_tile_size={saved_window}, "
+                f"val_overlap={saved_overlap}, resolved window={window}, "
+                f"stride={stride}"
+            )
         epoch = int(checkpoint.get("epoch", -1)) + 1
         print(f"Checkpoint : {ckpt_path}")
         print(f"Weights    : {args.weights}")
@@ -778,6 +838,10 @@ def main() -> None:
         print(f"Test list  : {test_list}")
         print(f"Subset     : {args.subset} (val_count={args.val_count})")
         print(f"Images     : {len(pairs)}")
+        print(
+            f"Train val  : tile={saved_window} | overlap={saved_overlap} | "
+            f"stride={saved_window - saved_overlap}"
+        )
         if args.tta_mode == "roadx3":
             inference_profile = (
                 "stride-multiple reflect pad | uniform PROB blending | "
@@ -786,9 +850,10 @@ def main() -> None:
         else:
             inference_profile = "Hann LOGIT blending"
         print(
-            f"Inference  : native resolution | window={args.window} | "
-            f"stride={args.stride} | overlap={args.window - args.stride} | "
-            f"{inference_profile} | TTA={args.tta_mode} | AMP={args.amp}"
+            f"Inference  : native resolution | window={window} | "
+            f"stride={stride} | overlap={window - stride} | "
+            f"{inference_profile} | TTA={args.tta_mode} | "
+            f"merge={args.tta_merge} | AMP={args.amp}"
         )
 
         probabilities: List[np.ndarray] = []
@@ -804,9 +869,10 @@ def main() -> None:
             probability = predict_image(
                 model,
                 image,
-                window=args.window,
-                stride=args.stride,
+                window=window,
+                stride=stride,
                 tta_mode=args.tta_mode,
+                tta_merge=args.tta_merge,
                 amp=args.amp,
                 tile_batch_size=args.tile_batch_size,
                 channels_last=args.channels_last,
