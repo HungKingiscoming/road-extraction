@@ -6,6 +6,13 @@ overlap, Hann-weighted LOGIT blending, then one final softmax.  Optional flip4
 or D4 TTA applies this complete path to each transformed full image, reverses
 the transform on the blended logits, averages logits, and only then softmaxes.
 
+``roadx3`` is a compatibility profile for the supplied roadx.infer code: pad
+the full image to a stride multiple, use identity + horizontal + vertical
+views, uniformly blend per-tile probabilities, inverse-transform each complete
+probability canvas, and average the three canvases. Inverting the complete
+canvas fixes the coordinate error caused by inverse-flipping each tile while
+leaving it at the transformed tile coordinate.
+
 The default ``test117`` subset excludes the first 61 test.txt entries used for
 checkpoint selection.  Threshold search is intentionally restricted to
 ``val61`` so the final test set cannot be used for calibration by accident.
@@ -221,12 +228,18 @@ def amp_settings(mode: str, device: torch.device) -> Tuple[bool, torch.dtype]:
         return False, torch.float32
     if mode == "bfloat16":
         return True, torch.bfloat16
-    # auto and float16 both use fp16 on CUDA/T4.
+    if mode == "auto" and torch.cuda.is_bf16_supported():
+        return True, torch.bfloat16
+    # float16, and auto on devices without native bf16 support (for example T4).
     return True, torch.float16
 
 
 def main_logits(output) -> Tensor:
     # train_fixed.py uses the final tuple element as the segmentation logits.
+    if isinstance(output, dict):
+        if "logits" not in output:
+            raise KeyError("Dictionary model output has no 'logits' entry")
+        output = output["logits"]
     if isinstance(output, tuple):
         output = output[-1]
     if not torch.is_tensor(output):
@@ -295,9 +308,73 @@ def sliding_logits(
     return blended[:, :, :original_h, :original_w]
 
 
+@torch.inference_mode()
+def sliding_probabilities_uniform(
+    model: nn.Module,
+    x: Tensor,
+    window: int,
+    stride: int,
+    tile_batch_size: int,
+    amp: str,
+    channels_last: bool,
+) -> Tensor:
+    """RoadX-style uniform blending of per-tile road probabilities."""
+    if x.ndim != 4 or x.shape[0] != 1:
+        raise ValueError("Expected x with shape [1, C, H, W]")
+    if stride < 1 or stride > window:
+        raise ValueError("stride must satisfy 1 <= stride <= window")
+
+    device = next(model.parameters()).device
+    original_h, original_w = x.shape[-2:]
+    pad_h = max(0, window - original_h)
+    pad_w = max(0, window - original_w)
+    if pad_h or pad_w:
+        mode = "reflect" if min(original_h, original_w) > 1 else "replicate"
+        x = F.pad(x, (0, pad_w, 0, pad_h), mode=mode)
+
+    height, width = x.shape[-2:]
+    ys = sliding_positions(height, window, stride)
+    xs = sliding_positions(width, window, stride)
+    coordinates = [(y, xx) for y in ys for xx in xs]
+    accumulator = torch.zeros(
+        (1, 1, height, width), device=device, dtype=torch.float32
+    )
+    normalizer = torch.zeros_like(accumulator)
+    amp_enabled, amp_dtype = amp_settings(amp, device)
+
+    for start in range(0, len(coordinates), tile_batch_size):
+        batch_coords = coordinates[start : start + tile_batch_size]
+        tiles = torch.cat(
+            [x[:, :, y : y + window, xx : xx + window] for y, xx in batch_coords],
+            dim=0,
+        ).to(device, non_blocking=True)
+        if channels_last:
+            tiles = tiles.contiguous(memory_format=torch.channels_last)
+
+        with torch.autocast(
+            device_type=device.type,
+            dtype=amp_dtype,
+            enabled=amp_enabled,
+        ):
+            probabilities = road_probability(main_logits(model(tiles)))
+        probabilities = probabilities.float()
+
+        for index, (y, xx) in enumerate(batch_coords):
+            accumulator[:, :, y : y + window, xx : xx + window] += (
+                probabilities[index : index + 1]
+            )
+            normalizer[:, :, y : y + window, xx : xx + window] += 1.0
+
+    blended = accumulator / normalizer.clamp_min_(1.0)
+    return blended[:, :, :original_h, :original_w]
+
+
 def tta_tags(mode: str) -> Tuple[str, ...]:
     if mode == "none":
         return ("r0",)
+    if mode == "roadx3":
+        # Supplied roadx.infer profile: identity, horizontal, vertical.
+        return ("r0", "fr0", "fr2")
     if mode == "flip4":
         # identity, horizontal, vertical, and horizontal+vertical
         return ("r0", "fr0", "fr2", "r2")
@@ -313,6 +390,30 @@ def apply_tta(tensor: Tensor, tag: str) -> Tensor:
     if flipped:
         output = torch.flip(output, dims=(-1,))
     return output
+
+
+def road_probability(logits: Tensor) -> Tensor:
+    """Convert one- or two-class segmentation logits to [N,1,H,W]."""
+    if logits.ndim != 4:
+        raise ValueError(f"Expected 4-D logits, got shape {tuple(logits.shape)}")
+    if logits.shape[1] == 1:
+        return logits.sigmoid()
+    if logits.shape[1] == 2:
+        return logits.softmax(dim=1)[:, 1:2]
+    raise ValueError(
+        f"Expected one or two output channels, got {logits.shape[1]}"
+    )
+
+
+def pad_to_multiple(x: Tensor, multiple: int) -> Tuple[Tensor, Tuple[int, int]]:
+    """Reflect-pad bottom/right so H and W are divisible by ``multiple``."""
+    original_h, original_w = x.shape[-2:]
+    pad_h = (multiple - original_h % multiple) % multiple
+    pad_w = (multiple - original_w % multiple) % multiple
+    if pad_h or pad_w:
+        mode = "reflect" if min(original_h, original_w) > 1 else "replicate"
+        x = F.pad(x, (0, pad_w, 0, pad_h), mode=mode)
+    return x, (original_h, original_w)
 
 
 def invert_tta(tensor: Tensor, tag: str) -> Tensor:
@@ -335,6 +436,35 @@ def predict_image(
 ) -> np.ndarray:
     """Run trainer-matched inference and optional full-image logit TTA."""
     x = image_to_tensor(image)
+
+    if tta_mode == "roadx3":
+        # Match supplied RoadX padding, views, uniform tile blending, and
+        # probability averaging. Invert each complete reconstructed canvas so
+        # transformed tile coordinates return to the correct original region.
+        x, (original_h, original_w) = pad_to_multiple(x, stride)
+        total_probability: Tensor | None = None
+        tags = tta_tags(tta_mode)
+        for tag in tags:
+            transformed = apply_tta(x, tag)
+            probability = sliding_probabilities_uniform(
+                model,
+                transformed,
+                window=window,
+                stride=stride,
+                tile_batch_size=tile_batch_size,
+                amp=amp,
+                channels_last=channels_last,
+            )
+            probability = invert_tta(probability, tag)
+            total_probability = (
+                probability
+                if total_probability is None
+                else total_probability + probability
+            )
+
+        assert total_probability is not None
+        mean_probability = total_probability / float(len(tags))
+        return mean_probability[0, 0, :original_h, :original_w].cpu().numpy()
 
     total_logits: Tensor | None = None
     tags = tta_tags(tta_mode)
@@ -513,9 +643,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--thr", type=float, default=0.50)
     ap.add_argument(
         "--tta-mode",
-        choices=("none", "flip4", "d4"),
+        choices=("none", "roadx3", "flip4", "d4"),
         default="none",
-        help="none exactly matches trainer validation; flip4/d4 add logit TTA",
+        help=(
+            "none matches trainer validation; roadx3 uses corrected 3-view "
+            "RoadX probability TTA; flip4/d4 use trainer-style logit TTA"
+        ),
     )
     ap.add_argument(
         "--tta",
@@ -645,10 +778,17 @@ def main() -> None:
         print(f"Test list  : {test_list}")
         print(f"Subset     : {args.subset} (val_count={args.val_count})")
         print(f"Images     : {len(pairs)}")
+        if args.tta_mode == "roadx3":
+            inference_profile = (
+                "stride-multiple reflect pad | uniform PROB blending | "
+                "3-view corrected RoadX TTA"
+            )
+        else:
+            inference_profile = "Hann LOGIT blending"
         print(
             f"Inference  : native resolution | window={args.window} | "
             f"stride={args.stride} | overlap={args.window - args.stride} | "
-            f"Hann LOGIT blending | TTA={args.tta_mode} | AMP={args.amp}"
+            f"{inference_profile} | TTA={args.tta_mode} | AMP={args.amp}"
         )
 
         probabilities: List[np.ndarray] = []
