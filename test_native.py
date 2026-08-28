@@ -1,4 +1,4 @@
-"""Trainer-matched native Massachusetts evaluation with optional TTA.
+"""Trainer-matched native Massachusetts/DeepGlobe evaluation with TTA.
 
 The default inference path reproduces train.py validation: native resolution,
 ImageNet normalization, reflect padding, checkpoint-saved validation tile size
@@ -14,13 +14,14 @@ probability canvas, and average the three canvases. Inverting the complete
 canvas fixes the coordinate error caused by inverse-flipping each tile while
 leaving it at the transformed tile coordinate.
 
-The default ``test117`` subset excludes the first 61 test.txt entries used for
-checkpoint selection.  Threshold search is intentionally restricted to
-``val61`` so the final test set cannot be used for calibration by accident.
+Massachusetts subsets come from test.txt. DeepGlobe subsets come from the exact
+split_manifest.json saved during training, including the requested overlapping
+protocol in which val300 is contained in the full test1226 set.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
@@ -117,6 +118,38 @@ def pairs_from_list(
     return pairs
 
 
+def pairs_from_manifest(
+    manifest_path: str | Path,
+    split: str,
+) -> Tuple[List[Tuple[Path, Path]], dict]:
+    """Load an exact train.py split without regenerating random indices."""
+    manifest_path = Path(manifest_path)
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Split manifest not found: {manifest_path}")
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    if not isinstance(manifest, dict):
+        raise TypeError(f"Invalid split manifest: {manifest_path}")
+    raw_pairs = manifest.get(split)
+    if not isinstance(raw_pairs, list) or not raw_pairs:
+        raise RuntimeError(
+            f"Manifest split '{split}' is absent or empty: {manifest_path}"
+        )
+    pairs: List[Tuple[Path, Path]] = []
+    for index, item in enumerate(raw_pairs):
+        if not isinstance(item, list) or len(item) != 2:
+            raise RuntimeError(
+                f"Invalid {split}[{index}] entry in {manifest_path}: {item!r}"
+            )
+        image_path, mask_path = Path(item[0]), Path(item[1])
+        if not image_path.is_file() or not mask_path.is_file():
+            raise FileNotFoundError(
+                f"Manifest pair does not exist: {image_path} | {mask_path}"
+            )
+        pairs.append((image_path, mask_path))
+    return pairs, manifest
+
+
 def read_rgb(path: Path) -> np.ndarray:
     return np.asarray(Image.open(path).convert("RGB"), dtype=np.uint8)
 
@@ -167,6 +200,7 @@ def load_model(
     device: torch.device,
     weights: str,
     channels_last: bool,
+    deploy: bool = False,
 ) -> Tuple[nn.Module, dict, Path]:
     checkpoint_path = resolve_checkpoint(checkpoint_path)
     try:
@@ -200,8 +234,21 @@ def load_model(
     if not isinstance(state, dict):
         raise KeyError(f"No usable '{weights}', model, ema, or state_dict weights found")
 
+    # IMPORTANT: load the TRAINING-form checkpoint first.  Only after all
+    # RepVGG/RepDepthwise branches and BN statistics are restored do we fuse
+    # them into their deploy convolutions.  Building deploy=True before loading
+    # would change the state-dict keys and make the training checkpoint invalid.
     model.load_state_dict(clean_state_dict(state), strict=True)
     model = model.to(device).eval()
+
+    if deploy:
+        if not hasattr(model, "switch_to_deploy"):
+            raise AttributeError(
+                "This model has no switch_to_deploy() method; cannot enable deploy mode"
+            )
+        model.switch_to_deploy()
+        model.eval()
+
     if channels_last:
         model = model.to(memory_format=torch.channels_last)
 
@@ -656,7 +703,22 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Exact checkpoint file is recommended",
     )
+    ap.add_argument(
+        "--dataset",
+        choices=("massachusetts", "deepglobe"),
+        default=None,
+        help="Auto-read checkpoint args.dataset when omitted",
+    )
     ap.add_argument("--weights", choices=("ema", "model"), default="ema")
+    ap.add_argument(
+        "--deploy",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Fuse RepVGGBlock/RepDepthwiseBlock training branches into deploy "
+            "convolutions after loading the checkpoint"
+        ),
+    )
     ap.add_argument("--thr", type=float, default=0.50)
     ap.add_argument(
         "--tta-mode",
@@ -702,9 +764,15 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument(
         "--subset",
-        choices=("val61", "test117", "all178", "custom"),
-        default="test117",
-        help="Safe Massachusetts split; custom uses the supplied list unchanged",
+        choices=(
+            "val61", "test117", "all178", "custom",
+            "deepglobe_val300", "deepglobe_test1226",
+        ),
+        default=None,
+        help=(
+            "Default is test117 for Massachusetts and deepglobe_test1226 for "
+            "DeepGlobe"
+        ),
     )
     ap.add_argument("--val-count", type=int, default=61)
     ap.add_argument(
@@ -731,6 +799,14 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--mask-dir", default=None)
     ap.add_argument("--test-list", default=None)
     ap.add_argument(
+        "--split-manifest",
+        default=None,
+        help=(
+            "DeepGlobe split_manifest.json; defaults to the checkpoint "
+            "directory"
+        ),
+    )
+    ap.add_argument(
         "--channels-last",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -742,6 +818,28 @@ def main() -> None:
     args = parse_args()
     if args.tta is not None:
         args.tta_mode = "flip4" if args.tta else "none"
+
+    # Resolve the dataset before selecting pairs. This small metadata load also
+    # lets a DeepGlobe checkpoint find the manifest beside itself by default.
+    resolved_ckpt = resolve_checkpoint(args.ckpt)
+    if args.dataset is None:
+        try:
+            metadata = torch.load(
+                resolved_ckpt, map_location="cpu", weights_only=False
+            )
+        except TypeError:
+            metadata = torch.load(resolved_ckpt, map_location="cpu")
+        saved_args = metadata.get("args", {}) if isinstance(metadata, dict) else {}
+        args.dataset = str(saved_args.get("dataset", "massachusetts"))
+        del metadata
+    if args.dataset not in {"massachusetts", "deepglobe"}:
+        raise ValueError(f"Unsupported checkpoint dataset: {args.dataset}")
+    if args.subset is None:
+        args.subset = (
+            "deepglobe_test1226"
+            if args.dataset == "deepglobe"
+            else "test117"
+        )
     if not 0.0 <= args.thr <= 1.0:
         raise ValueError("--thr must be in [0, 1]")
     if args.window is not None and args.window < 32:
@@ -766,24 +864,58 @@ def main() -> None:
         raise ValueError("--threshold-step must be positive")
     if not 0.0 <= args.threshold_min <= args.threshold_max <= 1.0:
         raise ValueError("Threshold search range must be inside [0, 1]")
-    if args.search_threshold and args.subset != "val61":
+    calibration_subsets = {"val61", "deepglobe_val300"}
+    if args.search_threshold and args.subset not in calibration_subsets:
         raise ValueError(
-            "Threshold search is allowed only on --subset val61; "
-            "reuse the selected threshold on test117"
+            "Threshold search is allowed only on val61 or deepglobe_val300; "
+            "reuse the selected threshold on the corresponding full test set"
         )
 
-    root = Path(args.data_root)
-    image_dir = Path(args.image_dir) if args.image_dir else root / "images"
-    mask_dir = Path(args.mask_dir) if args.mask_dir else root / "labels"
-    test_list = Path(args.test_list) if args.test_list else root / "test.txt"
-
-    all_pairs = pairs_from_list(image_dir, mask_dir, test_list)
-    if args.subset == "val61":
-        pairs = all_pairs[: args.val_count]
-    elif args.subset == "test117":
-        pairs = all_pairs[args.val_count :]
+    if args.dataset == "deepglobe":
+        if args.subset not in {"deepglobe_val300", "deepglobe_test1226"}:
+            raise ValueError(
+                "DeepGlobe requires --subset deepglobe_val300 or "
+                "deepglobe_test1226"
+            )
+        manifest_path = (
+            Path(args.split_manifest)
+            if args.split_manifest
+            else resolved_ckpt.parent / "split_manifest.json"
+        )
+        manifest_split = (
+            "val" if args.subset == "deepglobe_val300" else "test"
+        )
+        pairs, manifest = pairs_from_manifest(manifest_path, manifest_split)
+        expected_count = 300 if manifest_split == "val" else 1226
+        if len(pairs) != expected_count:
+            raise RuntimeError(
+                f"{args.subset} requires {expected_count} pairs, but manifest "
+                f"contains {len(pairs)}"
+            )
+        overlap_counts = manifest.get("overlap_counts", {})
+        if int(overlap_counts.get("val_test", -1)) != 300:
+            raise RuntimeError(
+                "Manifest does not record the requested 300-image val/test "
+                f"overlap: {overlap_counts}"
+            )
+        split_source = manifest_path
     else:
-        pairs = all_pairs
+        if args.subset not in {"val61", "test117", "all178", "custom"}:
+            raise ValueError(
+                "Massachusetts requires val61, test117, all178, or custom"
+            )
+        root = Path(args.data_root)
+        image_dir = Path(args.image_dir) if args.image_dir else root / "images"
+        mask_dir = Path(args.mask_dir) if args.mask_dir else root / "labels"
+        test_list = Path(args.test_list) if args.test_list else root / "test.txt"
+        all_pairs = pairs_from_list(image_dir, mask_dir, test_list)
+        if args.subset == "val61":
+            pairs = all_pairs[: args.val_count]
+        elif args.subset == "test117":
+            pairs = all_pairs[args.val_count :]
+        else:
+            pairs = all_pairs
+        split_source = test_list
     if not pairs:
         raise RuntimeError(f"Subset {args.subset} contains no images")
     if args.limit is not None:
@@ -791,6 +923,9 @@ def main() -> None:
     expected_names = [image_path.stem for image_path, _ in pairs]
 
     cache = Path(args.out) if args.out else None
+    if cache is not None and args.deploy:
+        # Never reuse a non-deploy probability cache for a deploy evaluation.
+        cache = cache.with_name(f"{cache.stem}_deploy{cache.suffix}")
     if cache is not None and cache.exists():
         print(f"Loading cached native probabilities: {cache}")
         probabilities, ground_truths, names = load_cache(cache)
@@ -811,6 +946,7 @@ def main() -> None:
             device=device,
             weights=args.weights,
             channels_last=args.channels_last,
+            deploy=args.deploy,
         )
         checkpoint_args = checkpoint["args"]
         saved_window = int(checkpoint_args.get("val_tile_size", 1024))
@@ -833,10 +969,18 @@ def main() -> None:
         epoch = int(checkpoint.get("epoch", -1)) + 1
         print(f"Checkpoint : {ckpt_path}")
         print(f"Weights    : {args.weights}")
+        print(f"Deploy     : {'ON' if args.deploy else 'OFF'}")
         print(f"Epoch      : {epoch if epoch > 0 else 'unknown'}")
         print(f"Device     : {device}")
-        print(f"Test list  : {test_list}")
-        print(f"Subset     : {args.subset} (val_count={args.val_count})")
+        print(f"Dataset    : {args.dataset}")
+        print(f"Split file : {split_source}")
+        if args.dataset == "deepglobe":
+            print(
+                f"Subset     : {args.subset} "
+                "(val300 is contained in test1226)"
+            )
+        else:
+            print(f"Subset     : {args.subset} (val_count={args.val_count})")
         print(f"Images     : {len(pairs)}")
         print(
             f"Train val  : tile={saved_window} | overlap={saved_overlap} | "
@@ -853,7 +997,8 @@ def main() -> None:
             f"Inference  : native resolution | window={window} | "
             f"stride={stride} | overlap={window - stride} | "
             f"{inference_profile} | TTA={args.tta_mode} | "
-            f"merge={args.tta_merge} | AMP={args.amp}"
+            f"merge={args.tta_merge} | AMP={args.amp} | "
+            f"deploy={'on' if args.deploy else 'off'}"
         )
 
         probabilities: List[np.ndarray] = []
