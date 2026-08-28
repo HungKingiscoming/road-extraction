@@ -14,9 +14,9 @@ probability canvas, and average the three canvases. Inverting the complete
 canvas fixes the coordinate error caused by inverse-flipping each tile while
 leaving it at the transformed tile coordinate.
 
-Massachusetts subsets come from test.txt. DeepGlobe subsets come from the exact
-split_manifest.json saved during training, including the requested overlapping
-protocol in which val300 is contained in the full test1226 set.
+Massachusetts subsets come from test.txt. DeepGlobe uses split_manifest.json
+when available; otherwise it deterministically regenerates the exact training
+split, including val300 inside the full test1226 set.
 """
 from __future__ import annotations
 
@@ -53,7 +53,10 @@ def sample_key(path: Path) -> str:
     return key
 
 
-def index_files(folder: str | Path) -> Dict[str, Path]:
+def index_files(
+    folder: str | Path,
+    role: str | None = None,
+) -> Dict[str, Path]:
     folder = Path(folder)
     if not folder.is_dir():
         raise FileNotFoundError(f"Dataset directory not found: {folder}")
@@ -62,6 +65,15 @@ def index_files(folder: str | Path) -> Dict[str, Path]:
         p for p in folder.rglob("*")
         if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
     )
+    if role is not None:
+        if role not in {"image", "mask"}:
+            raise ValueError("role must be image, mask, or None")
+        files = [
+            path
+            for path in files
+            if any(path.stem.lower().endswith(s) for s in MASK_SUFFIXES)
+            == (role == "mask")
+        ]
     if not files:
         raise RuntimeError(f"No supported images found in {folder}")
 
@@ -74,6 +86,49 @@ def index_files(folder: str | Path) -> Dict[str, Path]:
             )
         indexed[key] = path
     return indexed
+
+
+def build_pairs(
+    image_dir: str | Path,
+    mask_dir: str | Path,
+) -> List[Tuple[Path, Path]]:
+    """Pair files by stem, including DeepGlobe's shared train directory."""
+    image_dir, mask_dir = Path(image_dir), Path(mask_dir)
+    same_folder = image_dir.resolve() == mask_dir.resolve()
+    images = index_files(image_dir, role="image" if same_folder else None)
+    masks = index_files(mask_dir, role="mask" if same_folder else None)
+    common = sorted(images.keys() & masks.keys())
+    if len(common) != len(images) or len(common) != len(masks):
+        raise RuntimeError(
+            "Image/mask pairing mismatch: "
+            f"images={len(images)}, masks={len(masks)}, pairs={len(common)}"
+        )
+    return [(images[key], masks[key]) for key in common]
+
+
+def regenerate_deepglobe_split(
+    image_dir: str | Path,
+    mask_dir: str | Path,
+    train_count: int,
+    val_from_test_count: int,
+    split_seed: int,
+) -> Tuple[List[Tuple[Path, Path]], List[Tuple[Path, Path]]]:
+    """Reproduce train.py's deterministic overlapping DeepGlobe split."""
+    all_pairs = build_pairs(image_dir, mask_dir)
+    total = len(all_pairs)
+    if not 0 < train_count < total:
+        raise ValueError(
+            f"train_count={train_count} is invalid for {total} labeled pairs"
+        )
+    generator = np.random.default_rng(split_seed)
+    indices = generator.permutation(total)
+    test_pairs = [all_pairs[int(i)] for i in indices[train_count:]]
+    if not 0 < val_from_test_count <= len(test_pairs):
+        raise ValueError(
+            f"val_from_test_count={val_from_test_count} is invalid for "
+            f"{len(test_pairs)} test pairs"
+        )
+    return test_pairs[:val_from_test_count], test_pairs
 
 
 def pairs_from_list(
@@ -793,8 +848,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--relaxed-buffer-px", type=int, default=3)
     ap.add_argument("--out", default=None, help="Optional .npz probability/GT cache")
 
-    root = "/kaggle/input/datasets/datnguyentien204/massachu/massachusets"
-    ap.add_argument("--data-root", default=root)
+    ap.add_argument(
+        "--data-root",
+        default=None,
+        help="Auto-select the known Massachusetts/DeepGlobe Kaggle root",
+    )
     ap.add_argument("--image-dir", default=None)
     ap.add_argument("--mask-dir", default=None)
     ap.add_argument("--test-list", default=None)
@@ -806,6 +864,9 @@ def parse_args() -> argparse.Namespace:
             "directory"
         ),
     )
+    ap.add_argument("--split-seed", type=int, default=3407)
+    ap.add_argument("--deepglobe-train-count", type=int, default=5000)
+    ap.add_argument("--deepglobe-val-from-test-count", type=int, default=300)
     ap.add_argument(
         "--channels-last",
         action=argparse.BooleanOptionalAction,
@@ -858,6 +919,10 @@ def main() -> None:
         raise ValueError("--limit must be >= 1")
     if args.val_count < 1:
         raise ValueError("--val-count must be positive")
+    if args.deepglobe_train_count < 1:
+        raise ValueError("--deepglobe-train-count must be positive")
+    if args.deepglobe_val_from_test_count < 1:
+        raise ValueError("--deepglobe-val-from-test-count must be positive")
     if args.relaxed_buffer_px < 0:
         raise ValueError("--relaxed-buffer-px cannot be negative")
     if args.threshold_step <= 0:
@@ -885,26 +950,59 @@ def main() -> None:
         manifest_split = (
             "val" if args.subset == "deepglobe_val300" else "test"
         )
-        pairs, manifest = pairs_from_manifest(manifest_path, manifest_split)
+        if manifest_path.is_file():
+            pairs, manifest = pairs_from_manifest(manifest_path, manifest_split)
+            overlap_counts = manifest.get("overlap_counts", {})
+            if int(overlap_counts.get("val_test", -1)) != 300:
+                raise RuntimeError(
+                    "Manifest does not record the requested 300-image val/test "
+                    f"overlap: {overlap_counts}"
+                )
+            split_source = manifest_path
+        else:
+            deepglobe_root = Path(
+                args.data_root
+                or "/kaggle/input/datasets/balraj98/"
+                "deepglobe-road-extraction-dataset"
+            )
+            image_dir = (
+                Path(args.image_dir)
+                if args.image_dir
+                else deepglobe_root / "train"
+            )
+            mask_dir = (
+                Path(args.mask_dir)
+                if args.mask_dir
+                else deepglobe_root / "train"
+            )
+            val_pairs, test_pairs = regenerate_deepglobe_split(
+                image_dir=image_dir,
+                mask_dir=mask_dir,
+                train_count=args.deepglobe_train_count,
+                val_from_test_count=args.deepglobe_val_from_test_count,
+                split_seed=args.split_seed,
+            )
+            pairs = val_pairs if manifest_split == "val" else test_pairs
+            split_source = Path(
+                "regenerated:"
+                f"seed={args.split_seed},train={args.deepglobe_train_count},"
+                f"val_from_test={args.deepglobe_val_from_test_count}"
+            )
         expected_count = 300 if manifest_split == "val" else 1226
         if len(pairs) != expected_count:
             raise RuntimeError(
-                f"{args.subset} requires {expected_count} pairs, but manifest "
-                f"contains {len(pairs)}"
+                f"{args.subset} requires {expected_count} pairs, but the "
+                f"resolved split contains {len(pairs)}"
             )
-        overlap_counts = manifest.get("overlap_counts", {})
-        if int(overlap_counts.get("val_test", -1)) != 300:
-            raise RuntimeError(
-                "Manifest does not record the requested 300-image val/test "
-                f"overlap: {overlap_counts}"
-            )
-        split_source = manifest_path
     else:
         if args.subset not in {"val61", "test117", "all178", "custom"}:
             raise ValueError(
                 "Massachusetts requires val61, test117, all178, or custom"
             )
-        root = Path(args.data_root)
+        root = Path(
+            args.data_root
+            or "/kaggle/input/datasets/datnguyentien204/massachu/massachusets"
+        )
         image_dir = Path(args.image_dir) if args.image_dir else root / "images"
         mask_dir = Path(args.mask_dir) if args.mask_dir else root / "labels"
         test_list = Path(args.test_list) if args.test_list else root / "test.txt"
