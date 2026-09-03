@@ -1,253 +1,266 @@
-# DualBranchRoadNet — Road Extraction from Remote Sensing Imagery
+# DualBranchRoadNet for Road Extraction from Remote Sensing Imagery
 
-Research code for **road extraction** (binary road segmentation) from
-high-resolution satellite and aerial imagery, evaluated on two standard
-benchmarks: **Massachusetts Roads** and **DeepGlobe Road Extraction**.
+This repository implements a PyTorch road extraction pipeline for high-resolution aerial and satellite imagery. The project focuses on binary road segmentation and is evaluated on two standard benchmarks: Massachusetts Roads and DeepGlobe Road Extraction.
 
-The entire pipeline — data handling, model, loss, training, inference and
-profiling — is written in plain PyTorch with no dependency on
-`mmsegmentation`, `segmentation_models_pytorch` or `albumentations`. It runs on a
-single GPU or on multiple GPUs via DDP (tested on Kaggle T4×2).
+The code is built from scratch with plain PyTorch and does not depend on segmentation libraries such as `mmsegmentation`, `segmentation_models_pytorch`, or `albumentations`.
 
----
+## Highlights
 
-## 1. Problem Statement
+- Road extraction as binary semantic segmentation
+- Dual-resolution architecture with a detail stream and a semantic context stream
+- DAPPM-style multi-scale context aggregation
+- Centerline-aware auxiliary supervision for topology preservation
+- Native-resolution inference with sliding-window blending
+- DDP training support and checkpoint resume
+- Re-parameterizable blocks for deployment efficiency
 
-### 1.1. Formal definition
+## Repository structure
 
-Given an optical RGB image $I \in \mathbb{R}^{H \times W \times 3}$ captured from a
-satellite or aircraft, learn the mapping
-
-$$f_\theta : I \longmapsto \hat{Y} \in \{0, 1\}^{H \times W}$$
-
-where $\hat{Y}_{ij} = 1$ if pixel $(i,j)$ belongs to a **road surface** and $0$
-otherwise (buildings, trees, farmland, rivers, parking lots, …).
-
-The model emits **two-channel logits** at the full input resolution
-($\hat{L} \in \mathbb{R}^{2 \times H \times W}$). The predicted mask is obtained by
-thresholding the road-class probability $p = \mathrm{softmax}(\hat{L})_1 \ge \tau$
-(default $\tau = 0.5$, with an optional threshold-calibration mode fitted on the
-validation split).
-
-This is **binary semantic segmentation**, but several properties make it behave
-very differently from ordinary object segmentation (Cityscapes, ADE20K, …).
-
-### 1.2. Why this problem is hard
-
-| # | Challenge | Technical consequence |
-|---|---|---|
-| 1 | **Extreme class imbalance.** Roads cover only ~2–5% of the pixels. | Plain cross-entropy collapses towards background; class weighting plus Dice is required. Accuracy is meaningless — evaluation must use IoU/F1 of the **road class alone**. |
-| 2 | **Thin, elongated structures.** Roads are 8–20 px wide at 1 m/px. | At stride 32 (S32) a road is well under one pixel and simply disappears. A standard encoder–decoder that downsamples deeply and then interpolates back cannot recover it. |
-| 3 | **Topology matters more than pixels.** Trees, shadows, overpasses and vehicles occlude road segments. | A 5 px break destroys an entire route while barely moving IoU. This calls for **centerline** supervision and a **relaxed F1** metric. |
-| 4 | **Long-range context is required.** Rivers, field boundaries, fences and long rooftops all look like linear features. | A semantic branch with a large receptive field (multi-scale pooling) is needed to disambiguate them from regional context. |
-| 5 | **Training/inference resolution mismatch.** Training uses 1024 crops; native Massachusetts images are 1500×1500. | Evaluation must run at **native resolution** with overlapping sliding windows, blending logits through a Hann window to remove tile seams. |
-| 6 | **Deployment cost.** Parallel branches slow inference down. | **Re-parameterizable** blocks: train multi-branch, then fuse exactly into a single convolution for deployment. |
-
-### 1.3. Out of scope
-
-- No **road graph** extraction (nodes/edges, vectorization) — raster masks only.
-- No **road type** classification (highway / urban / dirt).
-- No multispectral, SAR, or time-series input.
-
----
-
-## 2. Data and Split Protocols
-
-### 2.1. Massachusetts Roads
-
-- 1500×1500 px images at **1.0 m/pixel** resolution.
-- Directory layout: `images/`, `labels/`, `train.txt`, `test.txt`.
-- Splits follow the **exact order given in the txt files** (`pairs_from_list`), never
-  a random shuffle:
-  - `train.txt` → training set.
-  - `test.txt`: the **first 61 entries become validation**, the remaining **117
-    images** form the final test set.
-  - Controlled by `--test_eval_images` (default 61).
-- The trainer **cross-checks** that train and test do not intersect and raises an
-  error on any overlapping key.
-
-### 2.2. DeepGlobe Road Extraction
-
-- 1024×1024 px images at **0.5 m/pixel**, 6226 publicly labeled image–mask pairs.
-- The `valid/` directory of many mirrors ships **without masks**, so
-  `_first_labeled_pair` accepts a directory only if masks actually pair up;
-  otherwise it falls back to a deterministic holdout carved out of the training set.
-- **Paper-compatible "overlapping" protocol** (enabled by `--deepglobe_train_count`):
-  1. Deterministic shuffle seeded by `--split_seed` (default 3407).
-  2. The first `train_count` pairs become the training set (e.g. 5000).
-  3. **Every** remaining pair forms the test set (1226 images).
-  4. Validation is the first `--deepglobe_val_from_test_count` pairs of that test set
-     (300 images).
-
-  → **val300 ⊂ test1226 is intentional**, and is recorded explicitly in
-  `split_manifest.json` under `overlap_counts.val_test`.
-
-### 2.3. `split_manifest.json` — reproducibility
-
-On every run, rank 0 writes `save_dir/split_manifest.json` containing:
-
-- `split_seed` and `counts` (train/val/test),
-- `overlap_counts` (train↔val, train↔test, val↔test),
-- the **full absolute paths** of every pair in all three splits.
-
-For DeepGlobe, `test_native.py` reads that same file back (`pairs_from_manifest`), so
-the evaluation set is **identical** to the one used during training — random indices
-are never regenerated.
-
-### 2.4. Mask loading
-
-`read_binary_mask` handles both $\{0,1\}$ and $\{0,255\}$ label encodings: the
-threshold is 0 when `max(mask) <= 1`, and 127 otherwise. Three-channel label images
-are reduced with a per-pixel channel `max`.
-
----
-
-## 3. Architecture — `DualBranchRoadNet`
-
-The core idea: **keep one detail stream permanently at S8** (never downsample it
-deeply) and let a separate **semantic stream** descend to S16/S32 to gather context,
-then inject that context back into the detail stream **under explicit control**
-through gated residuals.
-
-```
-                          ResNet-34 (pretrained, shared)
- image ─► stem S2(64) ─► layer1 S4(64) ─► layer2 S8(128) ─► layer3 S16(256) ─► layer4 S32(512)
-             │               │                │                  │                    │
-             │               │                ▼                  │                    ▼
-             │               │       detail_proj 1×1 → 96ch      │           semantic_proj 1×1 → 192ch
-             │               │                │                  │                    │
-             │               │        [RepVGG ×2] ◄─ bilateral exchange ─► ProgressiveDAPPM
-             │               │                │      S8 ↔ S16 (spatial gate)   (pool 8,4,2,1 + GN)
-             │               │        [RepVGG ×2]                │                    │
-             │               │                │                  ◄─── gated residual ─┘
-             │               │                ▼                  │
-             │               │     ControlledRoadFusion(96) ◄── semantic_to_fusion 1×1 ◄┘
-             │               │                │
-             ▼               ▼                ▼
-       stem_proj(16)   shallow_proj(32)   fused S8 (96)
-             │               │                │
-             │               └──► S4: concat → fuse 64ch → RepDW ×2
-             └─────────────────► S2: concat → fuse 32ch → RepDW ×2
-                                       │           └─► centerline head (TRAIN ONLY, at S4)
-                                       ▼
-                        upsample → SeparableConv 24ch → dropout → conv 1×1 → logits 2×H×W
+```text
+.
+├── README.md
+├── requirements.txt
+├── train.py
+├── test_native.py
+├── compare_reparameterization.py
+├── run-gpu-container.sh
+├── modeling/
+│   ├── __init__.py
+│   ├── decoder.py
+│   └── model.py
+└── road-extraction-main/   # duplicate folder present in the workspace
+    ├── requirements.txt
+    ├── run-gpu-container.sh
+    ├── train.py
+    └── modeling/
 ```
 
-### 3.1. Encoder — `TruncatedResNet34`
+## Problem setting
 
-A torchvision ResNet-34 returning **five feature levels**: `stem_s2(64)`,
-`shallow_s4(64)`, `shared_s8(128)`, `semantic_s16(256)`, `semantic_s32(512)`.
+Given an RGB image $I \in \mathbb{R}^{H \times W \times 3}$, the model predicts a binary road mask $\hat{Y} \in \{0,1\}^{H \times W}$ where road pixels are labeled as 1. This is a highly imbalanced segmentation task because roads usually occupy a small fraction of the image, while roads are also thin, elongated, and structurally important.
 
-Weights come from ImageNet, or from a local `.pth` file via
-`--encoder_weights_path` (useful on machines without internet access).
-`_extract_state_dict` strips the `module.` / `encoder.backbone.` / `backbone.`
-prefixes automatically and **raises if fewer than 100 tensors match**, guarding
-against loading the wrong checkpoint.
+The implementation addresses this with:
 
-### 3.2. `DualResolutionContext` — two-resolution streams
+- class-weighted cross-entropy
+- Dice loss for region quality
+- centerline Tversky supervision to preserve connectivity
+- sliding-window inference at native resolution
+- residual context fusion between shallow detail features and deep semantic context
 
-**Detail stream (S8, 96 channels).** `layer2` (128ch) → 1×1 → 96ch, through two
-`RepVGGBlock`s, then it receives semantic evidence, then two more `RepVGGBlock`s.
-This stream **never leaves S8**, so thin road evidence is never destroyed.
+## Installation
 
-**Semantic stream.** Anchored at `layer3` (S16, 256ch — pretrained features).
-`layer4` (S32, 512ch) → 1×1 → 192ch is used **only to gather broad context**.
+### Requirements
 
-**There is exactly one genuine bilateral exchange: S8 ↔ S16.** This is a deliberate
-design choice — it avoids asking the S32 map to preserve thin roads, and avoids a
-second, expensive bilateral module.
+- Python 3.10+
+- PyTorch with CUDA support recommended for training
+- `torchvision`
+- NumPy, Pillow, tqdm
 
-Both directions are **residual with learnable, conservatively initialized scales**:
+Install dependencies:
 
-| Path | Initialization | Rationale |
-|---|---|---|
-| `semantic_to_detail_scale_1` | `0.10` | semantics **weakly assist** detail |
-| `detail_to_semantic_scale_1` | `0.0` | the randomly initialized detail branch **must not disturb** pretrained semantics immediately |
-| `context_scale` (S32→S16) | `0.10` | DAPPM context returns to S16 |
-| `fusion_scale` (final fusion) | `0.10` | semantics enter the detail stream at the fusion step |
+```bash
+pip install -r requirements.txt
+```
 
-**`ResidualSpatialGate` (with `--bilateral_fusion spatial`).** It predicts **one**
-single-channel spatial modulation map from GroupNorm-normalized target and source
-features:
+> The project expects a CUDA-compatible PyTorch + torchvision pair. On Kaggle or similar GPU environments, avoid reinstalling the bundled torch packages unless you know the environment is compatible.
 
-$$g = 2\,\sigma\!\left(\mathrm{Conv}(\cdot)\right), \qquad \text{last conv zero-initialized} \;\Rightarrow\; g \equiv 1$$
+## Dataset preparation
 
-Because of the zero-init, the model **starts out numerically identical** to the
-`static` variant (channel-scaled residuals), and only gradually learns to suppress
-clutter and strengthen road-shaped regions — no abrupt shift in the pretrained
-feature distribution. Using a **single-channel** gate rather than a C-channel
-attention map is intentional: road/background selection is primarily **spatial**,
-while channel selectivity is already handled by the learned residual scales. The
-result is fewer parameters and less risk of overfitting Massachusetts.
+### Massachusetts Roads
 
-The gate's `last_mean` / `last_std` are logged every epoch (`gate_statistics()`) so
-you can verify that each information route is actually being used.
+Typical layout:
 
-### 3.3. `ProgressiveDAPPM` — progressive multi-scale context
+```text
+/data_root/
+├── images/
+├── labels/
+├── train.txt
+├── test.txt
+```
 
-At S32, adaptive pooling runs over grids `(8, 4, 2, 1)` — **finest to coarsest**.
-Each branch is projected with a 1×1 convolution, interpolated back to the original
-size, **added to the previous stage's representation**, and only then processed by a
-3×3 convolution. Each stage therefore adds broader context *progressively*, unlike
-the parallel additions of ASPP/PPM. All stages are finally concatenated, compressed
-with a 1×1 convolution, and added to a shortcut.
+The split follows the order in the text files. The script explicitly checks for overlap between training and evaluation data.
 
-It uses **GroupNorm rather than BatchNorm**: the global pooling branch produces a 1×1
-map, where BatchNorm would be meaningless and unstable with small per-GPU batches
-(default `batch_size=2`).
+### DeepGlobe Road Extraction
 
-### 3.4. `ControlledRoadFusion` — final fusion at S8
+Typical layout:
 
-The two streams are **normalized independently** and then **concatenated** (not
-summed element-wise, which would destroy channel identities) → 1×1 → multiplied by a
-learnable per-channel scale (init 0.10) → added residually to the detail stream →
-refined by a directional `RepDepthwiseBlock`.
+```text
+/data_root/
+├── train/
+├── valid/
+├── test/
+```
 
-### 3.5. `RoadReconstructionDecoder` — S8 → S1
+The project supports a deterministic overlapping split protocol for reproducibility. It writes a `split_manifest.json` file for training and evaluation alignment.
 
-- S8(96) → 1×1 → 64 → upsample to S4 → concat `shallow_proj(64→32)` → fuse to 64 → **RepDW ×2**
-- → upsample to S2 → concat `stem_proj(64→16)` → fuse to 32 → **RepDW ×2**
-- → upsample to the exact `output_size` → `SeparableConvBNAct(32→24)` → dropout 0.05 → 1×1 conv → **2 channels**
-- An **auxiliary centerline head** at S4 (`ConvBNAct(64→32)` + 1×1 conv → 1 channel)
-  is active **only when `model.training == True`**. At eval time `forward` returns a
-  single logits tensor, so it costs nothing at inference.
+## Training
 
-### 3.6. Re-parameterization (multi-branch training → single-branch deployment)
+### Single-GPU training on Massachusetts
 
-| Block | Training form | Deployment form |
-|---|---|---|
-| `RepVGGBlock` | Conv3×3-BN + Conv1×1-BN + BN identity | **one 3×3 conv with bias** |
-| `RepDepthwiseBlock` | DW3×3-BN + DW1×5-BN + DW5×1-BN + BN identity (+ pointwise) | **one DW 5×5 conv with bias** (+ unchanged pointwise) |
+```bash
+python train.py \
+  --dataset massachusetts \
+  --data_root /path/to/massachusets \
+  --train_list /path/to/massachusets/train.txt \
+  --test_list /path/to/massachusets/test.txt \
+  --epochs 200 \
+  --crop_size 1024 \
+  --batch_size 2 \
+  --accumulation_steps 2 \
+  --lr 2e-4 \
+  --bilateral_fusion spatial \
+  --road_occlusion_probability 0.3 \
+  --save_dir ./checkpoints/mass_dualbranch
+```
 
-The fusion is **mathematically exact** (fold BN into the convolution, pad kernels to
-5×5, sum them). The 1×5 / 5×1 branches learn **directional** road geometry
-separately, which matches the horizontally and vertically elongated structure of
-roads.
+### DeepGlobe training
 
-Call `model.switch_to_deploy()`. Verify the error with
-`verify_reparameterization()` or with the `compare_reparameterization.py` script.
+```bash
+python train.py \
+  --dataset deepglobe \
+  --data_root /path/to/deepglobe \
+  --deepglobe_train_count 5000 \
+  --deepglobe_val_from_test_count 300 \
+  --epochs 120 \
+  --crop_size 1024 \
+  --save_dir ./checkpoints/dg_dualbranch
+```
 
-### 3.7. Parameter counts (default configuration)
+### Multi-GPU DDP
 
-| Component | Parameters |
-|---|---|
-| ResNet-34 encoder | 21,284,672 |
-| `dual_branch` | 1,203,282 |
-| `decode_head` | 53,891 |
-| **Total (training form)** | **22,541,845** |
-| **Total (after `switch_to_deploy`)** | **22,502,773** |
+```bash
+torchrun --nproc_per_node=2 train.py --dataset massachusetts --data_root /path/to/data
+```
 
-> Everything "new" relative to the standard backbone accounts for only ~1.26M
-> parameters (≈5.6% of the total).
+### Resume training from checkpoint
 
----
+```bash
+python train.py --dataset massachusetts --resume ./checkpoints/mass_dualbranch/last.pt
+```
 
-## 4. Loss — `RoadSegCenterlineTverskyLoss`
+### Transfer learning with progressive unfreezing
 
-$$\mathcal{L} = \underbrace{\mathrm{CE}_w}_{\text{class balance}} \;+\; \lambda_{\text{dice}} \underbrace{\mathcal{L}_{\text{Dice}}}_{\text{region}} \;+\; \lambda_{\text{aux}}(t) \underbrace{\mathcal{L}^{\text{centerline}}_{\text{Tversky}}}_{\text{connectivity}}$$
+```bash
+python train.py --dataset deepglobe \
+  --pretrained_checkpoint ./checkpoints/mass_dualbranch/best_fixed_road_iou.pt \
+  --transfer_weights ema
+```
 
-**(a) Weighted cross-entropy.** The road-class weight is computed automatically at
-startup:
+## Model architecture
+
+The core model is `DualBranchRoadNet`, built on a truncated ResNet-34 encoder.
+
+Main design principles:
+
+- Keep a high-resolution detail stream at S8
+- Use a semantic stream at S16/S32 to gather long-range context
+- Fuse semantic context back into the detail path with residual gates
+- Reconstruct the road mask from multi-scale features
+- Add an auxiliary centerline head during training for connectivity supervision
+
+The network is designed to preserve thin road structures while still using large receptive fields to distinguish roads from visually similar linear patterns such as rivers, shadows, fences, and rooftops.
+
+## Loss function
+
+Training combines:
+
+- weighted cross-entropy for class imbalance
+- Dice loss for region coverage
+- centerline Tversky loss for topological connectivity
+
+This helps the model recover thin roads and maintain continuity between distant segments.
+
+## Evaluation
+
+The project evaluates at native image resolution instead of resizing inputs. It uses an overlapping sliding-window strategy with Hann-weighted logit blending to reduce seam artifacts.
+
+### Validation / testing
+
+```bash
+python test_native.py \
+  --ckpt ./checkpoints/mass_dualbranch/best_fixed_road_iou.pt \
+  --subset val61 \
+  --search-threshold
+```
+
+Then apply the threshold on the test split:
+
+```bash
+python test_native.py \
+  --ckpt ./checkpoints/mass_dualbranch/best_fixed_road_iou.pt \
+  --subset test117 \
+  --thr 0.46 \
+  --tta-mode flip4 \
+  --out cache_test117.npz
+```
+
+DeepGlobe evaluation:
+
+```bash
+a python test_native.py \
+  --ckpt ./checkpoints/dg_dualbranch/best_fixed_road_iou.pt \
+  --subset deepglobe_test1226
+```
+
+### Main metrics
+
+- road IoU (primary metric)
+- background IoU
+- mIoU
+- precision, recall, F1
+- macro IoU over images
+- relaxed F1 with a small spatial tolerance for topology quality
+
+## Checkpoints and outputs
+
+Each run saves a checkpoint directory such as:
+
+```text
+save_dir/
+├── best_fixed_road_iou.pt
+├── best_calibrated_road_iou.pt
+├── last.pt
+├── split_manifest.json
+├── metrics.jsonl
+└── ...
+```
+
+The checkpoint stores the model, EMA weights, optimizer state, scheduler state, scaler state, epoch, validation metrics, and full training arguments, allowing exact resumption and reproducible evaluation.
+
+## Deployment optimization
+
+The network includes re-parameterizable blocks (`RepVGGBlock` and `RepDepthwiseBlock`), allowing training-time multi-branch structures to be fused into a single convolutional representation for inference.
+
+```python
+model.switch_to_deploy()
+```
+
+The script `compare_reparameterization.py` verifies that the deploy-time model matches the training-time model within numerical tolerance and reports throughput and memory efficiency.
+
+## Training notes
+
+- `batch_size` is per-GPU
+- `accumulation_steps` controls effective batch size
+- AMP (automatic mixed precision) and `channels_last` are enabled by default
+- EMA weights are used for validation and testing
+- progressive unfreezing is supported for transfer learning scenarios
+
+## Useful scripts
+
+- `train.py`: training pipeline
+- `test_native.py`: native-resolution validation/test inference
+- `compare_reparameterization.py`: deployment equivalence and efficiency comparison
+- `modeling/model.py`: model architecture
+- `modeling/decoder.py`: loss and decoder logic
+
+## Citation / project context
+
+This project is intended for research and experimentation in remote sensing road extraction and is not a general-purpose geospatial production package. It is best suited for reproducible academic experiments and controlled benchmark evaluation.
+
+## License
+
+This repository does not include an explicit license file in the workspace snapshot. Please check the project source or institutional repository policy before reuse or redistribution.
+
 
 $$\text{imbalance} = \frac{N_{\text{background}}}{N_{\text{road}}}, \qquad w_{\text{road}} = \min\!\left(\sqrt{\text{imbalance}},\ \text{cap}\right)$$
 
