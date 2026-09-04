@@ -326,6 +326,64 @@ class RepDepthwiseBlock(nn.Module):
         self.deploy = True
 
 
+def _group_count(channels: int, maximum: int = 8) -> int:
+    """Largest small GroupNorm divisor, robust for small per-GPU batches."""
+    for groups in range(min(maximum, int(channels)), 0, -1):
+        if int(channels) % groups == 0:
+            return groups
+    return 1
+
+
+class SkipFeatureGate(nn.Module):
+    """Semantically-guided skip-connection denoising (full-CNN SSFRM-lite).
+
+    Shallow ResNet stem/layer1 features carry rich edges but also background
+    texture that looks locally road-like (driveways, rooftops, parking lots).
+    Concatenating them into the decoder unfiltered lets that noise leak into
+    the prediction.  This gate lets the already-decoded feature (semantically
+    deeper, since it has passed through the fused detail/semantic branch)
+    suppress that noise before the concatenation: one squeeze-excite style
+    channel gate plus one spatial gate, both driven by the decoder feature.
+    This targets the same problem as SSFRM (Yang et al., TGRS 2026) --
+    channel- and spatial-dimension refinement of skip features under deep
+    semantic guidance -- using only conv/pool/sigmoid instead of a learned
+    channel/spatial similarity matrix, so it stays attention-free.  Both
+    gates are zero-initialized to output exactly 1 (via ``2 * sigmoid(0)``),
+    so training starts identical to an unfiltered skip connection.
+    """
+
+    def __init__(self, skip_channels: int, guide_channels: int) -> None:
+        super().__init__()
+        hidden = max(8, skip_channels // 4)
+        self.channel_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(guide_channels, hidden, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, skip_channels, 1),
+        )
+        self.spatial_gate = nn.Sequential(
+            nn.Conv2d(
+                guide_channels + skip_channels, hidden, 3, padding=1, bias=False
+            ),
+            nn.GroupNorm(_group_count(hidden), hidden),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, 1, 1),
+        )
+        nn.init.zeros_(self.channel_gate[-1].weight)
+        nn.init.zeros_(self.channel_gate[-1].bias)
+        nn.init.zeros_(self.spatial_gate[-1].weight)
+        nn.init.zeros_(self.spatial_gate[-1].bias)
+
+    def forward(self, skip: Tensor, guide: Tensor) -> Tensor:
+        if skip.shape[-2:] != guide.shape[-2:]:
+            raise ValueError("SkipFeatureGate inputs must be spatially aligned")
+        channel_weight = 2.0 * torch.sigmoid(self.channel_gate(guide))
+        spatial_weight = 2.0 * torch.sigmoid(
+            self.spatial_gate(torch.cat((skip, guide), dim=1))
+        )
+        return skip * channel_weight * spatial_weight
+
+
 class SeparableConvBNAct(nn.Sequential):
     """Depthwise-separable full-resolution prediction refinement."""
 
@@ -364,6 +422,7 @@ class RoadReconstructionDecoder(nn.Module):
         self.shallow_proj = ConvBNAct(
             shallow_channels, shallow_skip_channels, 1, padding=0
         )
+        self.s4_skip_gate = SkipFeatureGate(shallow_skip_channels, s4_channels)
         self.s4_fuse = ConvBNAct(
             s4_channels + shallow_skip_channels,
             s4_channels,
@@ -378,6 +437,7 @@ class RoadReconstructionDecoder(nn.Module):
         self.stem_proj = ConvBNAct(
             stem_channels, stem_skip_channels, 1, padding=0
         )
+        self.s2_skip_gate = SkipFeatureGate(stem_skip_channels, s4_channels)
         self.s2_fuse = ConvBNAct(
             s4_channels + stem_skip_channels,
             s2_channels,
@@ -411,11 +471,13 @@ class RoadReconstructionDecoder(nn.Module):
         output_size: Tuple[int, int],
     ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
         p4 = self._resize(self.fused_proj(fused_s8), shallow_s4.shape[-2:])
-        p4 = self.s4_fuse(torch.cat((p4, self.shallow_proj(shallow_s4)), dim=1))
+        shallow_feature = self.s4_skip_gate(self.shallow_proj(shallow_s4), p4)
+        p4 = self.s4_fuse(torch.cat((p4, shallow_feature), dim=1))
         p4 = self.s4_refine(p4)
 
         p2 = self._resize(p4, stem_s2.shape[-2:])
-        p2 = self.s2_fuse(torch.cat((p2, self.stem_proj(stem_s2)), dim=1))
+        stem_feature = self.s2_skip_gate(self.stem_proj(stem_s2), p2)
+        p2 = self.s2_fuse(torch.cat((p2, stem_feature), dim=1))
         p2 = self.s2_refine(p2)
 
         full = self._resize(p2, output_size)

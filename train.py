@@ -1475,14 +1475,21 @@ def transfer_weights(
         raise KeyError(f"No '{weights}', model, ema, or state_dict weights found")
     cleaned = clean_state_dict(state)
     result = model.load_state_dict(cleaned, strict=False)
+    # NEW_MODULE_NAME_FRAGMENTS: substrings of parameter names that are
+    # allowed to be absent from an older checkpoint because they belong to a
+    # module introduced after that checkpoint was trained. Extend this tuple
+    # (never remove from it) whenever a new purely-additive, zero/near-zero
+    # initialized submodule is added, so older checkpoints keep transferring.
+    new_module_fragments = ("spatial_gate", "skip_gate", "strip_context")
     allowed_missing = all(
-        "spatial_gate" in key for key in result.missing_keys
+        any(fragment in key for fragment in new_module_fragments)
+        for key in result.missing_keys
     )
     if result.unexpected_keys or not allowed_missing:
         raise RuntimeError(
             "Transfer checkpoint architecture does not match DualBranchRoadNet. "
             f"Missing={result.missing_keys}, unexpected={result.unexpected_keys}. "
-            "Only newly introduced spatial-gate tensors may be absent."
+            f"Only tensors matching {new_module_fragments} may be absent."
         )
     return checkpoint_path
 
