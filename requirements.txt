@@ -6,3 +6,4 @@
 numpy>=1.24,<3
 Pillow>=9,<13
 tqdm>=4.65,<5
+matplotlib>=3.7,<4  # plot_loss.py only; Kaggle images already ship this

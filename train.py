@@ -28,7 +28,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
-from modeling.decoder import RoadSegCenterlineTverskyLoss
+from modeling.decoder import RoadSegCenterlineTverskyLoss, binary_dice_loss
 from modeling.model import DualBranchRoadNet, build_model
 
 
@@ -1315,12 +1315,18 @@ def validate(
     loader: DataLoader,
     device: torch.device,
     args: argparse.Namespace,
+    road_class_weight: float,
+    main_dice_weight: float,
 ) -> Dict[str, float]:
     model.eval()
     bins = args.threshold_bins
     positive_hist = torch.zeros(bins, dtype=torch.int64, device=device)
     negative_hist = torch.zeros(bins, dtype=torch.int64, device=device)
-    totals = torch.zeros(10, dtype=torch.float64, device=device)
+    # Slots 0-9 are the pre-existing confusion/relaxed/count accumulators;
+    # 10-11 are the running main-loss sums added for train/val overfitting
+    # comparison (see val_loss_main below). Appending at the end keeps every
+    # existing totals[...] index below unchanged.
+    totals = torch.zeros(12, dtype=torch.float64, device=device)
     # DEBUG: probability-mass diagnostics to separate "under-confident" from
     # "wrong" predictions -- summed then normalized after the loop.
     probability_sum_on_road = torch.zeros((), dtype=torch.float64, device=device)
@@ -1352,8 +1358,26 @@ def validate(
         relaxed = relaxed_components(
             prediction[0], target[0], args.relaxed_buffer_px
         )
+        # DEBUG: main-loss-only (CE + Dice) validation loss, for comparing
+        # against train_metrics["total"] to spot overfitting. The centerline
+        # auxiliary term is excluded because RoadReconstructionDecoder only
+        # returns its aux head in training mode (self.training), and running
+        # the model in train() mode here would corrupt BatchNorm running
+        # stats / enable dropout -- not an acceptable trade for one extra
+        # loss term.
+        labels = target.long()
+        class_weights = logits.new_tensor([1.0, road_class_weight])
+        loss_main_ce = F.cross_entropy(
+            logits.float(), labels, weight=class_weights
+        )
+        loss_main_dice = binary_dice_loss(
+            probability.unsqueeze(1), labels.unsqueeze(1).float()
+        )
         totals += totals.new_tensor(
-            [tp, fp, fn, tn, per_image_iou, 1.0, *relaxed]
+            [
+                tp, fp, fn, tn, per_image_iou, 1.0, *relaxed,
+                float(loss_main_ce.detach()), float(loss_main_dice.detach()),
+            ]
         )
         positive, negative = histogram_counts(probability, target, bins)
         positive_hist += positive
@@ -1415,6 +1439,14 @@ def validate(
         }
     )
     metrics["calibrated_threshold"] = float(best_threshold)
+
+    image_count = max(float(totals[5]), 1.0)
+    metrics["val_loss_main_ce"] = float(totals[10] / image_count)
+    metrics["val_loss_main_dice"] = float(totals[11] / image_count)
+    metrics["val_loss_main"] = (
+        metrics["val_loss_main_ce"]
+        + float(main_dice_weight) * metrics["val_loss_main_dice"]
+    )
     return metrics
 
 
@@ -2151,13 +2183,29 @@ def main() -> None:
             if distributed_active():
                 for tensor in ema.module.state_dict().values():
                     dist.broadcast(tensor, src=0)
-            validation_metrics = validate(ema.module, val_loader, device, args)
+            validation_metrics = validate(
+                ema.module,
+                val_loader,
+                device,
+                args,
+                criterion.road_class_weight,
+                criterion.main_dice_weight,
+            )
             fixed = validation_metrics["fixed_road_iou"]
             calibrated = validation_metrics["calibrated_road_iou"]
             fixed_improved, calibrated_improved = fixed > best_fixed, calibrated > best_calibrated
             best_fixed, best_calibrated = max(best_fixed, fixed), max(best_calibrated, calibrated)
+            # DEBUG: train vs. val main loss (CE+Dice, no centerline term on
+            # either side would be needed for a strict comparison, but train
+            # loss below does include it -- see val_loss_main's docstring at
+            # its computation site in validate() for why it can't). A train
+            # loss that keeps falling while val_loss_main flattens or rises
+            # is the overfitting signal to watch for.
             rank_zero_print(
                 f"train loss={train_metrics['total']:.5f} | "
+                f"val loss={validation_metrics['val_loss_main']:.5f} "
+                f"(ce={validation_metrics['val_loss_main_ce']:.4f} "
+                f"dice={validation_metrics['val_loss_main_dice']:.4f}) | "
                 f"throughput={train_metrics['images_per_second']:.1f} img/s | "
                 f"fixed@.50 road IoU={fixed:.5f} | "
                 f"calibrated road IoU={calibrated:.5f} "
