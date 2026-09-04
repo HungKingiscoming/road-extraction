@@ -350,6 +350,36 @@ def main_logits(output) -> Tensor:
     return output
 
 
+_cudnn_fallback_active = False
+
+
+def _forward_with_cudnn_fallback(model: nn.Module, tiles: Tensor):
+    """Run one forward pass, retrying with cuDNN disabled if it can't pick a kernel.
+
+    Grouped/depthwise convolutions (RepDepthwiseBlock's branch_3x3) under fp16
+    autocast can raise "RuntimeError: GET was unable to find an engine to
+    execute this computation" on some cuDNN/driver combinations, even though
+    the identical model trains fine under the same AMP settings -- this is a
+    known cuDNN v8 heuristic gap for certain grouped-conv shapes, not a bug in
+    the model. Falling back to the slower non-cuDNN convolution keeps
+    inference correct instead of crashing. Once the fallback is needed, it
+    stays on for the rest of the process so later tiles don't pay for a
+    repeated failed attempt.
+    """
+    global _cudnn_fallback_active
+    if _cudnn_fallback_active:
+        with torch.backends.cudnn.flags(enabled=False):
+            return model(tiles)
+    try:
+        return model(tiles)
+    except RuntimeError as error:
+        if "unable to find an engine" not in str(error):
+            raise
+        _cudnn_fallback_active = True
+        with torch.backends.cudnn.flags(enabled=False):
+            return model(tiles)
+
+
 @torch.inference_mode()
 def sliding_logits(
     model: nn.Module,
@@ -398,7 +428,7 @@ def sliding_logits(
             dtype=amp_dtype,
             enabled=amp_enabled,
         ):
-            logits = main_logits(model(tiles))
+            logits = main_logits(_forward_with_cudnn_fallback(model, tiles))
         logits = logits.float()
 
         for index, (y, xx) in enumerate(batch_coords):
@@ -459,7 +489,9 @@ def sliding_probabilities_uniform(
             dtype=amp_dtype,
             enabled=amp_enabled,
         ):
-            probabilities = road_probability(main_logits(model(tiles)))
+            probabilities = road_probability(
+                main_logits(_forward_with_cudnn_fallback(model, tiles))
+            )
         probabilities = probabilities.float()
 
         for index, (y, xx) in enumerate(batch_coords):
