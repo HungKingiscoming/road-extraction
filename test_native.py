@@ -1,4 +1,4 @@
-"""Trainer-matched native Massachusetts/DeepGlobe evaluation with TTA.
+"""Trainer-matched Massachusetts/DeepGlobe evaluation with TTA and WeavingUnet-compatible metrics.
 
 The default inference path reproduces train.py validation: native resolution,
 ImageNet normalization, reflect padding, checkpoint-saved validation tile size
@@ -664,39 +664,76 @@ def score_maps(
     ground_truths: Sequence[np.ndarray],
     threshold: float,
     relaxed_buffer_px: int,
-) -> Tuple[Dict[str, float], float, float, float]:
+) -> Tuple[Dict[str, float], Dict[str, float], float, float]:
+    """Score predictions using both pooled and WeavingUnet-style aggregation.
+
+    POOLED metrics are computed from one global confusion matrix over all pixels.
+
+    WEAVING-STYLE follows the public WeavingUnet evaluation code for BOTH
+    Massachusetts and DeepGlobe (their eval scripts use the same aggregation):
+      * Precision  = mean(per-image precision)
+      * Recall     = mean(per-image recall)
+      * F1         = mean(per-image F1)
+      * Accuracy   = mean(per-image accuracy)
+      * IoU        = global/pooled road IoU
+
+    Mean-image IoU and relaxed F1 are retained as additional diagnostics.
+    """
     if len(probabilities) != len(ground_truths):
         raise ValueError("probabilities and ground_truths must have equal length")
     if not probabilities:
         raise ValueError("No predictions to score")
 
     pooled = [0, 0, 0, 0]
+    per_image_precision: List[float] = []
+    per_image_recall: List[float] = []
     per_image_f1: List[float] = []
     per_image_iou: List[float] = []
+    per_image_accuracy: List[float] = []
     relaxed = [0, 0, 0, 0]
 
     for probability, gt in zip(probabilities, ground_truths):
         pred = probability >= threshold
         tp, fp, fn, tn = counts(pred, gt)
+
+        # Global confusion counts used for pooled metrics and WeavingUnet road IoU.
         for i, value in enumerate((tp, fp, fn, tn)):
             pooled[i] += value
+
+        # Per-image metrics, averaged later to reproduce WeavingUnet's P/R/F1/Acc.
         m = metrics_from_counts(tp, fp, fn, tn)
+        per_image_precision.append(m["precision"])
+        per_image_recall.append(m["recall"])
         per_image_f1.append(m["f1"])
         per_image_iou.append(m["iou"])
+        per_image_accuracy.append(m["accuracy"])
+
         components = relaxed_components(pred, gt, relaxed_buffer_px)
         for i, value in enumerate(components):
             relaxed[i] += value
 
     pooled_metrics = metrics_from_counts(*pooled)
+
+    weaving_metrics = {
+        "precision": float(np.mean(per_image_precision)),
+        "recall": float(np.mean(per_image_recall)),
+        "f1": float(np.mean(per_image_f1)),
+        # Their IOUMetric first accumulates the dataset confusion histogram,
+        # therefore road IoU corresponds to our pooled/global road IoU.
+        "iou": float(pooled_metrics["iou"]),
+        "accuracy": float(np.mean(per_image_accuracy)),
+    }
+
     relaxed_precision = relaxed[0] / max(relaxed[2], 1)
     relaxed_recall = relaxed[1] / max(relaxed[3], 1)
     relaxed_f1 = (
         2.0 * relaxed_precision * relaxed_recall
         / max(relaxed_precision + relaxed_recall, 1e-12)
     )
+
     return (
         pooled_metrics,
-        float(np.mean(per_image_f1)),
+        weaving_metrics,
         float(np.mean(per_image_iou)),
         float(relaxed_f1),
     )
@@ -1140,7 +1177,7 @@ def main() -> None:
             save_cache(cache, probabilities, ground_truths, names)
             print(f"Saved cache: {cache}")
 
-    pooled, mean_f1, mean_iou, relaxed_f1 = score_maps(
+    pooled, weaving, mean_iou, relaxed_f1 = score_maps(
         probabilities,
         ground_truths,
         args.thr,
@@ -1149,7 +1186,11 @@ def main() -> None:
     print("=" * 72)
     print(f"THRESHOLD {args.thr:.3f}")
     print(
-        f"POOLED   P={pooled['precision']:.4f} "
+        f"METRIC PROTOCOL : WeavingUnet-compatible for {args.dataset} "
+        "(mean-image P/R/F1/Acc + pooled/global road IoU)"
+    )
+    print(
+        f"POOLED       P={pooled['precision']:.4f} "
         f"R={pooled['recall']:.4f} "
         f"F1={pooled['f1']:.4f} "
         f"IoU={pooled['iou']:.4f} "
@@ -1157,7 +1198,17 @@ def main() -> None:
         f"mIoU={pooled['miou']:.4f} "
         f"Acc={pooled['accuracy']:.4f}"
     )
-    print(f"MEAN-IMG F1={mean_f1:.4f} IoU={mean_iou:.4f}")
+    print(
+        f"WEAVING-STYLE P={weaving['precision']:.4f} "
+        f"R={weaving['recall']:.4f} "
+        f"F1={weaving['f1']:.4f} "
+        f"IoU={weaving['iou']:.4f} "
+        f"Acc={weaving['accuracy']:.4f}"
+    )
+    print(
+        f"MEAN-IMG     F1={weaving['f1']:.4f} "
+        f"IoU={mean_iou:.4f}"
+    )
     print(
         f"RELAXED ±{args.relaxed_buffer_px}px F1={relaxed_f1:.4f}"
     )
