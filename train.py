@@ -620,51 +620,71 @@ def resolve_splits(
         )
         return train_pairs, val_pairs, test_pairs
 
+    # DeepGlobe paper-compatible fixed-count split.
+    # IMPORTANT: this must match test.py/regenerate_deepglobe_split exactly:
+    #   permutation(seed)[:5000]  -> train
+    #   permutation(seed)[5000:]  -> full test1226
+    #   first 300 of test1226     -> validation subset
+    # Validation intentionally overlaps the full test set by 300 images, matching
+    # the established evaluation protocol used by the companion test script.
     all_pairs = build_pairs(args.train_image_dir, args.train_mask_dir)
-    if args.val_image_dir and args.val_mask_dir:
-        val_images, val_masks = Path(args.val_image_dir), Path(args.val_mask_dir)
-        if val_images.is_dir() and val_masks.is_dir():
-            try:
-                val_pairs = build_pairs(val_images, val_masks)
-            except RuntimeError:
-                if args.dataset != "deepglobe":
-                    raise
-                rank_zero_print(
-                    "DeepGlobe validation directory has no matched masks; "
-                    "using a labeled deterministic holdout from train instead."
-                )
-            else:
-                rank_zero_print(
-                    f"Official/provided split: train={len(all_pairs)}, "
-                    f"val={len(val_pairs)}"
-                )
-                return all_pairs, val_pairs, []
+    total = len(all_pairs)
+    train_count = int(args.deepglobe_train_count)
+    val_from_test_count = int(args.deepglobe_val_from_test_count)
+
+    if not 0 < train_count < total:
+        raise ValueError(
+            f"deepglobe_train_count={train_count} is invalid for {total} labeled pairs"
+        )
+    test_count = total - train_count
+    if not 0 < val_from_test_count <= test_count:
+        raise ValueError(
+            f"deepglobe_val_from_test_count={val_from_test_count} is invalid for "
+            f"a {test_count}-image test split"
+        )
 
     generator = np.random.default_rng(args.split_seed)
-    indices = generator.permutation(len(all_pairs))
-    val_count = max(1, round(len(all_pairs) * args.val_ratio))
-    test_count = (
-        max(1, round(len(all_pairs) * args.test_ratio))
-        if args.test_ratio > 0.0
-        else 0
-    )
-    test_indices = set(indices[:test_count].tolist())
-    val_indices = set(indices[test_count : test_count + val_count].tolist())
-    train_pairs = [
-        pair
-        for index, pair in enumerate(all_pairs)
-        if index not in val_indices and index not in test_indices
-    ]
-    val_pairs = [
-        pair for index, pair in enumerate(all_pairs) if index in val_indices
-    ]
-    test_pairs = [
-        pair for index, pair in enumerate(all_pairs) if index in test_indices
-    ]
+    indices = generator.permutation(total)
+    train_indices = indices[:train_count]
+    test_indices = indices[train_count:]
+
+    train_pairs = [all_pairs[int(i)] for i in train_indices]
+    test_pairs = [all_pairs[int(i)] for i in test_indices]
+    val_pairs = test_pairs[:val_from_test_count]
+
+    # Hard leakage checks. These stop training before epoch 1 if train/test
+    # membership ever becomes inconsistent with the intended protocol.
+    train_keys = {sample_key(image) for image, _ in train_pairs}
+    val_keys = {sample_key(image) for image, _ in val_pairs}
+    test_keys = {sample_key(image) for image, _ in test_pairs}
+    train_test_overlap = train_keys & test_keys
+    train_val_overlap = train_keys & val_keys
+    val_test_overlap = val_keys & test_keys
+
+    if train_test_overlap:
+        raise RuntimeError(
+            f"DeepGlobe train/test leakage detected: {len(train_test_overlap)} samples; "
+            f"examples={sorted(train_test_overlap)[:10]}"
+        )
+    if train_val_overlap:
+        raise RuntimeError(
+            f"DeepGlobe train/val leakage detected: {len(train_val_overlap)} samples; "
+            f"examples={sorted(train_val_overlap)[:10]}"
+        )
+    if len(val_test_overlap) != len(val_pairs):
+        raise RuntimeError(
+            "DeepGlobe validation must be a subset of the full test split: "
+            f"val={len(val_pairs)}, val-test overlap={len(val_test_overlap)}"
+        )
+
+    # With the standard DeepGlobe labeled set (6226 images) and defaults this is
+    # exactly 5000 train / 300 val (inside test) / 1226 full test.
     rank_zero_print(
-        "Deterministic labeled split: "
-        f"train={len(train_pairs)}, val={len(val_pairs)}, "
-        f"test={len(test_pairs)}, seed={args.split_seed}"
+        "DeepGlobe fixed-count split: "
+        f"train={len(train_pairs)}, val={len(val_pairs)} (subset of test), "
+        f"test={len(test_pairs)} | train-test overlap={len(train_test_overlap)}, "
+        f"train-val overlap={len(train_val_overlap)}, "
+        f"val-test overlap={len(val_test_overlap)}, seed={args.split_seed}"
     )
     return train_pairs, val_pairs, test_pairs
 
@@ -1403,6 +1423,24 @@ def parse_args() -> argparse.Namespace:
         help="Held out and never evaluated during training when no labeled val exists",
     )
     parser.add_argument("--split_seed", type=int, default=3407)
+    parser.add_argument(
+        "--deepglobe_train_count",
+        type=int,
+        default=5000,
+        help=(
+            "DeepGlobe fixed training count. With the 6226 labeled pairs, "
+            "the remaining 1226 images form the full test split."
+        ),
+    )
+    parser.add_argument(
+        "--deepglobe_val_from_test_count",
+        type=int,
+        default=300,
+        help=(
+            "Number of validation images taken deterministically from the start "
+            "of the full DeepGlobe test1226 split."
+        ),
+    )
 
     parser.add_argument("--crop_size", type=int, default=1024)
     parser.add_argument("--road_crop_probability", type=float, default=0.60)
@@ -1576,6 +1614,11 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("Massachusetts requires --train_list and --test_list")
         if args.test_eval_images < 1:
             raise ValueError("test_eval_images must be positive")
+    elif args.dataset == "deepglobe":
+        if args.deepglobe_train_count < 1:
+            raise ValueError("deepglobe_train_count must be positive")
+        if args.deepglobe_val_from_test_count < 1:
+            raise ValueError("deepglobe_val_from_test_count must be positive")
     if args.fixed_road_weight is not None and args.fixed_road_weight <= 0.0:
         raise ValueError("fixed_road_weight must be positive")
     if not 0.0 < args.val_ratio < 1.0:
@@ -1636,6 +1679,14 @@ def save_split_manifest(
     test_pairs: Sequence[Tuple[Path, Path]],
     split_seed: int,
 ) -> None:
+    train_keys = {sample_key(image) for image, _ in train_pairs}
+    val_keys = {sample_key(image) for image, _ in val_pairs}
+    test_keys = {sample_key(image) for image, _ in test_pairs}
+    overlap_counts = {
+        "train_val": len(train_keys & val_keys),
+        "train_test": len(train_keys & test_keys),
+        "val_test": len(val_keys & test_keys),
+    }
     manifest = {
         "split_seed": int(split_seed),
         "counts": {
@@ -1643,6 +1694,7 @@ def save_split_manifest(
             "val": len(val_pairs),
             "test": len(test_pairs),
         },
+        "overlap_counts": overlap_counts,
         "train": [[str(image), str(mask)] for image, mask in train_pairs],
         "val": [[str(image), str(mask)] for image, mask in val_pairs],
         "test": [[str(image), str(mask)] for image, mask in test_pairs],
@@ -1706,6 +1758,12 @@ def main() -> None:
             test_pairs,
             args.split_seed,
         )
+        if args.dataset == "deepglobe":
+            rank_zero_print(
+                f"[startup] split_manifest.json saved: train={len(train_pairs)}, "
+                f"val={len(val_pairs)}, test={len(test_pairs)}; "
+                "expected overlaps train-test=0, train-val=0, val-test=300"
+            )
     if args.fixed_road_weight is None:
         rank_zero_print(
             f"[startup 3/5] Scanning {len(train_pairs)} training masks "
