@@ -211,22 +211,32 @@ def profile_model(
         torch.cuda.synchronize(device)
         total_ms = float(start.elapsed_time(end))
         peak_bytes = int(torch.cuda.max_memory_allocated(device))
+        peak_reserved_bytes = int(torch.cuda.max_memory_reserved(device))
     else:
         started = time.perf_counter()
         for _ in range(repeats):
             main_logits(model(x))
         total_ms = (time.perf_counter() - started) * 1000.0
         peak_bytes = 0
+        peak_reserved_bytes = 0
 
-    latency_ms = total_ms / repeats
+    batch_size = int(input_cpu.shape[0])
+    batch_latency_ms = total_ms / repeats
+    latency_ms_per_image = batch_latency_ms / max(batch_size, 1)
     result = {
+        "benchmark_batch_size": float(batch_size),
+        "benchmark_total_ms": total_ms,
         "macs_per_image": macs_per_image,
         "flops_per_image": 2.0 * macs_per_image,
         "gmacs_per_image": macs_per_image / 1e9,
         "gflops_per_image": 2.0 * macs_per_image / 1e9,
-        "latency_ms": latency_ms,
-        "throughput_images_per_second": 1000.0 * input_cpu.shape[0] / latency_ms,
+        # latency_ms is retained for compatibility and means latency per batch.
+        "latency_ms": batch_latency_ms,
+        "latency_ms_per_batch": batch_latency_ms,
+        "latency_ms_per_image": latency_ms_per_image,
+        "throughput_images_per_second": 1000.0 / max(latency_ms_per_image, 1e-12),
         "peak_allocated_bytes": peak_bytes,
+        "peak_reserved_bytes": peak_reserved_bytes,
     }
     model.to("cpu")
     del model, x
@@ -511,6 +521,11 @@ def evaluate_model(
     pooled = [0, 0, 0, 0]
     image_f1: List[float] = []
     image_iou: List[float] = []
+    inference_times: List[float] = []
+    io_seconds = 0.0
+    total_pixels = 0
+    total_tiles = 0
+    tta_views = len(tta_tags(tta_mode))
     if device.type == "cuda":
         torch.cuda.synchronize(device)
         torch.cuda.empty_cache()
@@ -518,13 +533,31 @@ def evaluate_model(
     started = time.perf_counter()
 
     for index, (image_path, mask_path) in enumerate(pairs, start=1):
+        io_started = time.perf_counter()
         image, gt = read_rgb(image_path), read_binary_mask(mask_path)
+        io_seconds += time.perf_counter() - io_started
+
+        tiles_per_view = (
+            len(sliding_positions(image.shape[0], window, stride))
+            * len(sliding_positions(image.shape[1], window, stride))
+        )
+        total_tiles += tiles_per_view * tta_views
+
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        inference_started = time.perf_counter()
         probability = predict_image(
             model, image, window, stride, tta_mode, tta_merge,
             amp, tile_batch_size, channels_last,
         )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        inference_seconds_this_image = time.perf_counter() - inference_started
+        inference_times.append(inference_seconds_this_image)
+
         height = min(gt.shape[0], probability.shape[0])
         width = min(gt.shape[1], probability.shape[1])
+        total_pixels += height * width
         values = confusion(
             probability[:height, :width] >= threshold, gt[:height, :width]
         )
@@ -533,24 +566,51 @@ def evaluate_model(
         image_metrics = metrics_from_counts(*values)
         image_f1.append(image_metrics["f1"])
         image_iou.append(image_metrics["iou"])
+        running_elapsed = max(time.perf_counter() - started, 1e-12)
         print(
             f"\r[{label}] {index:3d}/{len(pairs)}  {image_path.name}  "
-            f"IoU={image_metrics['iou']:.4f}", end="", flush=True,
+            f"P={image_metrics['precision']:.4f} R={image_metrics['recall']:.4f} "
+            f"F1={image_metrics['f1']:.4f} IoU={image_metrics['iou']:.4f} "
+            f"infer={1000.0 * inference_seconds_this_image:.1f}ms "
+            f"e2e={index / running_elapsed:.2f} img/s",
+            end="", flush=True,
         )
     print()
     if device.type == "cuda":
         torch.cuda.synchronize(device)
         peak_bytes = int(torch.cuda.max_memory_allocated(device))
+        peak_reserved_bytes = int(torch.cuda.max_memory_reserved(device))
     else:
         peak_bytes = 0
+        peak_reserved_bytes = 0
     elapsed = time.perf_counter() - started
+    inference_seconds = float(sum(inference_times))
+    inference_ms = np.asarray(inference_times, dtype=np.float64) * 1000.0
     result: Dict[str, float] = {
         **metrics_from_counts(*pooled),
         "mean_image_f1": float(np.mean(image_f1)),
         "mean_image_iou": float(np.mean(image_iou)),
         "elapsed_seconds": elapsed,
+        # Backward-compatible alias: this is end-to-end dataset throughput.
         "images_per_second": len(pairs) / max(elapsed, 1e-12),
+        "end_to_end_images_per_second": len(pairs) / max(elapsed, 1e-12),
+        "end_to_end_ms_per_image": 1000.0 * elapsed / max(len(pairs), 1),
+        "inference_seconds": inference_seconds,
+        "inference_images_per_second": len(pairs) / max(inference_seconds, 1e-12),
+        "inference_ms_per_image_mean": float(inference_ms.mean()),
+        "inference_ms_per_image_median": float(np.median(inference_ms)),
+        "inference_ms_per_image_p95": float(np.percentile(inference_ms, 95)),
+        "inference_ms_per_image_min": float(inference_ms.min()),
+        "inference_ms_per_image_max": float(inference_ms.max()),
+        "inference_ms_per_image_std": float(inference_ms.std()),
+        "io_seconds": io_seconds,
+        "total_pixels": float(total_pixels),
+        "megapixels_per_second": (total_pixels / 1e6) / max(inference_seconds, 1e-12),
+        "tta_views": float(tta_views),
+        "tiles_total": float(total_tiles),
+        "tiles_per_second": total_tiles / max(inference_seconds, 1e-12),
         "peak_allocated_bytes": float(peak_bytes),
+        "peak_reserved_bytes": float(peak_reserved_bytes),
     }
     model.to("cpu")
     del model
@@ -736,16 +796,24 @@ def main() -> None:
             f"(Conv/Linear only; 1 MAC = 2 FLOPs)"
         )
         print(
-            f"Latency    : train={training_profile['latency_ms']:.3f} ms | "
-            f"deploy={deploy_profile['latency_ms']:.3f} ms | speedup={speedup:.3f}x"
+            f"Latency/batch: train={training_profile['latency_ms_per_batch']:.3f} ms | "
+            f"deploy={deploy_profile['latency_ms_per_batch']:.3f} ms | speedup={speedup:.3f}x"
         )
         print(
-            f"Throughput : train={training_profile['throughput_images_per_second']:.2f} img/s | "
+            f"Latency/img  : train={training_profile['latency_ms_per_image']:.3f} ms | "
+            f"deploy={deploy_profile['latency_ms_per_image']:.3f} ms"
+        )
+        print(
+            f"Throughput   : train={training_profile['throughput_images_per_second']:.2f} img/s | "
             f"deploy={deploy_profile['throughput_images_per_second']:.2f} img/s"
         )
         print(
-            f"Peak VRAM  : train={mib(training_profile['peak_allocated_bytes']):.2f} MiB | "
+            f"Peak allocated: train={mib(training_profile['peak_allocated_bytes']):.2f} MiB | "
             f"deploy={mib(deploy_profile['peak_allocated_bytes']):.2f} MiB"
+        )
+        print(
+            f"Peak reserved : train={mib(training_profile['peak_reserved_bytes']):.2f} MiB | "
+            f"deploy={mib(deploy_profile['peak_reserved_bytes']):.2f} MiB"
         )
         print(
             f"FP32 error : max={max_abs:.8e} | mean={mean_abs:.8e} | "
@@ -804,27 +872,80 @@ def main() -> None:
             },
         }
 
+        dataset_speedup = (
+            deploy_eval["inference_images_per_second"]
+            / max(training_eval["inference_images_per_second"], 1e-12)
+        )
+        result["evaluation"]["deploy_inference_speedup"] = dataset_speedup
+
+        def print_full_eval(label: str, values: Dict[str, float]) -> None:
+            print(f"{label} ACCURACY")
+            print(
+                f"  Precision={values['precision']:.6f} | Recall={values['recall']:.6f} | "
+                f"F1/Dice={values['f1']:.6f}"
+            )
+            print(
+                f"  Road IoU={values['iou']:.6f} | BG IoU={values['background_iou']:.6f} | "
+                f"mIoU={values['miou']:.6f} | Accuracy={values['accuracy']:.6f}"
+            )
+            print(
+                f"  Mean-image F1={values['mean_image_f1']:.6f} | "
+                f"Mean-image IoU={values['mean_image_iou']:.6f}"
+            )
+            print(f"{label} SPEED / MEMORY")
+            print(
+                f"  End-to-end: {values['elapsed_seconds']:.3f}s total | "
+                f"{values['end_to_end_ms_per_image']:.3f} ms/image | "
+                f"{values['end_to_end_images_per_second']:.3f} images/s"
+            )
+            print(
+                f"  Inference : {values['inference_seconds']:.3f}s total | "
+                f"mean={values['inference_ms_per_image_mean']:.3f} ms | "
+                f"median={values['inference_ms_per_image_median']:.3f} ms | "
+                f"p95={values['inference_ms_per_image_p95']:.3f} ms"
+            )
+            print(
+                f"              min={values['inference_ms_per_image_min']:.3f} ms | "
+                f"max={values['inference_ms_per_image_max']:.3f} ms | "
+                f"std={values['inference_ms_per_image_std']:.3f} ms | "
+                f"{values['inference_images_per_second']:.3f} images/s"
+            )
+            print(
+                f"  Workload  : TTA views={int(values['tta_views'])} | "
+                f"tiles={int(values['tiles_total'])} | "
+                f"{values['tiles_per_second']:.3f} tiles/s | "
+                f"{values['megapixels_per_second']:.3f} MPix/s"
+            )
+            print(
+                f"  I/O time  : {values['io_seconds']:.3f}s | "
+                f"peak allocated={mib(values['peak_allocated_bytes']):.2f} MiB | "
+                f"peak reserved={mib(values['peak_reserved_bytes']):.2f} MiB"
+            )
+
         print("-" * 88)
         print("FINAL METRICS (same checkpoint, images, threshold and inference path)")
+        print_full_eval("MULTI ", training_eval)
+        print_full_eval("DEPLOY", deploy_eval)
+        print("DELTA / SPEEDUP")
         print(
-            "MULTI  : "
-            f"P={training_eval['precision']:.5f} R={training_eval['recall']:.5f} "
-            f"F1={training_eval['f1']:.5f} IoU={training_eval['iou']:.5f} "
-            f"mean-IoU={training_eval['mean_image_iou']:.5f} "
-            f"time={training_eval['elapsed_seconds']:.1f}s"
+            f"  Precision={deploy_eval['precision'] - training_eval['precision']:+.8f} | "
+            f"Recall={deploy_eval['recall'] - training_eval['recall']:+.8f} | "
+            f"F1={deploy_eval['f1'] - training_eval['f1']:+.8f}"
         )
         print(
-            "DEPLOY : "
-            f"P={deploy_eval['precision']:.5f} R={deploy_eval['recall']:.5f} "
-            f"F1={deploy_eval['f1']:.5f} IoU={deploy_eval['iou']:.5f} "
-            f"mean-IoU={deploy_eval['mean_image_iou']:.5f} "
-            f"time={deploy_eval['elapsed_seconds']:.1f}s"
+            f"  IoU={deploy_eval['iou'] - training_eval['iou']:+.8f} | "
+            f"BG-IoU={deploy_eval['background_iou'] - training_eval['background_iou']:+.8f} | "
+            f"mIoU={deploy_eval['miou'] - training_eval['miou']:+.8f} | "
+            f"Accuracy={deploy_eval['accuracy'] - training_eval['accuracy']:+.8f}"
         )
         print(
-            "DELTA  : "
-            f"F1={deploy_eval['f1'] - training_eval['f1']:+.8f} "
-            f"IoU={deploy_eval['iou'] - training_eval['iou']:+.8f} "
-            f"mean-IoU={deploy_eval['mean_image_iou'] - training_eval['mean_image_iou']:+.8f}"
+            f"  Mean-F1={deploy_eval['mean_image_f1'] - training_eval['mean_image_f1']:+.8f} | "
+            f"Mean-IoU={deploy_eval['mean_image_iou'] - training_eval['mean_image_iou']:+.8f}"
+        )
+        print(
+            f"  Dataset inference speedup={dataset_speedup:.4f}x | "
+            f"E2E throughput speedup="
+            f"{deploy_eval['end_to_end_images_per_second'] / max(training_eval['end_to_end_images_per_second'], 1e-12):.4f}x"
         )
 
     print("=" * 88)
