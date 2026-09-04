@@ -188,52 +188,6 @@ class ProgressiveDAPPM(nn.Module):
         return self.activation(context + self.shortcut(x))
 
 
-class StripPoolingContext(nn.Module):
-    """Directional long-range context without attention (full-CNN GLCDM-lite).
-
-    Roads are long and thin, so a plain isotropic receptive field (stacked
-    3x3 convs, or DAPPM's square adaptive-pool grids) is a poor match for
-    their shape.  This module pools each column down to one value and each
-    row down to one value -- a full-height / full-width receptive field at
-    the cost of a mean-reduction -- lightly mixes neighboring columns/rows
-    with a small conv, and broadcasts the result back.  This is the
-    convolution-only counterpart of GLCDM's horizontal/vertical Transformer
-    context branches (Yang et al., "Semantic-Spatial Feature Refinement
-    Network for Road Extraction," TGRS 2026): same "decouple long-range
-    context by direction" idea, no self-attention.  The residual is
-    zero-gated so the module starts as an identity and only learns to
-    contribute once training shows it helps.
-    """
-
-    def __init__(self, channels: int) -> None:
-        super().__init__()
-        groups = _group_count(channels)
-        self.column_conv = nn.Conv2d(
-            channels, channels, (1, 3), padding=(0, 1), bias=False
-        )
-        self.column_norm = nn.GroupNorm(groups, channels)
-        self.row_conv = nn.Conv2d(
-            channels, channels, (3, 1), padding=(1, 0), bias=False
-        )
-        self.row_norm = nn.GroupNorm(groups, channels)
-        self.fuse = ConvGNAct(channels, channels, 1, padding=0, activation=False)
-        self.gate = nn.Parameter(torch.zeros(1, channels, 1, 1))
-        self.activation = nn.ReLU(inplace=True)
-
-    def forward(self, x: Tensor) -> Tensor:
-        height, width = x.shape[-2:]
-        # Full-height receptive field per column, broadcast back to every row.
-        column_context = x.mean(dim=2, keepdim=True)
-        column_context = self.column_norm(self.column_conv(column_context))
-        column_context = column_context.expand(-1, -1, height, -1)
-        # Full-width receptive field per row, broadcast back to every column.
-        row_context = x.mean(dim=3, keepdim=True)
-        row_context = self.row_norm(self.row_conv(row_context))
-        row_context = row_context.expand(-1, -1, -1, width)
-        context = self.fuse(column_context + row_context)
-        return self.activation(x + self.gate * context)
-
-
 class ControlledRoadFusion(nn.Module):
     """Selectively inject semantic context into the persistent S8 detail path.
 
@@ -447,7 +401,6 @@ class DualResolutionContext(nn.Module):
                 hidden_channels=32,
             )
 
-        self.strip_context = StripPoolingContext(semantic_channels)
         self.dappm = ProgressiveDAPPM(
             semantic_channels,
             dappm_channels,
@@ -525,11 +478,8 @@ class DualResolutionContext(nn.Module):
         detail = self.detail_stages[1](detail)
 
         # S32 gathers context, then returns to the saved S16 representation.
-        # Strip-pooled directional context is added before the isotropic
-        # DAPPM grids, so DAPPM aggregates a representation that already
-        # carries full-row/full-column road evidence.
         context_s32 = self.dappm(
-            self.strip_context(self.semantic_projection(semantic_s32))
+            self.semantic_projection(semantic_s32)
         )
         context_s16 = self._resize(
             self.context_to_s16(context_s32), semantic.shape[-2:]
@@ -549,7 +499,6 @@ class DualResolutionContext(nn.Module):
             "detail_to_semantic": self.detail_to_semantic_scale_1,
             "s32_context_to_s16": self.context_scale,
             "semantic_to_final": self.final_fusion.fusion_scale,
-            "strip_context": self.strip_context.gate,
         }
         statistics: Dict[str, float] = {}
         for name, gate in gates.items():
