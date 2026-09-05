@@ -1690,10 +1690,30 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help=(
             "Use OrientedSkipAggregation (road-direction-steered context "
-            "aggregation, no auxiliary loss) for the S4/S2 skip connections "
-            "instead of SkipFeatureGate (channel/spatial SE-style gate). "
-            "--no-oriented_skip restores SkipFeatureGate for comparison."
+            "aggregation, direction learned + supervised via "
+            "RoadSegOrientationLoss) for the S4/S2 skip connections instead "
+            "of SkipFeatureGate (channel/spatial SE-style gate, no "
+            "orientation loss). --no-oriented_skip restores SkipFeatureGate "
+            "for comparison."
         ),
+    )
+    parser.add_argument(
+        "--oriented_skip_span",
+        type=int,
+        default=2,
+        help=(
+            "Sampling offsets per side along the predicted road direction "
+            "in OrientedSkipAggregation (2 -> 4 grid_sample calls per stage, "
+            "8 total across S4+S2). Lower this first if oriented_skip OOMs "
+            "at a batch size SkipFeatureGate fit."
+        ),
+    )
+    parser.add_argument(
+        "--oriented_skip_spacing",
+        type=float,
+        default=3.0,
+        help="Distance in pixels (of that stage's own resolution) between "
+        "consecutive OrientedSkipAggregation sampling offsets.",
     )
     parser.add_argument("--dropout", type=float, default=0.05)
     parser.add_argument(

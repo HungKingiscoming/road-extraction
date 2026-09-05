@@ -571,6 +571,8 @@ class RoadReconstructionDecoder(nn.Module):
         dropout: float = 0.05,
         full_refine_blocks: int = 0,
         oriented_skip: bool = True,
+        oriented_skip_span: int = 2,
+        oriented_skip_spacing: float = 3.0,
         deploy: bool = False,
     ) -> None:
         super().__init__()
@@ -581,16 +583,27 @@ class RoadReconstructionDecoder(nn.Module):
         # direction learned and supervised via RoadSegOrientationLoss) is the
         # default; SkipFeatureGate (channel/spatial SE-style denoising) stays
         # available via --no-oriented_skip for a clean A/B comparison
-        # without another code change.
+        # without another code change. OrientedSkipAggregation runs S4/S2
+        # grid_sample + several conv layers per stage (not just SE-style
+        # pooling), so it costs more VRAM than SkipFeatureGate at the same
+        # batch size -- span/spacing (fewer/closer sampling offsets) are
+        # exposed here too, so that cost is tunable without another one.
         skip_refine_cls = (
             OrientedSkipAggregation if oriented_skip else SkipFeatureGate
+        )
+        skip_refine_kwargs = (
+            {"span": oriented_skip_span, "spacing": oriented_skip_spacing}
+            if oriented_skip
+            else {}
         )
 
         self.fused_proj = ConvBNAct(fused_channels, s4_channels, 1, padding=0)
         self.shallow_proj = ConvBNAct(
             shallow_channels, shallow_skip_channels, 1, padding=0
         )
-        self.s4_skip_gate = skip_refine_cls(shallow_skip_channels, s4_channels)
+        self.s4_skip_gate = skip_refine_cls(
+            shallow_skip_channels, s4_channels, **skip_refine_kwargs
+        )
         self.s4_fuse = ConvBNAct(
             s4_channels + shallow_skip_channels,
             s4_channels,
@@ -605,7 +618,9 @@ class RoadReconstructionDecoder(nn.Module):
         self.stem_proj = ConvBNAct(
             stem_channels, stem_skip_channels, 1, padding=0
         )
-        self.s2_skip_gate = skip_refine_cls(stem_skip_channels, s4_channels)
+        self.s2_skip_gate = skip_refine_cls(
+            stem_skip_channels, s4_channels, **skip_refine_kwargs
+        )
         self.s2_fuse = ConvBNAct(
             s4_channels + stem_skip_channels,
             s2_channels,

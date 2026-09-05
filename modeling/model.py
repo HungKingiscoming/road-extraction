@@ -549,6 +549,8 @@ class DualBranchRoadNet(nn.Module):
         dropout: float = 0.05,
         full_refine_blocks: int = 0,
         oriented_skip: bool = True,
+        oriented_skip_span: int = 2,
+        oriented_skip_spacing: float = 3.0,
         imagenet_pretrained: bool = True,
         encoder_weights_path: Optional[str] = None,
         deploy: bool = False,
@@ -580,6 +582,8 @@ class DualBranchRoadNet(nn.Module):
             dropout=dropout,
             full_refine_blocks=full_refine_blocks,
             oriented_skip=oriented_skip,
+            oriented_skip_span=oriented_skip_span,
+            oriented_skip_spacing=oriented_skip_spacing,
             deploy=deploy,
         )
         self.current_phase = 4
@@ -698,6 +702,8 @@ def build_model(args) -> DualBranchRoadNet:
         dropout=float(args.dropout),
         full_refine_blocks=int(getattr(args, "full_refine_blocks", 0)),
         oriented_skip=bool(getattr(args, "oriented_skip", True)),
+        oriented_skip_span=int(getattr(args, "oriented_skip_span", 2)),
+        oriented_skip_spacing=float(getattr(args, "oriented_skip_spacing", 3.0)),
         imagenet_pretrained=bool(args.imagenet_pretrained),
         encoder_weights_path=args.encoder_weights_path,
     )
