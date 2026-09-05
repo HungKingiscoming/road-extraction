@@ -1684,6 +1684,17 @@ def parse_args() -> argparse.Namespace:
             "opt in only once there is VRAM budget to test it."
         ),
     )
+    parser.add_argument(
+        "--oriented_skip",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use OrientedSkipAggregation (road-direction-steered context "
+            "aggregation, no auxiliary loss) for the S4/S2 skip connections "
+            "instead of SkipFeatureGate (channel/spatial SE-style gate). "
+            "--no-oriented_skip restores SkipFeatureGate for comparison."
+        ),
+    )
     parser.add_argument("--dropout", type=float, default=0.05)
     parser.add_argument(
         "--imagenet_pretrained",
@@ -2090,7 +2101,8 @@ def main() -> None:
         f"decoder S4/S2/S1={args.decoder_s4_channels}/"
         f"{args.decoder_s2_channels}/{args.full_channels}ch | "
         f"detail blocks={tuple(args.detail_blocks)} | "
-        f"full_refine_blocks={args.full_refine_blocks}"
+        f"full_refine_blocks={args.full_refine_blocks} | "
+        f"skip={'oriented' if args.oriented_skip else 'gate'}"
     )
     rank_zero_print(
         f"bilateral fusion={args.bilateral_fusion} | "

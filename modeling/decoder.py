@@ -384,6 +384,122 @@ class SkipFeatureGate(nn.Module):
         return skip * channel_weight * spatial_weight
 
 
+_SKIP_SOBEL_X = torch.tensor(
+    [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]
+).view(1, 1, 3, 3)
+
+
+class OrientedSkipAggregation(nn.Module):
+    """Road-direction-steered skip-feature refinement (analytic, no auxiliary loss).
+
+    Drop-in alternative to SkipFeatureGate -- same
+    ``(projected_skip, guide) -> same-shape tensor`` signature expected by
+    ``RoadReconstructionDecoder._decode_stage`` -- inspired by RoadWeaveNet's
+    WeaveAgg/OCFE mechanism (Orientation-Conditioned Feature Extraction):
+    instead of gating the skip feature channel/spatial-wise, it aggregates
+    context sampled *along the skip feature's own local road direction*,
+    which is the right receptive-field shape for a road (long and thin) in a
+    way an isotropic conv or a plain gate cannot express.
+
+    WeaveAgg predicts that direction with a small trained head, but the head
+    only receives a training signal from an auxiliary loss against the
+    ground-truth structure-tensor angle -- its predicted direction is
+    detached before building the sampling grid, so gradient from the
+    segmentation loss alone cannot reach it. To avoid adding a fourth loss
+    term, this module estimates the direction analytically instead, every
+    forward pass, from the skip feature's own activations: an
+    activation-energy map (L2 norm across channels) stands in for the mask
+    RoadWeaveNet's structure_tensor_angle uses, Sobel gradients of that map
+    feed the same structure-tensor construction (dominant axis in
+    double-angle form, so a road's 180-degree undirected symmetry does not
+    confuse it), rotated 90 degrees to go from the gradient/normal axis to
+    the tangent (along-road) axis actually wanted for aggregation. The only
+    learned parameters are the confidence gate (how much to trust the
+    aggregated context at each pixel, driven by the decoder's ``guide``
+    feature) and the fuse conv -- both trained purely by the existing
+    segmentation loss, same as SkipFeatureGate. The confidence gate's last
+    layer is zero-weight-initialized with a negative bias, so it starts
+    near 0 (skip left almost unmodified) and only learns to pull in
+    directional context once training shows it helps.
+    """
+
+    def __init__(
+        self,
+        skip_channels: int,
+        guide_channels: int,
+        span: int = 2,
+        spacing: float = 3.0,
+    ) -> None:
+        super().__init__()
+        self.span = int(span)
+        self.spacing = float(spacing)
+        self.register_buffer("_sobel_x", _SKIP_SOBEL_X, persistent=False)
+        hidden = max(16, skip_channels // 4)
+        self.confidence = nn.Sequential(
+            nn.Conv2d(guide_channels, hidden, 3, padding=1, bias=False),
+            nn.GroupNorm(_group_count(hidden), hidden),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, 1, 1),
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv2d(skip_channels * 2, hidden, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, skip_channels, 1),
+        )
+        nn.init.zeros_(self.confidence[-1].weight)
+        # sigmoid(-4) ~= 0.018: starts as a near-identity skip connection
+        # (small but nonzero, so gradient can still reach and grow it)
+        # rather than the exact 2*sigmoid(0)=1 identity trick used elsewhere
+        # in this file -- here confidence scales an added residual, not a
+        # multiplicative pass-through, so identity means ~0, not 1.
+        nn.init.constant_(self.confidence[-1].bias, -4.0)
+
+    @torch.no_grad()
+    def _tangent_angle(self, x: Tensor) -> Tensor:
+        """Local road-tangent angle (radians), shape (B,1,H,W), from x itself."""
+        energy = x.float().norm(dim=1, keepdim=True)
+        ix = F.conv2d(energy, self._sobel_x, padding=1)
+        iy = F.conv2d(energy, self._sobel_x.transpose(2, 3), padding=1)
+        jxx = F.avg_pool2d(ix * ix, 5, stride=1, padding=2)
+        jyy = F.avg_pool2d(iy * iy, 5, stride=1, padding=2)
+        jxy = F.avg_pool2d(ix * iy, 5, stride=1, padding=2)
+        # Dominant-gradient (normal-to-edge) axis, double-angle form.
+        p, q = jxx - jyy, 2.0 * jxy
+        # Roads are aggregated *along* their length (tangent), which is the
+        # normal rotated 90 degrees -- +pi, not +pi/2, once doubled.
+        return 0.5 * torch.atan2(q, p) + (math.pi / 2.0)
+
+    def forward(self, skip: Tensor, guide: Tensor) -> Tensor:
+        if skip.shape[-2:] != guide.shape[-2:]:
+            raise ValueError(
+                "OrientedSkipAggregation inputs must be spatially aligned"
+            )
+        height, width = skip.shape[-2:]
+        theta = self._tangent_angle(skip)
+        direction = torch.cat((torch.cos(theta), torch.sin(theta)), dim=1)
+        ys, xs = torch.meshgrid(
+            torch.linspace(-1.0, 1.0, height, device=skip.device),
+            torch.linspace(-1.0, 1.0, width, device=skip.device),
+            indexing="ij",
+        )
+        base = torch.stack((xs, ys), dim=0).unsqueeze(0)  # 1,2,H,W
+
+        aggregated = torch.zeros_like(skip)
+        for step in range(1, self.span + 1):
+            offset = self.spacing * step / width
+            for sign in (1.0, -1.0):
+                grid = (base + sign * offset * direction).permute(0, 2, 3, 1)
+                aggregated = aggregated + F.grid_sample(
+                    skip, grid, mode="bilinear", padding_mode="border",
+                    align_corners=True,
+                )
+        aggregated = aggregated / float(self.span * 2)
+
+        confidence = torch.sigmoid(self.confidence(guide))
+        context = self.fuse(torch.cat((skip, aggregated), dim=1))
+        return skip + confidence * context
+
+
 class SeparableConvBNAct(nn.Sequential):
     """Depthwise-separable full-resolution prediction refinement."""
 
@@ -413,17 +529,26 @@ class RoadReconstructionDecoder(nn.Module):
         num_classes: int = 2,
         dropout: float = 0.05,
         full_refine_blocks: int = 0,
+        oriented_skip: bool = True,
         deploy: bool = False,
     ) -> None:
         super().__init__()
         shallow_skip_channels = max(24, s4_channels // 2)
         stem_skip_channels = max(16, s2_channels // 2)
+        # Both S4 and S2 skip stages use the same kind of refinement module,
+        # picked once here. OrientedSkipAggregation (road-direction-steered,
+        # no auxiliary loss) is the default; SkipFeatureGate (channel/spatial
+        # SE-style denoising) stays available via --no-oriented_skip for a
+        # clean A/B comparison without another code change.
+        skip_refine_cls = (
+            OrientedSkipAggregation if oriented_skip else SkipFeatureGate
+        )
 
         self.fused_proj = ConvBNAct(fused_channels, s4_channels, 1, padding=0)
         self.shallow_proj = ConvBNAct(
             shallow_channels, shallow_skip_channels, 1, padding=0
         )
-        self.s4_skip_gate = SkipFeatureGate(shallow_skip_channels, s4_channels)
+        self.s4_skip_gate = skip_refine_cls(shallow_skip_channels, s4_channels)
         self.s4_fuse = ConvBNAct(
             s4_channels + shallow_skip_channels,
             s4_channels,
@@ -438,7 +563,7 @@ class RoadReconstructionDecoder(nn.Module):
         self.stem_proj = ConvBNAct(
             stem_channels, stem_skip_channels, 1, padding=0
         )
-        self.s2_skip_gate = SkipFeatureGate(stem_skip_channels, s4_channels)
+        self.s2_skip_gate = skip_refine_cls(stem_skip_channels, s4_channels)
         self.s2_fuse = ConvBNAct(
             s4_channels + stem_skip_channels,
             s2_channels,
@@ -498,13 +623,13 @@ class RoadReconstructionDecoder(nn.Module):
 
         S4 and S2 both follow this exact pattern (only the submodules
         differ), so it is factored out once here rather than duplicated.
-        ``skip_refine`` is deliberately generic -- currently a
-        ``SkipFeatureGate`` (channel+spatial SE-style denoising), but the
-        signature ``(projected_skip, upsampled) -> same-shape tensor`` is
-        also what a road-orientation-aware module (aggregate skip context
-        along the locally predicted road direction, instead of gating it)
-        would implement -- so trying that later means swapping the module
-        passed in here, not touching this method or ``forward``.
+        ``skip_refine`` is deliberately generic -- ``OrientedSkipAggregation``
+        (road-direction-steered context aggregation) by default, or
+        ``SkipFeatureGate`` (channel+spatial SE-style denoising) via
+        ``oriented_skip=False`` -- both implement
+        ``(projected_skip, upsampled) -> same-shape tensor``, so switching
+        between them (or trying a third option later) means picking a class
+        in ``__init__``, not touching this method or ``forward``.
         """
         skip = skip_refine(skip_proj(raw_skip), upsampled)
         fused = fuse(torch.cat((upsampled, skip), dim=1))
