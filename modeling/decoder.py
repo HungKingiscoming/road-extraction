@@ -789,14 +789,18 @@ class RoadSegOrientationLoss(nn.Module):
         road_probability = road_logits.float().softmax(dim=1)[:, 1:2]
         loss_main_dice = binary_dice_loss(road_probability, road_mask)
 
-        if self.aux_weight > 0.0:
-            terms = [
-                self._orientation_term(orientation, road_mask)
-                for orientation in orientations
-            ]
-            terms = [term for term in terms if term is not None]
-        else:
-            terms = []
+        # Always computed (even when aux_weight==0.0 during warmup), same as
+        # the pre-warmup centerline loss this replaced: a term that is
+        # skipped outright rather than multiplied by a zero weight never
+        # touches OrientHead's parameters in the backward graph at all, so
+        # their gradient hooks never fire -- fine on a single GPU, but DDP
+        # requires every parameter to participate (even with a zero
+        # resulting gradient) every step, and errors out otherwise.
+        terms = [
+            self._orientation_term(orientation, road_mask)
+            for orientation in orientations
+        ]
+        terms = [term for term in terms if term is not None]
         loss_orientation = (
             torch.stack(terms).mean() if terms else road_logits.new_zeros(())
         )
