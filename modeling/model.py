@@ -547,7 +547,7 @@ class DualBranchRoadNet(nn.Module):
         decoder_s2_channels: int = 32,
         full_channels: int = 24,
         dropout: float = 0.05,
-        full_refine_blocks: int = 1,
+        full_refine_blocks: int = 0,
         imagenet_pretrained: bool = True,
         encoder_weights_path: Optional[str] = None,
         deploy: bool = False,
@@ -694,7 +694,7 @@ def build_model(args) -> DualBranchRoadNet:
         decoder_s2_channels=int(args.decoder_s2_channels),
         full_channels=int(args.full_channels),
         dropout=float(args.dropout),
-        full_refine_blocks=int(getattr(args, "full_refine_blocks", 1)),
+        full_refine_blocks=int(getattr(args, "full_refine_blocks", 0)),
         imagenet_pretrained=bool(args.imagenet_pretrained),
         encoder_weights_path=args.encoder_weights_path,
     )

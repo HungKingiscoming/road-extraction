@@ -1673,13 +1673,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--full_refine_blocks",
         type=int,
-        default=1,
+        default=0,
         help=(
             "Extra RepDepthwiseBlocks after full_refine, at full crop "
             "resolution (the most expensive spatial size in the decoder -- "
-            "each block here costs far more compute than the same block at "
-            "S4/S2, despite full_channels usually being the smallest width). "
-            "0 restores the original single-block full_refine only."
+            "each block here costs far more compute/VRAM than the same "
+            "block at S4/S2, despite full_channels usually being the "
+            "smallest width). Default 0 keeps the original single-block "
+            "full_refine so a plain run fits the same batch size as before; "
+            "opt in only once there is VRAM budget to test it."
         ),
     )
     parser.add_argument("--dropout", type=float, default=0.05)

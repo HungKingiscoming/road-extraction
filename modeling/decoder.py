@@ -412,7 +412,7 @@ class RoadReconstructionDecoder(nn.Module):
         full_channels: int = 24,
         num_classes: int = 2,
         dropout: float = 0.05,
-        full_refine_blocks: int = 1,
+        full_refine_blocks: int = 0,
         deploy: bool = False,
     ) -> None:
         super().__init__()
@@ -451,21 +451,15 @@ class RoadReconstructionDecoder(nn.Module):
         )
 
         self.full_refine = SeparableConvBNAct(s2_channels, full_channels)
-        # The full-resolution stage decides pixel-accurate road boundaries,
-        # yet previously had only the single block above -- thinner than
-        # every earlier decode stage (s4_refine/s2_refine each get two
-        # RepDepthwiseBlocks). Adding depth here targets the gap observed
-        # between relaxed (+/-3px) and strict F1: the model already locates
-        # roads correctly, it just under-refines their exact edges.
-        #
-        # This stage runs at the *largest* spatial size in the whole decoder
-        # (full crop resolution, e.g. 1024x1024), so unlike every other
-        # RepDepthwiseBlock stack in this decoder its compute cost (not just
-        # its parameter count) is real -- each added block costs roughly
-        # 4x/16x what the same block costs at S4/S2. Depth here is therefore
-        # exposed as a knob (default 1, not the 2 first tried) rather than
-        # hard-coded, so it can be dialed down if it is not earning its cost
-        # and dialed up only once that is confirmed.
+        # Optional extra depth at the full-resolution stage, targeting the
+        # persistent gap between relaxed (+/-3px) and strict F1 (the model
+        # locates roads correctly; it under-refines their exact edges). This
+        # stage runs at the *largest* spatial size in the decoder, so unlike
+        # every other RepDepthwiseBlock stack here its compute/VRAM cost is
+        # real (roughly 4x/16x an S4/S2 block) regardless of full_channels --
+        # default 0 keeps the original single-block full_refine so a plain
+        # run fits the same batch size as before; opt in via
+        # --full_refine_blocks once there is VRAM budget to test it.
         self.full_extra_refine = (
             nn.Sequential(
                 *[
@@ -489,6 +483,33 @@ class RoadReconstructionDecoder(nn.Module):
     def _resize(x: Tensor, size: Tuple[int, int]) -> Tensor:
         return F.interpolate(x, size=size, mode="bilinear", align_corners=False)
 
+    @staticmethod
+    def _decode_stage(
+        upsampled: Tensor,
+        raw_skip: Tensor,
+        skip_proj: nn.Module,
+        skip_refine: nn.Module,
+        fuse: nn.Module,
+        refine: nn.Module,
+    ) -> Tensor:
+        """One coarse-to-fine stage: project + refine the skip feature under
+        guidance from the already-decoded ``upsampled`` feature, fuse the
+        two, then refine the result.
+
+        S4 and S2 both follow this exact pattern (only the submodules
+        differ), so it is factored out once here rather than duplicated.
+        ``skip_refine`` is deliberately generic -- currently a
+        ``SkipFeatureGate`` (channel+spatial SE-style denoising), but the
+        signature ``(projected_skip, upsampled) -> same-shape tensor`` is
+        also what a road-orientation-aware module (aggregate skip context
+        along the locally predicted road direction, instead of gating it)
+        would implement -- so trying that later means swapping the module
+        passed in here, not touching this method or ``forward``.
+        """
+        skip = skip_refine(skip_proj(raw_skip), upsampled)
+        fused = fuse(torch.cat((upsampled, skip), dim=1))
+        return refine(fused)
+
     def forward(
         self,
         stem_s2: Tensor,
@@ -497,14 +518,16 @@ class RoadReconstructionDecoder(nn.Module):
         output_size: Tuple[int, int],
     ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
         p4 = self._resize(self.fused_proj(fused_s8), shallow_s4.shape[-2:])
-        shallow_feature = self.s4_skip_gate(self.shallow_proj(shallow_s4), p4)
-        p4 = self.s4_fuse(torch.cat((p4, shallow_feature), dim=1))
-        p4 = self.s4_refine(p4)
+        p4 = self._decode_stage(
+            p4, shallow_s4, self.shallow_proj, self.s4_skip_gate,
+            self.s4_fuse, self.s4_refine,
+        )
 
         p2 = self._resize(p4, stem_s2.shape[-2:])
-        stem_feature = self.s2_skip_gate(self.stem_proj(stem_s2), p2)
-        p2 = self.s2_fuse(torch.cat((p2, stem_feature), dim=1))
-        p2 = self.s2_refine(p2)
+        p2 = self._decode_stage(
+            p2, stem_s2, self.stem_proj, self.s2_skip_gate,
+            self.s2_fuse, self.s2_refine,
+        )
 
         full = self._resize(p2, output_size)
         full = self.full_extra_refine(self.full_refine(full))
