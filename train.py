@@ -1512,7 +1512,7 @@ def transfer_weights(
     # module introduced after that checkpoint was trained. Extend this tuple
     # (never remove from it) whenever a new purely-additive, zero/near-zero
     # initialized submodule is added, so older checkpoints keep transferring.
-    new_module_fragments = ("spatial_gate", "skip_gate")
+    new_module_fragments = ("spatial_gate", "skip_gate", "full_extra_refine")
     allowed_missing = all(
         any(fragment in key for fragment in new_module_fragments)
         for key in result.missing_keys

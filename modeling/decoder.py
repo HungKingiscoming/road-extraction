@@ -450,6 +450,16 @@ class RoadReconstructionDecoder(nn.Module):
         )
 
         self.full_refine = SeparableConvBNAct(s2_channels, full_channels)
+        # The full-resolution stage decides pixel-accurate road boundaries,
+        # yet previously had only the single block above -- thinner than
+        # every earlier decode stage (s4_refine/s2_refine each get two
+        # RepDepthwiseBlocks). Matching that depth here targets the gap
+        # observed between relaxed (+/-3px) and strict F1: the model already
+        # locates roads correctly, it just under-refines their exact edges.
+        self.full_extra_refine = nn.Sequential(
+            RepDepthwiseBlock(full_channels, deploy=deploy),
+            RepDepthwiseBlock(full_channels, deploy=deploy),
+        )
         self.dropout = nn.Dropout2d(dropout) if dropout > 0.0 else nn.Identity()
         self.classifier = nn.Conv2d(full_channels, num_classes, 1)
 
@@ -481,7 +491,8 @@ class RoadReconstructionDecoder(nn.Module):
         p2 = self.s2_refine(p2)
 
         full = self._resize(p2, output_size)
-        road_logits = self.classifier(self.dropout(self.full_refine(full)))
+        full = self.full_extra_refine(self.full_refine(full))
+        road_logits = self.classifier(self.dropout(full))
         if self.training:
             return self.centerline_head(p4), road_logits
         return road_logits
