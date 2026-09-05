@@ -1670,6 +1670,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decoder_s4_channels", type=int, default=64)
     parser.add_argument("--decoder_s2_channels", type=int, default=32)
     parser.add_argument("--full_channels", type=int, default=24)
+    parser.add_argument(
+        "--full_refine_blocks",
+        type=int,
+        default=1,
+        help=(
+            "Extra RepDepthwiseBlocks after full_refine, at full crop "
+            "resolution (the most expensive spatial size in the decoder -- "
+            "each block here costs far more compute than the same block at "
+            "S4/S2, despite full_channels usually being the smallest width). "
+            "0 restores the original single-block full_refine only."
+        ),
+    )
     parser.add_argument("--dropout", type=float, default=0.05)
     parser.add_argument(
         "--imagenet_pretrained",
@@ -2075,7 +2087,8 @@ def main() -> None:
     rank_zero_print(
         f"decoder S4/S2/S1={args.decoder_s4_channels}/"
         f"{args.decoder_s2_channels}/{args.full_channels}ch | "
-        f"detail blocks={tuple(args.detail_blocks)}"
+        f"detail blocks={tuple(args.detail_blocks)} | "
+        f"full_refine_blocks={args.full_refine_blocks}"
     )
     rank_zero_print(
         f"bilateral fusion={args.bilateral_fusion} | "

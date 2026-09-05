@@ -412,6 +412,7 @@ class RoadReconstructionDecoder(nn.Module):
         full_channels: int = 24,
         num_classes: int = 2,
         dropout: float = 0.05,
+        full_refine_blocks: int = 1,
         deploy: bool = False,
     ) -> None:
         super().__init__()
@@ -453,12 +454,27 @@ class RoadReconstructionDecoder(nn.Module):
         # The full-resolution stage decides pixel-accurate road boundaries,
         # yet previously had only the single block above -- thinner than
         # every earlier decode stage (s4_refine/s2_refine each get two
-        # RepDepthwiseBlocks). Matching that depth here targets the gap
-        # observed between relaxed (+/-3px) and strict F1: the model already
-        # locates roads correctly, it just under-refines their exact edges.
-        self.full_extra_refine = nn.Sequential(
-            RepDepthwiseBlock(full_channels, deploy=deploy),
-            RepDepthwiseBlock(full_channels, deploy=deploy),
+        # RepDepthwiseBlocks). Adding depth here targets the gap observed
+        # between relaxed (+/-3px) and strict F1: the model already locates
+        # roads correctly, it just under-refines their exact edges.
+        #
+        # This stage runs at the *largest* spatial size in the whole decoder
+        # (full crop resolution, e.g. 1024x1024), so unlike every other
+        # RepDepthwiseBlock stack in this decoder its compute cost (not just
+        # its parameter count) is real -- each added block costs roughly
+        # 4x/16x what the same block costs at S4/S2. Depth here is therefore
+        # exposed as a knob (default 1, not the 2 first tried) rather than
+        # hard-coded, so it can be dialed down if it is not earning its cost
+        # and dialed up only once that is confirmed.
+        self.full_extra_refine = (
+            nn.Sequential(
+                *[
+                    RepDepthwiseBlock(full_channels, deploy=deploy)
+                    for _ in range(int(full_refine_blocks))
+                ]
+            )
+            if full_refine_blocks > 0
+            else nn.Identity()
         )
         self.dropout = nn.Dropout2d(dropout) if dropout > 0.0 else nn.Identity()
         self.classifier = nn.Conv2d(full_channels, num_classes, 1)
