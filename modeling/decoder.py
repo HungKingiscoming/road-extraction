@@ -42,37 +42,6 @@ class ConvBNAct(nn.Sequential):
         super().__init__(*layers)
 
 
-class ConvGNAct(nn.Sequential):
-    """Conv-GroupNorm-ReLU used on pooled maps, including 1x1 maps."""
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int = 3,
-        padding: Optional[int] = None,
-        activation: bool = True,
-    ) -> None:
-        if padding is None:
-            padding = kernel_size // 2
-        groups = min(8, out_channels)
-        while out_channels % groups:
-            groups -= 1
-        layers: list[nn.Module] = [
-            nn.Conv2d(
-                in_channels,
-                out_channels,
-                kernel_size,
-                padding=padding,
-                bias=False,
-            ),
-            nn.GroupNorm(groups, out_channels),
-        ]
-        if activation:
-            layers.append(nn.ReLU(inplace=True))
-        super().__init__(*layers)
-
-
 class ConvBN(nn.Sequential):
     """Linear Conv-BN branch used by re-parameterizable blocks."""
 

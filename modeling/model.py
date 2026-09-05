@@ -10,7 +10,6 @@ from torch import Tensor
 
 from .decoder import (
     ConvBNAct,
-    ConvGNAct,
     RepDepthwiseBlock,
     RepVGGBlock,
     RoadReconstructionDecoder,
@@ -121,71 +120,58 @@ def _rep_stage(channels: int, blocks: int, deploy: bool) -> nn.Sequential:
     )
 
 
-class ProgressiveDAPPM(nn.Module):
-    """Progressively aggregate adaptive pooled context at the semantic S32 map.
+class DilatedContextBlock(nn.Module):
+    """D-LinkNet-style dilated-conv context, placed right after the encoder's
+    deepest stage -- the same slot D-LinkNet's center block occupies, chosen
+    for the same reason: it won the DeepGlobe Road Extraction Challenge doing
+    exactly this at exactly this position (ResNet34 -> dilated center block).
 
-    GroupNorm keeps the global 1x1 branch valid for small per-GPU batches.
-    Pooling proceeds from finer to coarser grids, so each stage adds broader
-    context to the previous representation before concatenation.
+    Unlike the DAPPM this replaces, no branch here pools the map down (DAPPM
+    pooled to grids as coarse as 1x1). Each dilated 3x3 conv runs at the S32
+    map's full H*W, so thin/elongated road structure keeps its spatial
+    position while the receptive field still grows enough (dilation
+    1,2,4,8 -> effective reach 15px at this resolution) to bridge gaps from
+    shadows, tree cover, or intersections. Branches chain sequentially (each
+    dilated conv sees the previous one's output, not the raw input) and every
+    intermediate output is summed into the residual, matching the original
+    D-LinkNet Dblock.
+
+    Uses BatchNorm, not GroupNorm: since nothing here is pooled, every branch
+    sees the map's full spatial extent, so per-GPU batch=8 gives batch*H*W
+    samples per channel for running stats -- plenty stable. GroupNorm was
+    only needed for DAPPM's 1x1/2x2 pooled branches, which this block has
+    none of.
     """
 
     def __init__(
-        self,
-        in_channels: int,
-        branch_channels: int,
-        out_channels: int,
-        pool_sizes: Sequence[int] = (1, 2, 4, 8),
+        self, channels: int, dilations: Sequence[int] = (1, 2, 4, 8)
     ) -> None:
         super().__init__()
-        sizes = tuple(sorted({int(size) for size in pool_sizes}, reverse=True))
-        if not sizes or min(sizes) < 1:
-            raise ValueError("DAPPM pool sizes must be positive")
-        self.pool_sizes = sizes
-        self.scale0 = ConvGNAct(in_channels, branch_channels, 1, padding=0)
-        self.pool_projections = nn.ModuleList(
-            ConvGNAct(in_channels, branch_channels, 1, padding=0)
-            for _ in sizes
+        if not dilations:
+            raise ValueError("DilatedContextBlock needs at least one dilation")
+        self.branches = nn.ModuleList(
+            nn.Sequential(
+                nn.Conv2d(
+                    channels,
+                    channels,
+                    3,
+                    padding=int(dilation),
+                    dilation=int(dilation),
+                    bias=False,
+                ),
+                nn.BatchNorm2d(channels),
+                nn.ReLU(inplace=True),
+            )
+            for dilation in dilations
         )
-        self.processes = nn.ModuleList(
-            ConvGNAct(branch_channels, branch_channels, 3)
-            for _ in sizes
-        )
-        self.compression = ConvGNAct(
-            branch_channels * (len(sizes) + 1),
-            out_channels,
-            1,
-            padding=0,
-            activation=False,
-        )
-        self.shortcut = ConvGNAct(
-            in_channels,
-            out_channels,
-            1,
-            padding=0,
-            activation=False,
-        )
-        self.activation = nn.ReLU(inplace=True)
 
     def forward(self, x: Tensor) -> Tensor:
-        output_size = x.shape[-2:]
-        previous = self.scale0(x)
-        outputs = [previous]
-        for configured_size, projection, process in zip(
-            self.pool_sizes, self.pool_projections, self.processes
-        ):
-            grid = max(1, min(configured_size, *output_size))
-            pooled = F.adaptive_avg_pool2d(x, (grid, grid))
-            pooled = projection(pooled)
-            pooled = F.interpolate(
-                pooled,
-                size=output_size,
-                mode="bilinear",
-                align_corners=False,
-            )
-            previous = process(previous + pooled)
-            outputs.append(previous)
-        context = self.compression(torch.cat(outputs, dim=1))
-        return self.activation(context + self.shortcut(x))
+        out = x
+        current = x
+        for branch in self.branches:
+            current = branch(current)
+            out = out + current
+        return out
 
 
 class ControlledRoadFusion(nn.Module):
@@ -320,17 +306,17 @@ class DualResolutionContext(nn.Module):
     """Persistent detail S8 stream plus semantic S16/S32 context stream.
 
     There is one genuine bilateral interaction at S8 <-> S16.  S32 is used
-    only to gather broad DAPPM context; it returns to the saved S16 feature as
-    a gated residual before the final S8 fusion.  This avoids asking the S32
-    map to preserve thin roads and avoids a second heavy bilateral module.
+    only to gather broad dilated-conv context (see ``DilatedContextBlock``);
+    it returns to the saved S16 feature as a gated residual before the final
+    S8 fusion.  This avoids asking the S32 map to preserve thin roads and
+    avoids a second heavy bilateral module.
     """
 
     def __init__(
         self,
         detail_channels: int = 96,
         semantic_channels: int = 192,
-        dappm_channels: int = 32,
-        dappm_pool_sizes: Sequence[int] = (1, 2, 4, 8),
+        context_dilations: Sequence[int] = (1, 2, 4, 8),
         detail_blocks: Sequence[int] = (2, 2),
         semantic_blocks: int = 2,
         fusion_blocks: int = 1,
@@ -401,11 +387,8 @@ class DualResolutionContext(nn.Module):
                 hidden_channels=32,
             )
 
-        self.dappm = ProgressiveDAPPM(
-            semantic_channels,
-            dappm_channels,
-            semantic_channels,
-            pool_sizes=dappm_pool_sizes,
+        self.context_block = DilatedContextBlock(
+            semantic_channels, dilations=context_dilations
         )
         self.context_to_s16 = ConvBNAct(
             semantic_channels,
@@ -478,7 +461,7 @@ class DualResolutionContext(nn.Module):
         detail = self.detail_stages[1](detail)
 
         # S32 gathers context, then returns to the saved S16 representation.
-        context_s32 = self.dappm(
+        context_s32 = self.context_block(
             self.semantic_projection(semantic_s32)
         )
         context_s16 = self._resize(
@@ -537,8 +520,7 @@ class DualBranchRoadNet(nn.Module):
         num_classes: int = 2,
         detail_channels: int = 96,
         semantic_channels: int = 192,
-        dappm_channels: int = 32,
-        dappm_pool_sizes: Sequence[int] = (1, 2, 4, 8),
+        context_dilations: Sequence[int] = (1, 2, 4, 8),
         detail_blocks: Sequence[int] = (2, 2),
         semantic_blocks: int = 2,
         fusion_blocks: int = 1,
@@ -563,8 +545,7 @@ class DualBranchRoadNet(nn.Module):
         self.dual_branch = DualResolutionContext(
             detail_channels=detail_channels,
             semantic_channels=semantic_channels,
-            dappm_channels=dappm_channels,
-            dappm_pool_sizes=dappm_pool_sizes,
+            context_dilations=context_dilations,
             detail_blocks=detail_blocks,
             semantic_blocks=semantic_blocks,
             fusion_blocks=fusion_blocks,
@@ -662,9 +643,38 @@ class DualBranchRoadNet(nn.Module):
         return trainable, total
 
     def optimization_modules(self) -> Dict[str, Iterable[nn.Parameter]]:
+        # These four are the small [1,C,1,1] residual-gate scales that
+        # control how much each cross-branch/cross-resolution pathway is
+        # allowed to contribute (semantic<->detail exchange, DAPPM-replacing
+        # context back into S16, final semantic->detail fusion) -- see
+        # gate_statistics(). Diagnosed on a trained checkpoint (epoch 79):
+        # after the existing no-decay fix for broadcast scales
+        # (_is_broadcast_scale in train.py), context_scale had only moved
+        # from its 0.10 init to 0.1124 and detail_to_semantic_scale_1 from
+        # 0.0 to 0.0297 -- weight decay was already ruled out as the cause,
+        # so these four get their own LR bucket (see --gate_lr_factor) to
+        # test whether they are simply starved of gradient signal by their
+        # own small multiplicative scale, rather than genuinely unhelpful.
+        gate_scale_ids = {
+            id(self.dual_branch.semantic_to_detail_scale_1),
+            id(self.dual_branch.detail_to_semantic_scale_1),
+            id(self.dual_branch.context_scale),
+            id(self.dual_branch.final_fusion.fusion_scale),
+        }
+        dual_branch_rest = (
+            parameter
+            for parameter in self.dual_branch.parameters()
+            if id(parameter) not in gate_scale_ids
+        )
+        dual_branch_gates = (
+            parameter
+            for parameter in self.dual_branch.parameters()
+            if id(parameter) in gate_scale_ids
+        )
         return {
             "head": self.decode_head.parameters(),
-            "dual_branch": self.dual_branch.parameters(),
+            "dual_branch": dual_branch_rest,
+            "dual_branch_gates": dual_branch_gates,
             "layer3": (
                 parameter
                 for module in (self.encoder.layer3, self.encoder.layer4)
@@ -690,8 +700,9 @@ def build_model(args) -> DualBranchRoadNet:
         num_classes=2,
         detail_channels=int(args.detail_channels),
         semantic_channels=int(args.semantic_channels),
-        dappm_channels=int(args.dappm_channels),
-        dappm_pool_sizes=tuple(int(value) for value in args.dappm_pool_sizes),
+        context_dilations=tuple(
+            int(value) for value in getattr(args, "context_dilations", (1, 2, 4, 8))
+        ),
         detail_blocks=tuple(int(value) for value in args.detail_blocks),
         semantic_blocks=int(args.semantic_blocks),
         fusion_blocks=int(args.fusion_blocks),

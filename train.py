@@ -40,7 +40,14 @@ IMAGENET_STD = np.asarray((0.229, 0.224, 0.225), dtype=np.float32)
 # Optimizer parameter-group buckets, used everywhere a per-bucket metric
 # (grad norm, weight norm) needs to be reported. Keep in sync with the keys
 # returned by DualBranchRoadNet.optimization_modules().
-OPTIMIZER_BUCKETS = ("head", "dual_branch", "layer3", "layer2", "early_encoder")
+OPTIMIZER_BUCKETS = (
+    "head",
+    "dual_branch",
+    "dual_branch_gates",
+    "layer3",
+    "layer2",
+    "early_encoder",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -474,11 +481,53 @@ def road_guided_occlusion(
     return np.asarray(pil, dtype=np.uint8).copy()
 
 
+def rotate_pair(
+    image: np.ndarray, mask: np.ndarray, max_degrees: float
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Continuous-angle rotation, safe for the full +/-180 degree range.
+
+    Roads in satellite imagery have no preferred orientation, but the
+    existing augmentation only ever shows the model 8 discrete angles (4
+    rot90 steps x horizontal flip). That under-covers what OrientHead /
+    structure_tensor_angle is meant to generalize across, since they predict
+    a continuous double-angle direction. A plain ``Image.rotate`` would fill
+    the corners it exposes with a constant color and, worse, fill the mask
+    corners with 0 (background) -- fabricated labels the model would
+    dutifully learn from. Reflect-padding first avoids that: padding by
+    ceil(0.25 * size) on each side is enough that the output's center crop
+    (whose farthest corner sits sqrt(2)/2 * size =~ 0.707 * size from the
+    center) is always reconstructed from real, if mirrored, image content
+    for any rotation angle, never a fabricated border.
+    """
+    if max_degrees <= 0:
+        return image, mask
+    angle = random.uniform(-max_degrees, max_degrees)
+    if abs(angle) < 1e-3:
+        return image, mask
+    size = mask.shape[0]
+    pad = max(1, math.ceil(0.25 * size))
+    image_padded = np.pad(image, ((pad, pad), (pad, pad), (0, 0)), mode="reflect")
+    mask_padded = np.pad(mask, ((pad, pad), (pad, pad)), mode="reflect")
+    image_rot = np.asarray(
+        Image.fromarray(image_padded).rotate(angle, resample=Image.BICUBIC)
+    )
+    mask_rot = np.asarray(
+        Image.fromarray(mask_padded).rotate(angle, resample=Image.NEAREST)
+    )
+    start, end = pad, pad + size
+    return (
+        np.ascontiguousarray(image_rot[start:end, start:end]),
+        np.ascontiguousarray(mask_rot[start:end, start:end]),
+    )
+
+
 def augment_pair(
     image: np.ndarray,
     mask: np.ndarray,
     road_occlusion_probability: float = 0.0,
     road_occlusion_max_patches: int = 2,
+    rotation_probability: float = 0.0,
+    rotation_max_degrees: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     if random.random() < 0.5:
         image, mask = image[:, ::-1], mask[:, ::-1]
@@ -487,6 +536,8 @@ def augment_pair(
     rotations = random.randrange(4)
     if rotations:
         image, mask = np.rot90(image, rotations), np.rot90(mask, rotations)
+    if random.random() < rotation_probability:
+        image, mask = rotate_pair(image, mask, rotation_max_degrees)
 
     pil = Image.fromarray(np.ascontiguousarray(image))
     if random.random() < 0.60:
@@ -526,6 +577,8 @@ class RoadCropDataset(Dataset):
         road_crop_tries: int,
         road_occlusion_probability: float,
         road_occlusion_max_patches: int,
+        rotation_probability: float = 0.0,
+        rotation_max_degrees: float = 0.0,
     ) -> None:
         self.pairs = list(pairs)
         self.crop_size = int(crop_size)
@@ -534,6 +587,8 @@ class RoadCropDataset(Dataset):
         self.road_crop_tries = int(road_crop_tries)
         self.road_occlusion_probability = float(road_occlusion_probability)
         self.road_occlusion_max_patches = int(road_occlusion_max_patches)
+        self.rotation_probability = float(rotation_probability)
+        self.rotation_max_degrees = float(rotation_max_degrees)
 
     def __len__(self) -> int:
         return len(self.pairs)
@@ -556,6 +611,8 @@ class RoadCropDataset(Dataset):
             mask,
             road_occlusion_probability=self.road_occlusion_probability,
             road_occlusion_max_patches=self.road_occlusion_max_patches,
+            rotation_probability=self.rotation_probability,
+            rotation_max_degrees=self.rotation_max_degrees,
         )
         return image_to_tensor(image), torch.from_numpy(mask).long()
 
@@ -688,6 +745,8 @@ def make_loaders(
         road_crop_tries=args.road_crop_tries,
         road_occlusion_probability=args.road_occlusion_probability,
         road_occlusion_max_patches=args.road_occlusion_max_patches,
+        rotation_probability=args.rotation_probability,
+        rotation_max_degrees=args.rotation_max_degrees,
     )
     val_dataset = RoadNativeValidationDataset(val_pairs)
     train_sampler: Optional[DistributedSampler]
@@ -802,6 +861,7 @@ def build_optimizer(model: DualBranchRoadNet, args: argparse.Namespace) -> AdamW
     factors = {
         "head": 1.0,
         "dual_branch": args.dual_branch_lr_factor,
+        "dual_branch_gates": args.gate_lr_factor,
         "layer3": args.backbone_lr_factor,
         "layer2": args.backbone_lr_factor,
         "early_encoder": args.early_encoder_lr_factor,
@@ -1646,12 +1706,40 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=2,
     )
+    parser.add_argument(
+        "--rotation_probability",
+        type=float,
+        default=0.5,
+        help=(
+            "Probability of an additional continuous-angle rotation on top "
+            "of the existing flip/rot90 augmentation. The existing "
+            "augmentation only ever shows 8 discrete angles; roads have no "
+            "preferred orientation, and OrientHead/structure_tensor_angle "
+            "are trained to predict a continuous direction, so this closes "
+            "that gap. Reflect-padded before rotating so corners are never "
+            "a fabricated constant/background border (see rotate_pair)."
+        ),
+    )
+    parser.add_argument(
+        "--rotation_max_degrees",
+        type=float,
+        default=45.0,
+        help="+/- degrees for --rotation_probability's continuous rotation.",
+    )
 
     parser.add_argument("--detail_channels", type=int, default=96)
     parser.add_argument("--semantic_channels", type=int, default=192)
-    parser.add_argument("--dappm_channels", type=int, default=32)
     parser.add_argument(
-        "--dappm_pool_sizes", nargs="+", type=int, default=(1, 2, 4, 8)
+        "--context_dilations",
+        nargs="+",
+        type=int,
+        default=(1, 2, 4, 8),
+        help=(
+            "Dilation rates for the DilatedContextBlock placed after the "
+            "encoder's S32 stage (D-LinkNet-style center block, replacing "
+            "DAPPM -- gate_statistics() showed DAPPM's contribution to S16 "
+            "barely moved from its init value across training)."
+        ),
     )
     parser.add_argument(
         "--detail_blocks", nargs=2, type=int, default=(2, 2)
@@ -1738,6 +1826,20 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.75,
         help="LR factor for detail/semantic branches; old flag kept as alias",
+    )
+    parser.add_argument(
+        "--gate_lr_factor",
+        type=float,
+        default=3.0,
+        help=(
+            "LR factor (relative to --lr) for DualResolutionContext's four "
+            "[1,C,1,1] residual-gate scales (semantic_to_detail, "
+            "detail_to_semantic, s32 context, final fusion). Diagnosed near-"
+            "stuck at their init values after 79 epochs even with weight "
+            "decay already excluded for them; higher than "
+            "--dual_branch_lr_factor to test whether they were starved of "
+            "gradient signal by their own small multiplicative scale."
+        ),
     )
     parser.add_argument("--backbone_lr_factor", type=float, default=0.20)
     parser.add_argument("--early_encoder_lr_factor", type=float, default=0.10)
@@ -1876,14 +1978,13 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("val_ratio + test_ratio must be smaller than 1")
     if args.resume and args.pretrained_checkpoint:
         raise ValueError("Use either --resume or --pretrained_checkpoint, not both")
-    if not args.dappm_pool_sizes or min(args.dappm_pool_sizes) < 1:
-        raise ValueError("dappm_pool_sizes must be positive")
+    if not args.context_dilations or min(args.context_dilations) < 1:
+        raise ValueError("context_dilations must be positive")
     if min(args.detail_blocks) < 1:
         raise ValueError("detail_blocks must be positive")
     channel_values = (
         args.detail_channels,
         args.semantic_channels,
-        args.dappm_channels,
         args.decoder_s4_channels,
         args.decoder_s2_channels,
         args.full_channels,
@@ -1894,6 +1995,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("road_occlusion_probability must be in [0, 1]")
     if args.road_occlusion_max_patches < 1:
         raise ValueError("road_occlusion_max_patches must be positive")
+    if not 0.0 <= args.rotation_probability <= 1.0:
+        raise ValueError("rotation_probability must be in [0, 1]")
+    if args.rotation_max_degrees < 0.0:
+        raise ValueError("rotation_max_degrees cannot be negative")
     for name in ("aux_weight",):
         if getattr(args, name) < 0.0:
             raise ValueError(f"{name} cannot be negative")
@@ -2091,8 +2196,8 @@ def main() -> None:
     )
     rank_zero_print(
         f"shared ResNet34 to S8 | detail={args.detail_channels}ch S8 | "
-        f"semantic anchor=256ch S16 | context={args.semantic_channels}ch S32 | DAPPM="
-        f"{args.dappm_channels}ch grids={tuple(args.dappm_pool_sizes)}"
+        f"semantic anchor=256ch S16 | context={args.semantic_channels}ch S32 | "
+        f"dilated context dilations={tuple(args.context_dilations)}"
     )
     rank_zero_print(
         f"decoder S4/S2/S1={args.decoder_s4_channels}/"
