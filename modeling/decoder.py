@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from typing import Dict, Optional, Tuple, Union
 
 import torch
@@ -389,38 +388,83 @@ _SKIP_SOBEL_X = torch.tensor(
 ).view(1, 1, 3, 3)
 
 
+def structure_tensor_angle(
+    mask: Tensor, sobel_x: Tensor, eps: float = 1e-6
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Local road-tangent direction (double-angle form) from a binary mask.
+
+    Ground-truth counterpart to ``OrientHead``'s prediction, used to
+    supervise it. Sobel gradients of the mask feed a structure-tensor
+    (second-moment matrix); its dominant axis, in double-angle form
+    ``(p, q) = (cos(2*theta), sin(2*theta))``, is agnostic to a road's
+    180-degree undirected symmetry (a road pointing left-to-right and one
+    pointing right-to-left are the same line). That axis is the
+    gradient/normal direction (perpendicular to the road); rotating 90
+    degrees -- negating (p, q), since doubling a 90-degree rotation gives
+    180 degrees -- gives the tangent (along-road) direction actually wanted.
+    Returns unit-normalized ``(p, q)`` plus a ``valid`` mask (low-gradient
+    regions and background pixels have no reliable/meaningful direction).
+    """
+    mask = mask[:, 0].float() if mask.ndim == 4 else mask.float()
+    ix = F.conv2d(mask.unsqueeze(1), sobel_x, padding=1)[:, 0]
+    iy = F.conv2d(mask.unsqueeze(1), sobel_x.transpose(2, 3), padding=1)[:, 0]
+    jxx = F.avg_pool2d((ix * ix).unsqueeze(1), 5, 1, 2)[:, 0]
+    jyy = F.avg_pool2d((iy * iy).unsqueeze(1), 5, 1, 2)[:, 0]
+    jxy = F.avg_pool2d((ix * iy).unsqueeze(1), 5, 1, 2)[:, 0]
+    # Normal (gradient) axis, rotated 90 degrees (negated) to the tangent.
+    p, q = -(jxx - jyy), -(2.0 * jxy)
+    n = torch.sqrt(p * p + q * q)
+    valid = (n > 5e-3).float() * (mask > 0.5).float()
+    n = n + eps
+    return (p / n).unsqueeze(1), (q / n).unsqueeze(1), valid.unsqueeze(1)
+
+
+class OrientHead(nn.Module):
+    """Predicts (p, q, confidence) = (cos2theta, sin2theta, confidence) per pixel."""
+
+    def __init__(self, channels: int, hidden: Optional[int] = None) -> None:
+        super().__init__()
+        hidden = hidden or max(16, channels // 2)
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, hidden, 3, padding=1, bias=False),
+            nn.GroupNorm(_group_count(hidden), hidden),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, 3, 1),
+        )
+        # Zero-init: starts with a single, stable (if arbitrary) direction
+        # over the whole feature map and confidence=sigmoid(0)=0.5, instead
+        # of a noisy random direction per pixel on step 1.
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        p, q, confidence = self.net(x).chunk(3, dim=1)
+        n = torch.sqrt(p * p + q * q + 1e-6)
+        return p / n, q / n, torch.sigmoid(confidence)
+
+
 class OrientedSkipAggregation(nn.Module):
-    """Road-direction-steered skip-feature refinement (analytic, no auxiliary loss).
+    """Road-direction-steered skip-feature refinement (learned, supervised direction).
 
     Drop-in alternative to SkipFeatureGate -- same
     ``(projected_skip, guide) -> same-shape tensor`` signature expected by
-    ``RoadReconstructionDecoder._decode_stage`` -- inspired by RoadWeaveNet's
+    ``RoadReconstructionDecoder._decode_stage`` -- implementing RoadWeaveNet's
     WeaveAgg/OCFE mechanism (Orientation-Conditioned Feature Extraction):
     instead of gating the skip feature channel/spatial-wise, it aggregates
     context sampled *along the skip feature's own local road direction*,
     which is the right receptive-field shape for a road (long and thin) in a
     way an isotropic conv or a plain gate cannot express.
 
-    WeaveAgg predicts that direction with a small trained head, but the head
-    only receives a training signal from an auxiliary loss against the
-    ground-truth structure-tensor angle -- its predicted direction is
-    detached before building the sampling grid, so gradient from the
-    segmentation loss alone cannot reach it. To avoid adding a fourth loss
-    term, this module estimates the direction analytically instead, every
-    forward pass, from the skip feature's own activations: an
-    activation-energy map (L2 norm across channels) stands in for the mask
-    RoadWeaveNet's structure_tensor_angle uses, Sobel gradients of that map
-    feed the same structure-tensor construction (dominant axis in
-    double-angle form, so a road's 180-degree undirected symmetry does not
-    confuse it), rotated 90 degrees to go from the gradient/normal axis to
-    the tangent (along-road) axis actually wanted for aggregation. The only
-    learned parameters are the confidence gate (how much to trust the
-    aggregated context at each pixel, driven by the decoder's ``guide``
-    feature) and the fuse conv -- both trained purely by the existing
-    segmentation loss, same as SkipFeatureGate. The confidence gate's last
-    layer is zero-weight-initialized with a negative bias, so it starts
-    near 0 (skip left almost unmodified) and only learns to pull in
-    directional context once training shows it helps.
+    Direction is predicted by a small trained head (``OrientHead``) rather
+    than computed analytically, so it can adapt beyond what a fixed
+    Sobel/structure-tensor estimate of the raw activations would give. That
+    head's own gradient signal comes only from an external auxiliary loss
+    against ``structure_tensor_angle`` of the ground-truth mask (see
+    ``last_orientation`` below) -- its predicted direction is detached
+    before building the sampling grid here, since grid_sample's gradient
+    through a geometric sampling location is too weak/indirect to train a
+    direction head on its own. The confidence gate and fuse conv remain
+    purely segmentation-loss-trained, same as SkipFeatureGate.
     """
 
     def __init__(
@@ -433,7 +477,7 @@ class OrientedSkipAggregation(nn.Module):
         super().__init__()
         self.span = int(span)
         self.spacing = float(spacing)
-        self.register_buffer("_sobel_x", _SKIP_SOBEL_X, persistent=False)
+        self.orient = OrientHead(skip_channels)
         hidden = max(16, skip_channels // 4)
         self.confidence = nn.Sequential(
             nn.Conv2d(guide_channels, hidden, 3, padding=1, bias=False),
@@ -453,21 +497,11 @@ class OrientedSkipAggregation(nn.Module):
         # in this file -- here confidence scales an added residual, not a
         # multiplicative pass-through, so identity means ~0, not 1.
         nn.init.constant_(self.confidence[-1].bias, -4.0)
-
-    @torch.no_grad()
-    def _tangent_angle(self, x: Tensor) -> Tensor:
-        """Local road-tangent angle (radians), shape (B,1,H,W), from x itself."""
-        energy = x.float().norm(dim=1, keepdim=True)
-        ix = F.conv2d(energy, self._sobel_x, padding=1)
-        iy = F.conv2d(energy, self._sobel_x.transpose(2, 3), padding=1)
-        jxx = F.avg_pool2d(ix * ix, 5, stride=1, padding=2)
-        jyy = F.avg_pool2d(iy * iy, 5, stride=1, padding=2)
-        jxy = F.avg_pool2d(ix * iy, 5, stride=1, padding=2)
-        # Dominant-gradient (normal-to-edge) axis, double-angle form.
-        p, q = jxx - jyy, 2.0 * jxy
-        # Roads are aggregated *along* their length (tangent), which is the
-        # normal rotated 90 degrees -- +pi, not +pi/2, once doubled.
-        return 0.5 * torch.atan2(q, p) + (math.pi / 2.0)
+        # Last (p, q) prediction, kept (not detached) for an external loss to
+        # supervise against structure_tensor_angle(mask) -- see
+        # RoadReconstructionDecoder.forward and RoadSegOrientationLoss. Not a
+        # registered buffer: this is per-step scratch, not model state.
+        self.last_orientation: Optional[Tuple[Tensor, Tensor]] = None
 
     def forward(self, skip: Tensor, guide: Tensor) -> Tensor:
         if skip.shape[-2:] != guide.shape[-2:]:
@@ -475,7 +509,10 @@ class OrientedSkipAggregation(nn.Module):
                 "OrientedSkipAggregation inputs must be spatially aligned"
             )
         height, width = skip.shape[-2:]
-        theta = self._tangent_angle(skip)
+        p, q, _ = self.orient(skip)
+        self.last_orientation = (p, q)
+        direction = torch.cat((p, q), dim=1).detach()
+        theta = 0.5 * torch.atan2(direction[:, 1:2], direction[:, 0:1])
         direction = torch.cat((torch.cos(theta), torch.sin(theta)), dim=1)
         ys, xs = torch.meshgrid(
             torch.linspace(-1.0, 1.0, height, device=skip.device),
@@ -516,7 +553,9 @@ class SeparableConvBNAct(nn.Sequential):
 
 
 class RoadReconstructionDecoder(nn.Module):
-    """S8-to-S1 decoder with one train-only S4 centerline head."""
+    """S8-to-S1 decoder. In training mode with oriented_skip on, also
+    surfaces the S2 OrientedSkipAggregation's predicted road direction for
+    RoadSegOrientationLoss to supervise."""
 
     def __init__(
         self,
@@ -537,9 +576,10 @@ class RoadReconstructionDecoder(nn.Module):
         stem_skip_channels = max(16, s2_channels // 2)
         # Both S4 and S2 skip stages use the same kind of refinement module,
         # picked once here. OrientedSkipAggregation (road-direction-steered,
-        # no auxiliary loss) is the default; SkipFeatureGate (channel/spatial
-        # SE-style denoising) stays available via --no-oriented_skip for a
-        # clean A/B comparison without another code change.
+        # direction learned and supervised via RoadSegOrientationLoss) is the
+        # default; SkipFeatureGate (channel/spatial SE-style denoising) stays
+        # available via --no-oriented_skip for a clean A/B comparison
+        # without another code change.
         skip_refine_cls = (
             OrientedSkipAggregation if oriented_skip else SkipFeatureGate
         )
@@ -598,12 +638,6 @@ class RoadReconstructionDecoder(nn.Module):
         self.dropout = nn.Dropout2d(dropout) if dropout > 0.0 else nn.Identity()
         self.classifier = nn.Conv2d(full_channels, num_classes, 1)
 
-        auxiliary_channels = max(24, s4_channels // 2)
-        self.centerline_head = nn.Sequential(
-            ConvBNAct(s4_channels, auxiliary_channels, 3),
-            nn.Conv2d(auxiliary_channels, 1, 1),
-        )
-
     @staticmethod
     def _resize(x: Tensor, size: Tuple[int, int]) -> Tensor:
         return F.interpolate(x, size=size, mode="bilinear", align_corners=False)
@@ -641,7 +675,7 @@ class RoadReconstructionDecoder(nn.Module):
         shallow_s4: Tensor,
         fused_s8: Tensor,
         output_size: Tuple[int, int],
-    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+    ) -> Union[Tensor, Tuple[Optional[Tuple[Tensor, Tensor]], Tensor]]:
         p4 = self._resize(self.fused_proj(fused_s8), shallow_s4.shape[-2:])
         p4 = self._decode_stage(
             p4, shallow_s4, self.shallow_proj, self.s4_skip_gate,
@@ -658,39 +692,16 @@ class RoadReconstructionDecoder(nn.Module):
         full = self.full_extra_refine(self.full_refine(full))
         road_logits = self.classifier(self.dropout(full))
         if self.training:
-            return self.centerline_head(p4), road_logits
+            # last_orientation is None whenever oriented_skip=False (plain
+            # SkipFeatureGate has no direction to supervise).
+            orientation = getattr(self.s2_skip_gate, "last_orientation", None)
+            return orientation, road_logits
         return road_logits
 
     def switch_to_deploy(self) -> None:
         for module in list(self.modules()):
             if isinstance(module, (RepVGGBlock, RepDepthwiseBlock)):
                 module.switch_to_deploy()
-
-
-def _soft_erode(mask: Tensor) -> Tensor:
-    vertical = -F.max_pool2d(-mask, (3, 1), stride=1, padding=(1, 0))
-    horizontal = -F.max_pool2d(-mask, (1, 3), stride=1, padding=(0, 1))
-    return torch.minimum(vertical, horizontal)
-
-
-def _soft_dilate(mask: Tensor) -> Tensor:
-    return F.max_pool2d(mask, 3, stride=1, padding=1)
-
-
-def _soft_open(mask: Tensor) -> Tensor:
-    return _soft_dilate(_soft_erode(mask))
-
-
-def soft_skeletonize(mask: Tensor, iterations: int = 8) -> Tensor:
-    """Morphological skeleton target generation using only PyTorch ops."""
-    opened = _soft_open(mask)
-    skeleton = F.relu(mask - opened)
-    for _ in range(max(0, int(iterations))):
-        mask = _soft_erode(mask)
-        opened = _soft_open(mask)
-        delta = F.relu(mask - opened)
-        skeleton = skeleton + F.relu(delta - skeleton * delta)
-    return skeleton.clamp_(0.0, 1.0)
 
 
 def binary_dice_loss(
@@ -703,58 +714,37 @@ def binary_dice_loss(
     return (1.0 - (2.0 * intersection + eps) / (denominator + eps)).mean()
 
 
-def binary_tversky_loss(
-    probability: Tensor,
-    target: Tensor,
-    alpha: float = 0.30,
-    beta: float = 0.70,
-    eps: float = 1e-6,
-) -> Tensor:
-    """One centerline loss; beta > alpha penalizes broken roads more."""
-    probability = probability.float().flatten(1)
-    target = target.float().flatten(1)
-    true_positive = (probability * target).sum(dim=1)
-    false_positive = (probability * (1.0 - target)).sum(dim=1)
-    false_negative = ((1.0 - probability) * target).sum(dim=1)
-    score = (true_positive + eps) / (
-        true_positive
-        + float(alpha) * false_positive
-        + float(beta) * false_negative
-        + eps
-    )
-    return (1.0 - score).mean()
+class RoadSegOrientationLoss(nn.Module):
+    """Road objective: weighted CE + Dice + road-orientation supervision.
 
-
-class RoadSegCenterlineTverskyLoss(nn.Module):
-    """Compact road objective: weighted CE + Dice + centerline Tversky."""
+    The orientation term supervises OrientedSkipAggregation's OrientHead
+    (S2 stage) against ``structure_tensor_angle`` of the ground-truth mask,
+    resized to the predicted (p, q)'s resolution. It occupies the same slot,
+    warmup schedule (``aux_start_epoch``/``aux_warmup_epochs``), and weight
+    (``aux_weight``) previously used for centerline Tversky supervision,
+    which it replaces rather than adds to a fourth loss term. When
+    ``oriented_skip=False`` (plain SkipFeatureGate, no direction to
+    supervise), ``outputs[0]`` is ``None`` and this term is simply zero.
+    """
 
     def __init__(
         self,
         road_class_weight: float = 2.0,
         main_dice_weight: float = 1.0,
         aux_weight: float = 0.15,
-        centerline_alpha: float = 0.30,
-        centerline_beta: float = 0.70,
-        skeleton_iterations: int = 8,
-        centerline_dilation: int = 1,
-        fast_centerline_target: bool = False,
     ) -> None:
         super().__init__()
         self.road_class_weight = float(road_class_weight)
         self.main_dice_weight = float(main_dice_weight)
         self.aux_weight = float(aux_weight)
-        self.centerline_alpha = float(centerline_alpha)
-        self.centerline_beta = float(centerline_beta)
-        self.skeleton_iterations = int(skeleton_iterations)
-        self.centerline_dilation = int(centerline_dilation)
-        self.fast_centerline_target = bool(fast_centerline_target)
+        self.register_buffer("_sobel_x", _SKIP_SOBEL_X, persistent=False)
 
     def forward(
         self,
-        outputs: Tuple[Tensor, Tensor],
+        outputs: Tuple[Optional[Tuple[Tensor, Tensor]], Tensor],
         target: Tensor,
     ) -> Dict[str, Tensor]:
-        centerline_logits, road_logits = outputs
+        orientation, road_logits = outputs
         labels = (target > 0).long()
         road_mask = labels.unsqueeze(1).float()
         class_weights = road_logits.new_tensor([1.0, self.road_class_weight])
@@ -764,69 +754,33 @@ class RoadSegCenterlineTverskyLoss(nn.Module):
         road_probability = road_logits.float().softmax(dim=1)[:, 1:2]
         loss_main_dice = binary_dice_loss(road_probability, road_mask)
 
-        with torch.no_grad():
-            # Skeletonize before reducing resolution.  This preserves narrow
-            # branches and intersections that can merge when the mask is
-            # max-pooled directly to S4.
-            if self.fast_centerline_target:
-                intermediate_size = tuple(
-                    min(source, target_size * 2)
-                    for source, target_size in zip(
-                        road_mask.shape[-2:], centerline_logits.shape[-2:]
-                    )
+        if orientation is not None and self.aux_weight > 0.0:
+            p_pred, q_pred = orientation
+            with torch.no_grad():
+                target_mask = F.adaptive_max_pool2d(
+                    road_mask, p_pred.shape[-2:]
                 )
-                skeleton_input = F.adaptive_max_pool2d(
-                    road_mask.float(), intermediate_size
+                p_gt, q_gt, valid = structure_tensor_angle(
+                    target_mask, self._sobel_x
                 )
-                scale = max(
-                    road_mask.shape[-2] / max(intermediate_size[0], 1),
-                    road_mask.shape[-1] / max(intermediate_size[1], 1),
-                )
-                target_iterations = (
-                    max(1, math.ceil(self.skeleton_iterations / scale))
-                    if self.skeleton_iterations > 0
-                    else 0
-                )
-                target_dilation = max(
-                    0, int(math.floor(self.centerline_dilation / scale + 0.5))
-                )
-            else:
-                skeleton_input = road_mask.float()
-                target_iterations = self.skeleton_iterations
-                target_dilation = self.centerline_dilation
+            # cos(2 * (theta_pred - theta_gt)); 1 minus that is 0 when the
+            # predicted and ground-truth directions are aligned (mod 180deg).
+            alignment = p_pred * p_gt + q_pred * q_gt
+            valid_count = valid.sum().clamp_min(1.0)
+            loss_orientation = ((1.0 - alignment) * valid).sum() / valid_count
+        else:
+            loss_orientation = road_logits.new_zeros(())
 
-            centerline_target = soft_skeletonize(
-                skeleton_input, target_iterations
-            )
-            if target_dilation > 0:
-                kernel = 2 * target_dilation + 1
-                centerline_target = F.max_pool2d(
-                    centerline_target,
-                    kernel,
-                    stride=1,
-                    padding=target_dilation,
-                )
-            centerline_target = F.adaptive_max_pool2d(
-                centerline_target, centerline_logits.shape[-2:]
-            )
-
-        loss_centerline = binary_tversky_loss(
-            centerline_logits.float().sigmoid(),
-            centerline_target,
-            alpha=self.centerline_alpha,
-            beta=self.centerline_beta,
-        )
         total = (
             loss_main_ce
             + self.main_dice_weight * loss_main_dice
-            + self.aux_weight * loss_centerline
+            + self.aux_weight * loss_orientation
         )
         return {
             "loss_total": total,
             "loss_main_ce": loss_main_ce.detach(),
             "loss_main_dice": loss_main_dice.detach(),
-            "loss_aux_centerline": loss_centerline.detach(),
-            "loss_centerline_tversky": loss_centerline.detach(),
+            "loss_aux_orientation": loss_orientation.detach(),
         }
 
 

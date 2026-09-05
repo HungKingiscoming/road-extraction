@@ -1,9 +1,9 @@
-from .decoder import RoadReconstructionDecoder, RoadSegCenterlineTverskyLoss
+from .decoder import RoadReconstructionDecoder, RoadSegOrientationLoss
 from .model import DualBranchRoadNet, build_model
 
 __all__ = (
     "DualBranchRoadNet",
     "RoadReconstructionDecoder",
-    "RoadSegCenterlineTverskyLoss",
+    "RoadSegOrientationLoss",
     "build_model",
 )

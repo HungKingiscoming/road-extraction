@@ -28,7 +28,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
-from modeling.decoder import RoadSegCenterlineTverskyLoss, binary_dice_loss
+from modeling.decoder import RoadSegOrientationLoss, binary_dice_loss
 from modeling.model import DualBranchRoadNet, build_model
 
 
@@ -1015,7 +1015,7 @@ def train_one_epoch(
     model: nn.Module,
     ema: ModelEMA,
     loader: DataLoader,
-    criterion: RoadSegCenterlineTverskyLoss,
+    criterion: RoadSegOrientationLoss,
     optimizer: torch.optim.Optimizer,
     scheduler: LambdaLR,
     scaler,
@@ -1044,7 +1044,7 @@ def train_one_epoch(
             "total",
             "main_ce",
             "main_dice",
-            "centerline",
+            "orientation",
             "road_fraction",
             "pred_road_fraction",  # DEBUG: mean predicted road probability
             "grad_norm_total",  # DEBUG: global clipped grad norm
@@ -1124,13 +1124,13 @@ def train_one_epoch(
                 losses["loss_total"].detach(),
                 losses["loss_main_ce"],
                 losses["loss_main_dice"],
-                losses["loss_aux_centerline"],
+                losses["loss_aux_orientation"],
                 (masks > 0).float().mean(),
                 pred_road_fraction,
             )
         ).float().cpu().tolist()
         for name, value in zip(
-            ("total", "main_ce", "main_dice", "centerline", "road_fraction", "pred_road_fraction"),
+            ("total", "main_ce", "main_dice", "orientation", "road_fraction", "pred_road_fraction"),
             metric_values,
         ):
             meters[name].update(value, batch)
@@ -1359,12 +1359,12 @@ def validate(
             prediction[0], target[0], args.relaxed_buffer_px
         )
         # DEBUG: main-loss-only (CE + Dice) validation loss, for comparing
-        # against train_metrics["total"] to spot overfitting. The centerline
+        # against train_metrics["total"] to spot overfitting. The orientation
         # auxiliary term is excluded because RoadReconstructionDecoder only
-        # returns its aux head in training mode (self.training), and running
-        # the model in train() mode here would corrupt BatchNorm running
-        # stats / enable dropout -- not an acceptable trade for one extra
-        # loss term.
+        # returns OrientedSkipAggregation's prediction in training mode
+        # (self.training), and running the model in train() mode here would
+        # corrupt BatchNorm running stats / enable dropout -- not an
+        # acceptable trade for one extra loss term.
         labels = target.long()
         class_weights = logits.new_tensor([1.0, road_class_weight])
         loss_main_ce = F.cross_entropy(
@@ -1741,19 +1741,9 @@ def parse_args() -> argparse.Namespace:
         "--aux_start_epoch",
         type=int,
         default=5,
-        help="Keep centerline supervision off before this zero-based epoch",
+        help="Keep orientation supervision off before this zero-based epoch",
     )
     parser.add_argument("--aux_warmup_epochs", type=int, default=5)
-    parser.add_argument("--centerline_alpha", type=float, default=0.30)
-    parser.add_argument("--centerline_beta", type=float, default=0.70)
-    parser.add_argument("--centerline_dilation", type=int, default=1)
-    parser.add_argument("--skeleton_iterations", type=int, default=8)
-    parser.add_argument(
-        "--fast_centerline_target",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Use an S2 intermediate skeleton target instead of full resolution",
-    )
 
     parser.add_argument(
         "--progressive_unfreeze",
@@ -1880,14 +1870,6 @@ def validate_args(args: argparse.Namespace) -> None:
     )
     if min(channel_values) < 1:
         raise ValueError("All architecture channel counts must be positive")
-    if not 0.0 <= args.centerline_alpha <= 1.0:
-        raise ValueError("centerline_alpha must be in [0, 1]")
-    if not 0.0 <= args.centerline_beta <= 1.0:
-        raise ValueError("centerline_beta must be in [0, 1]")
-    if args.centerline_alpha + args.centerline_beta <= 0.0:
-        raise ValueError("centerline_alpha + centerline_beta must be positive")
-    if args.centerline_dilation < 0:
-        raise ValueError("centerline_dilation cannot be negative")
     if not 0.0 <= args.road_occlusion_probability <= 1.0:
         raise ValueError("road_occlusion_probability must be in [0, 1]")
     if args.road_occlusion_max_patches < 1:
@@ -2052,15 +2034,10 @@ def main() -> None:
     scheduler = build_scheduler(optimizer, updates_per_epoch, args)
     scaler = make_grad_scaler(args.use_amp)
     ema = ModelEMA(model, args.ema_decay)
-    criterion = RoadSegCenterlineTverskyLoss(
+    criterion = RoadSegOrientationLoss(
         road_class_weight=road_weight,
         main_dice_weight=args.main_dice_weight,
         aux_weight=args.aux_weight,
-        centerline_alpha=args.centerline_alpha,
-        centerline_beta=args.centerline_beta,
-        skeleton_iterations=args.skeleton_iterations,
-        centerline_dilation=args.centerline_dilation,
-        fast_centerline_target=args.fast_centerline_target,
     ).to(device)
 
     start_epoch, best_fixed, best_calibrated = 0, -1.0, -1.0
@@ -2113,13 +2090,14 @@ def main() -> None:
         f"road CE weight={road_weight:.3f}"
     )
     rank_zero_print(
-        "loss=weighted CE + Dice + centerline Tversky "
-        f"(centerline max={args.aux_weight:.2f}, starts epoch "
+        "loss=weighted CE + Dice"
+        + (
+            " + road-orientation supervision (S2 OrientedSkipAggregation)"
+            if args.oriented_skip
+            else ""
+        )
+        + f" (aux max={args.aux_weight:.2f}, starts epoch "
         f"{args.aux_start_epoch + 1})"
-    )
-    rank_zero_print(
-        "centerline target="
-        + ("fast S2 morphology" if args.fast_centerline_target else "full resolution")
     )
     rank_zero_print(
         f"progressive_unfreeze={args.progressive_unfreeze} | "
@@ -2167,7 +2145,7 @@ def main() -> None:
                 f"  [debug] train_loss={train_metrics['total']:.5f} "
                 f"(ce={train_metrics['main_ce']:.4f} "
                 f"dice={train_metrics['main_dice']:.4f} "
-                f"centerline={train_metrics['centerline']:.4f}) | "
+                f"orientation={train_metrics['orientation']:.4f}) | "
                 f"pred_road_frac={train_metrics['pred_road_fraction']:.4f} "
                 f"true_road_frac={train_metrics['road_fraction']:.4f} | "
                 f"skipped_nonfinite={int(train_metrics['skipped_nonfinite'])}"
@@ -2222,9 +2200,8 @@ def main() -> None:
             calibrated = validation_metrics["calibrated_road_iou"]
             fixed_improved, calibrated_improved = fixed > best_fixed, calibrated > best_calibrated
             best_fixed, best_calibrated = max(best_fixed, fixed), max(best_calibrated, calibrated)
-            # DEBUG: train vs. val main loss (CE+Dice, no centerline term on
-            # either side would be needed for a strict comparison, but train
-            # loss below does include it -- see val_loss_main's docstring at
+            # DEBUG: train vs. val main loss (CE+Dice; train loss below also
+            # includes the orientation term, val_loss_main does not -- see
             # its computation site in validate() for why it can't). A train
             # loss that keeps falling while val_loss_main flattens or rises
             # is the overfitting signal to watch for.
