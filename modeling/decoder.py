@@ -554,8 +554,10 @@ class SeparableConvBNAct(nn.Sequential):
 
 class RoadReconstructionDecoder(nn.Module):
     """S8-to-S1 decoder. In training mode with oriented_skip on, also
-    surfaces the S2 OrientedSkipAggregation's predicted road direction for
-    RoadSegOrientationLoss to supervise."""
+    surfaces both OrientedSkipAggregation stages' predicted road direction
+    (S4, S2) for RoadSegOrientationLoss to supervise -- both must be
+    supervised, since each has an OrientHead that would otherwise never
+    receive gradient (its direction output is detached before use)."""
 
     def __init__(
         self,
@@ -675,7 +677,10 @@ class RoadReconstructionDecoder(nn.Module):
         shallow_s4: Tensor,
         fused_s8: Tensor,
         output_size: Tuple[int, int],
-    ) -> Union[Tensor, Tuple[Optional[Tuple[Tensor, Tensor]], Tensor]]:
+    ) -> Union[
+        Tensor,
+        Tuple[Tuple[Optional[Tuple[Tensor, Tensor]], Optional[Tuple[Tensor, Tensor]]], Tensor],
+    ]:
         p4 = self._resize(self.fused_proj(fused_s8), shallow_s4.shape[-2:])
         p4 = self._decode_stage(
             p4, shallow_s4, self.shallow_proj, self.s4_skip_gate,
@@ -693,9 +698,18 @@ class RoadReconstructionDecoder(nn.Module):
         road_logits = self.classifier(self.dropout(full))
         if self.training:
             # last_orientation is None whenever oriented_skip=False (plain
-            # SkipFeatureGate has no direction to supervise).
-            orientation = getattr(self.s2_skip_gate, "last_orientation", None)
-            return orientation, road_logits
+            # SkipFeatureGate has no direction to supervise). Both stages
+            # must be supervised, not just one: OrientHead's predicted
+            # direction is detached before use in grid_sample (see
+            # OrientedSkipAggregation), so a stage whose orientation is
+            # never returned to the loss would have an OrientHead that
+            # never receives *any* gradient -- silently dead weight, and
+            # fatal under DDP (which errors on parameters with no grad).
+            orientations = (
+                getattr(self.s4_skip_gate, "last_orientation", None),
+                getattr(self.s2_skip_gate, "last_orientation", None),
+            )
+            return orientations, road_logits
         return road_logits
 
     def switch_to_deploy(self) -> None:
@@ -717,14 +731,20 @@ def binary_dice_loss(
 class RoadSegOrientationLoss(nn.Module):
     """Road objective: weighted CE + Dice + road-orientation supervision.
 
-    The orientation term supervises OrientedSkipAggregation's OrientHead
-    (S2 stage) against ``structure_tensor_angle`` of the ground-truth mask,
-    resized to the predicted (p, q)'s resolution. It occupies the same slot,
-    warmup schedule (``aux_start_epoch``/``aux_warmup_epochs``), and weight
-    (``aux_weight``) previously used for centerline Tversky supervision,
-    which it replaces rather than adds to a fourth loss term. When
-    ``oriented_skip=False`` (plain SkipFeatureGate, no direction to
-    supervise), ``outputs[0]`` is ``None`` and this term is simply zero.
+    The orientation term supervises both OrientedSkipAggregation stages'
+    OrientHead (S4 and S2) against ``structure_tensor_angle`` of the
+    ground-truth mask, each resized to that stage's predicted (p, q)
+    resolution, then averaged. Both stages must be supervised: an
+    OrientHead's predicted direction is detached before use in
+    grid_sample (see OrientedSkipAggregation), so a stage left out here
+    would have a head that never receives any gradient at all -- silently
+    dead weight, and fatal under DDP (which errors on parameters with no
+    grad). This term occupies the same slot, warmup schedule
+    (``aux_start_epoch``/``aux_warmup_epochs``), and weight (``aux_weight``)
+    previously used for centerline Tversky supervision, which it replaces
+    rather than adds to a fourth loss term. When ``oriented_skip=False``
+    (plain SkipFeatureGate, no direction to supervise), ``outputs[0]``'s
+    entries are ``None`` and this term is simply zero.
     """
 
     def __init__(
@@ -739,12 +759,27 @@ class RoadSegOrientationLoss(nn.Module):
         self.aux_weight = float(aux_weight)
         self.register_buffer("_sobel_x", _SKIP_SOBEL_X, persistent=False)
 
+    def _orientation_term(
+        self, orientation: Optional[Tuple[Tensor, Tensor]], road_mask: Tensor
+    ) -> Optional[Tensor]:
+        if orientation is None:
+            return None
+        p_pred, q_pred = orientation
+        with torch.no_grad():
+            target_mask = F.adaptive_max_pool2d(road_mask, p_pred.shape[-2:])
+            p_gt, q_gt, valid = structure_tensor_angle(target_mask, self._sobel_x)
+        # cos(2 * (theta_pred - theta_gt)); 1 minus that is 0 when the
+        # predicted and ground-truth directions are aligned (mod 180deg).
+        alignment = p_pred * p_gt + q_pred * q_gt
+        valid_count = valid.sum().clamp_min(1.0)
+        return ((1.0 - alignment) * valid).sum() / valid_count
+
     def forward(
         self,
-        outputs: Tuple[Optional[Tuple[Tensor, Tensor]], Tensor],
+        outputs: Tuple[Tuple[Optional[Tuple[Tensor, Tensor]], ...], Tensor],
         target: Tensor,
     ) -> Dict[str, Tensor]:
-        orientation, road_logits = outputs
+        orientations, road_logits = outputs
         labels = (target > 0).long()
         road_mask = labels.unsqueeze(1).float()
         class_weights = road_logits.new_tensor([1.0, self.road_class_weight])
@@ -754,22 +789,17 @@ class RoadSegOrientationLoss(nn.Module):
         road_probability = road_logits.float().softmax(dim=1)[:, 1:2]
         loss_main_dice = binary_dice_loss(road_probability, road_mask)
 
-        if orientation is not None and self.aux_weight > 0.0:
-            p_pred, q_pred = orientation
-            with torch.no_grad():
-                target_mask = F.adaptive_max_pool2d(
-                    road_mask, p_pred.shape[-2:]
-                )
-                p_gt, q_gt, valid = structure_tensor_angle(
-                    target_mask, self._sobel_x
-                )
-            # cos(2 * (theta_pred - theta_gt)); 1 minus that is 0 when the
-            # predicted and ground-truth directions are aligned (mod 180deg).
-            alignment = p_pred * p_gt + q_pred * q_gt
-            valid_count = valid.sum().clamp_min(1.0)
-            loss_orientation = ((1.0 - alignment) * valid).sum() / valid_count
+        if self.aux_weight > 0.0:
+            terms = [
+                self._orientation_term(orientation, road_mask)
+                for orientation in orientations
+            ]
+            terms = [term for term in terms if term is not None]
         else:
-            loss_orientation = road_logits.new_zeros(())
+            terms = []
+        loss_orientation = (
+            torch.stack(terms).mean() if terms else road_logits.new_zeros(())
+        )
 
         total = (
             loss_main_ce

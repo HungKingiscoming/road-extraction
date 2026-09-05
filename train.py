@@ -2092,7 +2092,7 @@ def main() -> None:
     rank_zero_print(
         "loss=weighted CE + Dice"
         + (
-            " + road-orientation supervision (S2 OrientedSkipAggregation)"
+            " + road-orientation supervision (S4+S2 OrientedSkipAggregation)"
             if args.oriented_skip
             else ""
         )
