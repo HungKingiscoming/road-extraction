@@ -556,7 +556,11 @@ class SeparableConvBNAct(nn.Sequential):
 
 
 class RoadReconstructionDecoder(nn.Module):
-    """S8-to-S1 road decoder with global context and learned directional skips."""
+    """Light S8-to-S1 road decoder with segmentation-trained directional skips.
+
+    Global context is disabled by default because DualResolutionContext already
+    injects S32 dilated semantic context before this decoder.
+    """
 
     def __init__(
         self,
@@ -572,7 +576,7 @@ class RoadReconstructionDecoder(nn.Module):
         oriented_skip: bool = True,
         oriented_skip_span: int = 2,
         oriented_skip_spacing: float = 3.0,
-        use_global_context: bool = True,
+        use_global_context: bool = False,
         global_context_dilations: Tuple[int, int] = (2, 4),
         deploy: bool = False,
     ) -> None:
@@ -666,7 +670,7 @@ class RoadReconstructionDecoder(nn.Module):
         shallow_s4: Tensor,
         fused_s8: Tensor,
         output_size: Tuple[int, int],
-    ) -> Union[Tensor, Tuple[Tuple, Tensor]]:
+    ) -> Tensor:
         # Global scene/road context is injected only at S8, then the existing
         # coarse-to-fine decoder handles precise spatial reconstruction.
         fused_s8 = self.global_context(fused_s8)
@@ -694,11 +698,8 @@ class RoadReconstructionDecoder(nn.Module):
         full = self._resize(p2, output_size)
         full = self.full_extra_refine(self.full_refine(full))
         road_logits = self.classifier(self.dropout(full))
-        # Preserve the old train/eval API so existing training code can replace
-        # the module without needing an immediate rewrite. There is deliberately
-        # no orientation output anymore; the empty tuple is only compatibility.
-        if self.training:
-            return (), road_logits
+        # The decoder now always returns segmentation logits. DirectionHead is
+        # optimized implicitly through BCE + clDice via differentiable grid_sample.
         return road_logits
 
     def switch_to_deploy(self) -> None:
