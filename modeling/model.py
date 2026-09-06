@@ -540,7 +540,12 @@ class DualResolutionContext(nn.Module):
 
 
 class DualBranchRoadNet(nn.Module):
-    """Dual-resolution road model with progressive-unfreezing support."""
+    """Dual-resolution road model with progressive-unfreezing support.
+
+    The dual branch already provides the global semantic-context path.  The
+    decoder therefore defaults to local/directional reconstruction only; its
+    directional sampler is learned end-to-end from segmentation loss.
+    """
 
     PHASE_NAMES = {
         0: "head_only",
@@ -568,6 +573,7 @@ class DualBranchRoadNet(nn.Module):
         oriented_skip: bool = True,
         oriented_skip_span: int = 2,
         oriented_skip_spacing: float = 3.0,
+        decoder_global_context: bool = False,
         imagenet_pretrained: bool = True,
         encoder_weights_path: Optional[str] = None,
         deploy: bool = False,
@@ -600,6 +606,10 @@ class DualBranchRoadNet(nn.Module):
             oriented_skip=oriented_skip,
             oriented_skip_span=oriented_skip_span,
             oriented_skip_spacing=oriented_skip_spacing,
+            # Global semantic context is already modeled in DualResolutionContext:
+            # S32 DilatedContextBlock -> gated S16 -> final S8 fusion.  Keep the
+            # decoder context off by default to avoid duplicating the same role.
+            use_global_context=decoder_global_context,
             deploy=deploy,
         )
         self.current_phase = 4
@@ -753,6 +763,7 @@ def build_model(args) -> DualBranchRoadNet:
         oriented_skip=bool(getattr(args, "oriented_skip", True)),
         oriented_skip_span=int(getattr(args, "oriented_skip_span", 2)),
         oriented_skip_spacing=float(getattr(args, "oriented_skip_spacing", 3.0)),
+        decoder_global_context=bool(getattr(args, "decoder_global_context", False)),
         imagenet_pretrained=bool(args.imagenet_pretrained),
         encoder_weights_path=args.encoder_weights_path,
     )
