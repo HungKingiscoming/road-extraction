@@ -11,8 +11,8 @@ from torch import Tensor
 from .decoder import (
     ConvBNAct,
     ConvGNAct,
-    RepDepthwiseBlock,
-    RepVGGBlock,
+    DeformableConvBlock,
+    DeformableRoadRefineBlock,
     RoadReconstructionDecoder,
 )
 
@@ -112,10 +112,10 @@ class TruncatedResNet34(nn.Module):
         return stem_s2, shallow_s4, shared_s8, semantic_s16, semantic_s32
 
 
-def _rep_stage(channels: int, blocks: int, deploy: bool) -> nn.Sequential:
+def _detail_stage(channels: int, blocks: int, deploy: bool) -> nn.Sequential:
     return nn.Sequential(
         *[
-            RepVGGBlock(channels, channels, deploy=deploy)
+            DeformableConvBlock(channels, channels, deploy=deploy)
             for _ in range(max(1, int(blocks)))
         ]
     )
@@ -219,7 +219,7 @@ class ControlledRoadFusion(nn.Module):
         )
         self.refinement = nn.Sequential(
             *[
-                RepDepthwiseBlock(channels, deploy=deploy)
+                DeformableRoadRefineBlock(channels, deploy=deploy)
                 for _ in range(max(1, int(refine_blocks)))
             ]
         )
@@ -348,7 +348,7 @@ class DualResolutionContext(nn.Module):
         self.bilateral_fusion = bilateral_fusion
         self.detail_projection = ConvBNAct(128, detail_channels, 1, padding=0)
         self.detail_stages = nn.ModuleList(
-            _rep_stage(detail_channels, depth, deploy)
+            _detail_stage(detail_channels, depth, deploy)
             for depth in detail_blocks
         )
 
@@ -671,9 +671,11 @@ class DualBranchRoadNet(nn.Module):
         }
 
     def switch_to_deploy(self) -> None:
-        for module in list(self.modules()):
-            if isinstance(module, (RepVGGBlock, RepDepthwiseBlock)):
-                module.switch_to_deploy()
+        """Không còn tác dụng: kiến trúc hiện tại toàn bộ dùng deformable
+        conv (offset phụ thuộc input), không có block nào fuse được về dạng
+        tĩnh. Giữ lại phương thức để không phá vỡ code gọi
+        model.switch_to_deploy() ở nơi khác (ví dụ script export)."""
+        return
 
 
 def build_model(args) -> DualBranchRoadNet:
