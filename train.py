@@ -28,7 +28,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
-from modeling.decoder import RoadSegBCEClDiceLoss
+from modeling.decoder import RoadSegCenterlineTverskyLoss
 from modeling.model import DualBranchRoadNet, build_model
 
 
@@ -36,18 +36,6 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 MASK_SUFFIXES = ("_mask", "_masks", "_gt", "_label", "_labels")
 IMAGENET_MEAN = np.asarray((0.485, 0.456, 0.406), dtype=np.float32)
 IMAGENET_STD = np.asarray((0.229, 0.224, 0.225), dtype=np.float32)
-
-# Optimizer parameter-group buckets, used everywhere a per-bucket metric
-# (grad norm, weight norm) needs to be reported. Keep in sync with the keys
-# returned by DualBranchRoadNet.optimization_modules().
-OPTIMIZER_BUCKETS = (
-    "head",
-    "dual_branch",
-    "dual_branch_gates",
-    "layer3",
-    "layer2",
-    "early_encoder",
-)
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +53,11 @@ def init_distributed() -> Tuple[bool, int, int, int, torch.device]:
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
+        # Print before process-group creation so a NCCL rendezvous problem is
+        # visible immediately in notebook environments.  Passing device_id
+        # eagerly creates the NCCL communicator on recent PyTorch releases and
+        # has been observed to stall on Kaggle T4x2; the classic call is more
+        # portable and torch.cuda.set_device above already pins each rank.
         print(
             f"[rank {rank}] Initializing NCCL on cuda:{local_rank} "
             f"(world_size={world_size})...",
@@ -73,6 +66,9 @@ def init_distributed() -> Tuple[bool, int, int, int, torch.device]:
         dist.init_process_group(
             backend="nccl",
             init_method="env://",
+            # Rank 0 may scan several thousand masks before the first NCCL
+            # collective while the other ranks wait to receive the result.
+            # DeepGlobe can take more than three minutes on Kaggle storage.
             timeout=timedelta(minutes=15),
         )
         print(f"[rank {rank}] NCCL process group ready", flush=True)
@@ -420,7 +416,13 @@ def road_guided_occlusion(
     probability: float,
     max_patches: int,
 ) -> np.ndarray:
-    """Synthesize shadows/vegetation/vehicles over labeled road pixels."""
+    """Synthesize shadows/vegetation/vehicles over labeled road pixels.
+
+    The segmentation target is deliberately unchanged, forcing the semantic
+    branch to infer short hidden road segments from surrounding continuity.
+    Occluders are kept local so the augmentation does not create an impossible
+    reconstruction problem.
+    """
     if probability <= 0.0 or not mask.any() or random.random() >= probability:
         return image
 
@@ -481,52 +483,11 @@ def road_guided_occlusion(
     return np.asarray(pil, dtype=np.uint8).copy()
 
 
-def rotate_pair(
-    image: np.ndarray, mask: np.ndarray, max_degrees: float
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Continuous-angle rotation, safe for the full +/-180 degree range.
-
-    Roads in satellite imagery have no preferred orientation, but the
-    existing augmentation only ever shows the model 8 discrete angles (4
-    rot90 steps x horizontal flip). That under-covers what DirectionHead is meant to generalize across, since they predict
-    a continuous double-angle direction. A plain ``Image.rotate`` would fill
-    the corners it exposes with a constant color and, worse, fill the mask
-    corners with 0 (background) -- fabricated labels the model would
-    dutifully learn from. Reflect-padding first avoids that: padding by
-    ceil(0.25 * size) on each side is enough that the output's center crop
-    (whose farthest corner sits sqrt(2)/2 * size =~ 0.707 * size from the
-    center) is always reconstructed from real, if mirrored, image content
-    for any rotation angle, never a fabricated border.
-    """
-    if max_degrees <= 0:
-        return image, mask
-    angle = random.uniform(-max_degrees, max_degrees)
-    if abs(angle) < 1e-3:
-        return image, mask
-    size = mask.shape[0]
-    pad = max(1, math.ceil(0.25 * size))
-    image_padded = np.pad(image, ((pad, pad), (pad, pad), (0, 0)), mode="reflect")
-    mask_padded = np.pad(mask, ((pad, pad), (pad, pad)), mode="reflect")
-    image_rot = np.asarray(
-        Image.fromarray(image_padded).rotate(angle, resample=Image.BICUBIC)
-    )
-    mask_rot = np.asarray(
-        Image.fromarray(mask_padded).rotate(angle, resample=Image.NEAREST)
-    )
-    start, end = pad, pad + size
-    return (
-        np.ascontiguousarray(image_rot[start:end, start:end]),
-        np.ascontiguousarray(mask_rot[start:end, start:end]),
-    )
-
-
 def augment_pair(
     image: np.ndarray,
     mask: np.ndarray,
     road_occlusion_probability: float = 0.0,
     road_occlusion_max_patches: int = 2,
-    rotation_probability: float = 0.0,
-    rotation_max_degrees: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     if random.random() < 0.5:
         image, mask = image[:, ::-1], mask[:, ::-1]
@@ -535,8 +496,6 @@ def augment_pair(
     rotations = random.randrange(4)
     if rotations:
         image, mask = np.rot90(image, rotations), np.rot90(mask, rotations)
-    if random.random() < rotation_probability:
-        image, mask = rotate_pair(image, mask, rotation_max_degrees)
 
     pil = Image.fromarray(np.ascontiguousarray(image))
     if random.random() < 0.60:
@@ -576,8 +535,6 @@ class RoadCropDataset(Dataset):
         road_crop_tries: int,
         road_occlusion_probability: float,
         road_occlusion_max_patches: int,
-        rotation_probability: float = 0.0,
-        rotation_max_degrees: float = 0.0,
     ) -> None:
         self.pairs = list(pairs)
         self.crop_size = int(crop_size)
@@ -586,8 +543,6 @@ class RoadCropDataset(Dataset):
         self.road_crop_tries = int(road_crop_tries)
         self.road_occlusion_probability = float(road_occlusion_probability)
         self.road_occlusion_max_patches = int(road_occlusion_max_patches)
-        self.rotation_probability = float(rotation_probability)
-        self.rotation_max_degrees = float(rotation_max_degrees)
 
     def __len__(self) -> int:
         return len(self.pairs)
@@ -610,8 +565,6 @@ class RoadCropDataset(Dataset):
             mask,
             road_occlusion_probability=self.road_occlusion_probability,
             road_occlusion_max_patches=self.road_occlusion_max_patches,
-            rotation_probability=self.rotation_probability,
-            rotation_max_degrees=self.rotation_max_degrees,
         )
         return image_to_tensor(image), torch.from_numpy(mask).long()
 
@@ -668,59 +621,50 @@ def resolve_splits(
         return train_pairs, val_pairs, test_pairs
 
     all_pairs = build_pairs(args.train_image_dir, args.train_mask_dir)
-    total = len(all_pairs)
-    train_count = int(args.deepglobe_train_count)
-    val_from_test_count = int(args.deepglobe_val_from_test_count)
-
-    if not 0 < train_count < total:
-        raise ValueError(
-            f"deepglobe_train_count={train_count} is invalid for {total} labeled pairs"
-        )
-    test_count = total - train_count
-    if not 0 < val_from_test_count <= test_count:
-        raise ValueError(
-            f"deepglobe_val_from_test_count={val_from_test_count} is invalid for "
-            f"a {test_count}-image test split"
-        )
+    if args.val_image_dir and args.val_mask_dir:
+        val_images, val_masks = Path(args.val_image_dir), Path(args.val_mask_dir)
+        if val_images.is_dir() and val_masks.is_dir():
+            try:
+                val_pairs = build_pairs(val_images, val_masks)
+            except RuntimeError:
+                if args.dataset != "deepglobe":
+                    raise
+                rank_zero_print(
+                    "DeepGlobe validation directory has no matched masks; "
+                    "using a labeled deterministic holdout from train instead."
+                )
+            else:
+                rank_zero_print(
+                    f"Official/provided split: train={len(all_pairs)}, "
+                    f"val={len(val_pairs)}"
+                )
+                return all_pairs, val_pairs, []
 
     generator = np.random.default_rng(args.split_seed)
-    indices = generator.permutation(total)
-    train_indices = indices[:train_count]
-    test_indices = indices[train_count:]
-
-    train_pairs = [all_pairs[int(i)] for i in train_indices]
-    test_pairs = [all_pairs[int(i)] for i in test_indices]
-    val_pairs = test_pairs[:val_from_test_count]
-
-    train_keys = {sample_key(image) for image, _ in train_pairs}
-    val_keys = {sample_key(image) for image, _ in val_pairs}
-    test_keys = {sample_key(image) for image, _ in test_pairs}
-    train_test_overlap = train_keys & test_keys
-    train_val_overlap = train_keys & val_keys
-    val_test_overlap = val_keys & test_keys
-
-    if train_test_overlap:
-        raise RuntimeError(
-            f"DeepGlobe train/test leakage detected: {len(train_test_overlap)} samples; "
-            f"examples={sorted(train_test_overlap)[:10]}"
-        )
-    if train_val_overlap:
-        raise RuntimeError(
-            f"DeepGlobe train/val leakage detected: {len(train_val_overlap)} samples; "
-            f"examples={sorted(train_val_overlap)[:10]}"
-        )
-    if len(val_test_overlap) != len(val_pairs):
-        raise RuntimeError(
-            "DeepGlobe validation must be a subset of the full test split: "
-            f"val={len(val_pairs)}, val-test overlap={len(val_test_overlap)}"
-        )
-
+    indices = generator.permutation(len(all_pairs))
+    val_count = max(1, round(len(all_pairs) * args.val_ratio))
+    test_count = (
+        max(1, round(len(all_pairs) * args.test_ratio))
+        if args.test_ratio > 0.0
+        else 0
+    )
+    test_indices = set(indices[:test_count].tolist())
+    val_indices = set(indices[test_count : test_count + val_count].tolist())
+    train_pairs = [
+        pair
+        for index, pair in enumerate(all_pairs)
+        if index not in val_indices and index not in test_indices
+    ]
+    val_pairs = [
+        pair for index, pair in enumerate(all_pairs) if index in val_indices
+    ]
+    test_pairs = [
+        pair for index, pair in enumerate(all_pairs) if index in test_indices
+    ]
     rank_zero_print(
-        "DeepGlobe fixed-count split: "
-        f"train={len(train_pairs)}, val={len(val_pairs)} (subset of test), "
-        f"test={len(test_pairs)} | train-test overlap={len(train_test_overlap)}, "
-        f"train-val overlap={len(train_val_overlap)}, "
-        f"val-test overlap={len(val_test_overlap)}, seed={args.split_seed}"
+        "Deterministic labeled split: "
+        f"train={len(train_pairs)}, val={len(val_pairs)}, "
+        f"test={len(test_pairs)}, seed={args.split_seed}"
     )
     return train_pairs, val_pairs, test_pairs
 
@@ -744,8 +688,6 @@ def make_loaders(
         road_crop_tries=args.road_crop_tries,
         road_occlusion_probability=args.road_occlusion_probability,
         road_occlusion_max_patches=args.road_occlusion_max_patches,
-        rotation_probability=args.rotation_probability,
-        rotation_max_degrees=args.rotation_max_degrees,
     )
     val_dataset = RoadNativeValidationDataset(val_pairs)
     train_sampler: Optional[DistributedSampler]
@@ -834,63 +776,23 @@ def distributed_road_weight(
 # ---------------------------------------------------------------------------
 
 
-def _is_broadcast_scale(parameter: torch.nn.Parameter) -> bool:
-    """True for per-channel (1, C, 1, 1) scale/gate parameters.
-
-    These behave like a BatchNorm affine weight (an elementwise multiplier),
-    not like a dense conv kernel. They should therefore live in the
-    ``no_decay`` bucket the same way 1-D biases/norm weights do. Bucketing
-    them by ``ndim`` alone (the previous behaviour) puts them in the decay
-    group, and weight decay then continuously pulls every learnable fusion
-    gate in ``DualResolutionContext`` (``fusion_scale``,
-    ``semantic_to_detail_scale_1``, ``detail_to_semantic_scale_1``,
-    ``context_scale``) toward zero every step. That is consistent with the
-    symptom observed in the Massachusetts run: those gates barely moved
-    across 150 epochs and ``detail_to_semantic`` stayed pinned near 0.02.
-    """
-    return (
-        parameter.ndim == 4
-        and parameter.shape[0] == 1
-        and parameter.shape[2] == 1
-        and parameter.shape[3] == 1
-    )
-
-
 def build_optimizer(model: DualBranchRoadNet, args: argparse.Namespace) -> AdamW:
     factors = {
         "head": 1.0,
         "dual_branch": args.dual_branch_lr_factor,
-        "dual_branch_gates": args.gate_lr_factor,
         "layer3": args.backbone_lr_factor,
         "layer2": args.backbone_lr_factor,
         "early_encoder": args.early_encoder_lr_factor,
     }
     groups: List[Dict] = []
     seen: set[int] = set()
-    # DEBUG: bucketing summary, printed once at startup so a bad weight-decay
-    # assignment (e.g. gate/scale params silently decayed) is visible before
-    # a single epoch has run instead of only being inferable from gate drift
-    # 100+ epochs later.
-    bucket_debug: Dict[str, Dict[str, int]] = {}
     for group_name, parameters in model.optimization_modules().items():
         decay, no_decay = [], []
-        scale_like_no_decay = 0
         for parameter in parameters:
             if id(parameter) in seen:
                 raise RuntimeError(f"Duplicate optimizer parameter in {group_name}")
             seen.add(id(parameter))
-            is_bias_like = parameter.ndim <= 1
-            is_scale_like = _is_broadcast_scale(parameter)
-            if is_scale_like:
-                scale_like_no_decay += 1
-            (no_decay if (is_bias_like or is_scale_like) else decay).append(parameter)
-        bucket_debug[group_name] = {
-            "decay_tensors": len(decay),
-            "decay_params": sum(p.numel() for p in decay),
-            "no_decay_tensors": len(no_decay),
-            "no_decay_params": sum(p.numel() for p in no_decay),
-            "scale_like_rescued": scale_like_no_decay,
-        }
+            (no_decay if parameter.ndim <= 1 else decay).append(parameter)
         for suffix, values, weight_decay in (
             ("decay", decay, args.weight_decay),
             ("no_decay", no_decay, 0.0),
@@ -906,23 +808,6 @@ def build_optimizer(model: DualBranchRoadNet, args: argparse.Namespace) -> AdamW
                 )
     if len(seen) != len(list(model.parameters())):
         raise RuntimeError("Some model parameters were not assigned to the optimizer")
-
-    if is_main_process():
-        rank_zero_print("[optimizer] parameter bucketing (decay vs no_decay):")
-        for group_name, counts in bucket_debug.items():
-            rescued_note = (
-                f", scale/gate tensors moved to no_decay={counts['scale_like_rescued']}"
-                if counts["scale_like_rescued"]
-                else ""
-            )
-            rank_zero_print(
-                f"  {group_name}: decay={counts['decay_tensors']} tensors/"
-                f"{counts['decay_params']:,} params | "
-                f"no_decay={counts['no_decay_tensors']} tensors/"
-                f"{counts['no_decay_params']:,} params"
-                f"{rescued_note}"
-            )
-
     optimizer_kwargs = {"betas": (0.9, 0.999)}
     try:
         return AdamW(
@@ -931,6 +816,7 @@ def build_optimizer(model: DualBranchRoadNet, args: argparse.Namespace) -> AdamW
             **optimizer_kwargs,
         )
     except (TypeError, RuntimeError):
+        # Compatibility fallback for older PyTorch builds/accelerators.
         return AdamW(groups, **optimizer_kwargs)
 
 
@@ -1019,62 +905,11 @@ def head_lr(optimizer: torch.optim.Optimizer) -> float:
     return float(optimizer.param_groups[0]["lr"])
 
 
-def group_lrs(optimizer: torch.optim.Optimizer) -> Dict[str, float]:
-    """DEBUG: current LR of the 'decay' sub-group for each optimizer bucket.
-
-    Useful to confirm the per-group LR factors (dual_branch/backbone/etc.)
-    and the cosine schedule are actually taking effect as expected, rather
-    than inferring it indirectly from the head LR alone.
-    """
-    lrs: Dict[str, float] = {}
-    for group in optimizer.param_groups:
-        name = group.get("group_name", "")
-        if name.endswith("/decay"):
-            lrs[name[: -len("/decay")]] = float(group["lr"])
-    return lrs
-
-
-@torch.no_grad()
-def bucket_weight_norms(model: DualBranchRoadNet) -> Dict[str, float]:
-    """DEBUG: L2 norm of the trainable weights in each optimizer bucket.
-
-    Tracked every logged epoch so weight-decay shrinkage (or its absence)
-    is directly observable instead of only inferable from gate-value drift.
-    """
-    norms: Dict[str, float] = {}
-    for name, parameters in model.optimization_modules().items():
-        total = 0.0
-        for parameter in parameters:
-            total += float(parameter.detach().float().pow(2).sum())
-        norms[name] = math.sqrt(total)
-    return norms
-
-
-def bucket_grad_norms(optimizer: torch.optim.Optimizer) -> Dict[str, float]:
-    """DEBUG: L2 grad norm per optimizer bucket, read right after unscale_.
-
-    Gradients are already DDP-averaged and unscaled at this point, so this
-    is a cheap way to see whether a given bucket (most importantly
-    ``dual_branch``, which holds the bilateral-fusion gates) is receiving a
-    meaningfully large gradient at all, independent of whatever the clipped
-    global norm ends up being.
-    """
-    sums: Dict[str, float] = {}
-    for group in optimizer.param_groups:
-        bucket = group.get("group_name", "unknown").split("/")[0]
-        squared = 0.0
-        for parameter in group["params"]:
-            if parameter.grad is not None:
-                squared += float(parameter.grad.detach().float().pow(2).sum())
-        sums[bucket] = sums.get(bucket, 0.0) + squared
-    return {bucket: math.sqrt(value) for bucket, value in sums.items()}
-
-
 def train_one_epoch(
     model: nn.Module,
     ema: ModelEMA,
     loader: DataLoader,
-    criterion: RoadSegBCEClDiceLoss,
+    criterion: RoadSegCenterlineTverskyLoss,
     optimizer: torch.optim.Optimizer,
     scheduler: LambdaLR,
     scaler,
@@ -1086,22 +921,27 @@ def train_one_epoch(
     model.train()
     base_model = unwrap_model(model)
     base_model.enforce_frozen_norm_eval(args.freeze_encoder_bn)
+    if epoch < args.aux_start_epoch:
+        aux_scale = 0.0
+    elif args.aux_warmup_epochs:
+        aux_scale = min(
+            1.0,
+            (epoch - args.aux_start_epoch + 1) / args.aux_warmup_epochs,
+        )
+    else:
+        aux_scale = 1.0
+    criterion.aux_weight = args.aux_weight * aux_scale
+
     meters = {
         name: RunningAverage()
         for name in (
             "total",
-            "bce",
-            "cldice",
+            "main_ce",
+            "main_dice",
+            "centerline",
             "road_fraction",
-            "pred_road_fraction",  # DEBUG: mean predicted road probability
-            "grad_norm_total",  # DEBUG: global clipped grad norm
         )
     }
-    # DEBUG: per-bucket grad-norm meters, added lazily so this works even if
-    # OPTIMIZER_BUCKETS ever drifts from optimization_modules() keys.
-    for bucket in OPTIMIZER_BUCKETS:
-        meters[f"grad_norm_{bucket}"] = RunningAverage()
-
     optimizer.zero_grad(set_to_none=True)
     successful_updates, skipped_nonfinite = 0, 0
     progress = tqdm(
@@ -1131,24 +971,17 @@ def train_one_epoch(
             with torch.autocast(
                 device_type=device.type, dtype=torch.float16, enabled=args.use_amp
             ):
-                outputs = model(images)
-                losses = criterion(outputs, masks)
+                losses = criterion(model(images), masks)
                 scaled_loss = losses["loss_total"] / group_size
+            # All ranks always enter backward. DDP propagates non-finite
+            # gradients across ranks and GradScaler then skips the update on
+            # every rank consistently. This removes a blocking all-reduce and
+            # two device synchronizations from every healthy batch.
             scaler.scale(scaled_loss).backward()
 
-        grad_norm_value = float("nan")
-        bucket_norms: Dict[str, float] = {}
         if do_update:
             scaler.unscale_(optimizer)
-            total_norm_tensor = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), args.grad_clip
-            )
-            grad_norm_value = float(total_norm_tensor)
-            if args.debug_grad_norms:
-                # Cheap: one Python-side reduction over already-materialized
-                # .grad tensors, no extra device synchronization beyond the
-                # .item()-style float() casts already required below.
-                bucket_norms = bucket_grad_norms(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             old_scale = float(scaler.get_scale())
             scaler.step(optimizer)
             scaler.update()
@@ -1161,42 +994,22 @@ def train_one_epoch(
                 skipped_nonfinite += 1
 
         batch = int(images.shape[0])
-        road_logits = outputs[-1] if isinstance(outputs, tuple) else outputs
-        with torch.no_grad():
-            pred_road_fraction = (
-                road_logits.float().softmax(dim=1)[:, 1].mean()
-            )
+        # One device-to-host copy replaces five scalar synchronizations.
         metric_values = torch.stack(
             (
                 losses["loss_total"].detach(),
-                losses["loss_bce"],
-                losses["loss_cldice"],
+                losses["loss_main_ce"],
+                losses["loss_main_dice"],
+                losses["loss_aux_centerline"],
                 (masks > 0).float().mean(),
-                pred_road_fraction,
             )
         ).float().cpu().tolist()
-        for name, value in zip(
-            (
-                "total",
-                "bce",
-                "cldice",
-                "road_fraction",
-                "pred_road_fraction",
-            ),
-            metric_values,
-        ):
+        for name, value in zip(meters, metric_values):
             meters[name].update(value, batch)
-        if do_update and not math.isnan(grad_norm_value):
-            meters["grad_norm_total"].update(grad_norm_value, 1)
-            for bucket, value in bucket_norms.items():
-                if f"grad_norm_{bucket}" in meters:
-                    meters[f"grad_norm_{bucket}"].update(value, 1)
         progress.set_postfix(
             loss=f"{meters['total'].mean:.4f}",
-            bce=f"{meters['bce'].mean:.3f}",
-            cldice=f"{meters['cldice'].mean:.3f}",
             lr=f"{head_lr(optimizer):.2e}",
-            gnorm=f"{meters['grad_norm_total'].mean:.2f}",
+            aux=f"{criterion.aux_weight:.3f}",
         )
 
     if distributed_active():
@@ -1214,15 +1027,14 @@ def train_one_epoch(
         dist.all_reduce(counters, op=dist.ReduceOp.MAX)
         successful_updates, skipped_nonfinite = map(int, counters.tolist())
     elapsed = max(perf_counter() - epoch_start, 1e-6)
-    result = {name: meter.mean for name, meter in meters.items()} | {
+    return {name: meter.mean for name, meter in meters.items()} | {
         "lr": head_lr(optimizer),
-        "group_lrs": group_lrs(optimizer),  # DEBUG
+        "aux_weight": criterion.aux_weight,
         "successful_updates": float(successful_updates),
         "skipped_nonfinite": float(skipped_nonfinite),
         "seconds": elapsed,
         "images_per_second": meters["total"].count / elapsed,
     }
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1367,24 +1179,12 @@ def validate(
     loader: DataLoader,
     device: torch.device,
     args: argparse.Namespace,
-    criterion: RoadSegBCEClDiceLoss,
 ) -> Dict[str, float]:
-    """Native sliding-window validation using the exact training objective.
-
-    Validation loss is the same weighted BCE + clDice used during training;
-    no Dice or orientation auxiliary term is computed.
-    """
     model.eval()
     bins = args.threshold_bins
     positive_hist = torch.zeros(bins, dtype=torch.int64, device=device)
     negative_hist = torch.zeros(bins, dtype=torch.int64, device=device)
-    # 0-9: confusion / relaxed-overlap accumulators.
-    # 10-12: loss_total, BCE, clDice summed per validation image.
-    totals = torch.zeros(13, dtype=torch.float64, device=device)
-    probability_sum_on_road = torch.zeros((), dtype=torch.float64, device=device)
-    probability_sum_on_background = torch.zeros((), dtype=torch.float64, device=device)
-    road_pixel_count = torch.zeros((), dtype=torch.float64, device=device)
-    background_pixel_count = torch.zeros((), dtype=torch.float64, device=device)
+    totals = torch.zeros(10, dtype=torch.float64, device=device)
     progress = tqdm(
         loader, desc="Native validation", leave=False, disable=not is_main_process()
     )
@@ -1410,64 +1210,24 @@ def validate(
         relaxed = relaxed_components(
             prediction[0], target[0], args.relaxed_buffer_px
         )
-
-        # Exact same objective as training. RoadSegBCEClDiceLoss accepts logits
-        # directly and internally converts the binary target consistently.
-        losses = criterion(logits, masks)
         totals += totals.new_tensor(
-            [
-                tp, fp, fn, tn, per_image_iou, 1.0, *relaxed,
-                float(losses["loss_total"].detach()),
-                float(losses["loss_bce"]),
-                float(losses["loss_cldice"]),
-            ]
+            [tp, fp, fn, tn, per_image_iou, 1.0, *relaxed]
         )
         positive, negative = histogram_counts(probability, target, bins)
         positive_hist += positive
         negative_hist += negative
 
-        probability_sum_on_road += probability[target].double().sum()
-        probability_sum_on_background += probability[~target].double().sum()
-        road_pixel_count += target.double().sum()
-        background_pixel_count += (~target).double().sum()
-
     if distributed_active():
         dist.all_reduce(totals, op=dist.ReduceOp.SUM)
         dist.all_reduce(positive_hist, op=dist.ReduceOp.SUM)
         dist.all_reduce(negative_hist, op=dist.ReduceOp.SUM)
-        for tensor in (
-            probability_sum_on_road,
-            probability_sum_on_background,
-            road_pixel_count,
-            background_pixel_count,
-        ):
-            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-
     tp, fp, fn, tn = (int(value) for value in totals[:4].tolist())
-    metrics = {
-        f"fixed_{key}": value
-        for key, value in metrics_from_counts(tp, fp, fn, tn).items()
-    }
-    metrics["fixed_road_iou_macro"] = float(
-        totals[4] / max(float(totals[5]), 1.0)
-    )
+    metrics = {f"fixed_{key}": value for key, value in metrics_from_counts(tp, fp, fn, tn).items()}
+    metrics["fixed_road_iou_macro"] = float(totals[4] / max(float(totals[5]), 1.0))
     relaxed_precision = float(totals[6] / max(float(totals[8]), 1.0))
     relaxed_recall = float(totals[7] / max(float(totals[9]), 1.0))
-    metrics["fixed_relaxed_f1"] = (
-        2.0 * relaxed_precision * relaxed_recall
-        / max(relaxed_precision + relaxed_recall, 1e-12)
-    )
-    metrics["mean_probability_on_road"] = float(
-        probability_sum_on_road / road_pixel_count.clamp_min(1.0)
-    )
-    metrics["mean_probability_on_background"] = float(
-        probability_sum_on_background / background_pixel_count.clamp_min(1.0)
-    )
-    metrics["predicted_road_fraction"] = float(
-        (tp + fp) / max(tp + fp + fn + tn, 1)
-    )
-    metrics["true_road_fraction"] = float(
-        (tp + fn) / max(tp + fp + fn + tn, 1)
+    metrics["fixed_relaxed_f1"] = 2.0 * relaxed_precision * relaxed_recall / max(
+        relaxed_precision + relaxed_recall, 1e-12
     )
 
     best_threshold, best_counts, best_iou = 0.5, (tp, fp, fn, tn), -1.0
@@ -1485,11 +1245,6 @@ def validate(
         }
     )
     metrics["calibrated_threshold"] = float(best_threshold)
-
-    image_count = max(float(totals[5]), 1.0)
-    metrics["val_loss"] = float(totals[10] / image_count)
-    metrics["val_loss_bce"] = float(totals[11] / image_count)
-    metrics["val_loss_cldice"] = float(totals[12] / image_count)
     return metrics
 
 
@@ -1550,21 +1305,14 @@ def transfer_weights(
         raise KeyError(f"No '{weights}', model, ema, or state_dict weights found")
     cleaned = clean_state_dict(state)
     result = model.load_state_dict(cleaned, strict=False)
-    # NEW_MODULE_NAME_FRAGMENTS: substrings of parameter names that are
-    # allowed to be absent from an older checkpoint because they belong to a
-    # module introduced after that checkpoint was trained. Extend this tuple
-    # (never remove from it) whenever a new purely-additive, zero/near-zero
-    # initialized submodule is added, so older checkpoints keep transferring.
-    new_module_fragments = ("spatial_gate", "skip_gate", "full_extra_refine")
     allowed_missing = all(
-        any(fragment in key for fragment in new_module_fragments)
-        for key in result.missing_keys
+        "spatial_gate" in key for key in result.missing_keys
     )
     if result.unexpected_keys or not allowed_missing:
         raise RuntimeError(
             "Transfer checkpoint architecture does not match DualBranchRoadNet. "
             f"Missing={result.missing_keys}, unexpected={result.unexpected_keys}. "
-            f"Only tensors matching {new_module_fragments} may be absent."
+            "Only newly introduced spatial-gate tensors may be absent."
         )
     return checkpoint_path
 
@@ -1655,24 +1403,6 @@ def parse_args() -> argparse.Namespace:
         help="Held out and never evaluated during training when no labeled val exists",
     )
     parser.add_argument("--split_seed", type=int, default=3407)
-    parser.add_argument(
-        "--deepglobe_train_count",
-        type=int,
-        default=5000,
-        help=(
-            "DeepGlobe fixed training count. With the 6226 labeled pairs, "
-            "the remaining 1226 images form the full test split."
-        ),
-    )
-    parser.add_argument(
-        "--deepglobe_val_from_test_count",
-        type=int,
-        default=300,
-        help=(
-            "Number of validation images taken deterministically from the start "
-            "of the full DeepGlobe test1226 split."
-        ),
-    )
 
     parser.add_argument("--crop_size", type=int, default=1024)
     parser.add_argument("--road_crop_probability", type=float, default=0.60)
@@ -1689,39 +1419,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=2,
     )
-    parser.add_argument(
-        "--rotation_probability",
-        type=float,
-        default=0.5,
-        help=(
-            "Probability of an additional continuous-angle rotation on top "
-            "of the existing flip/rot90 augmentation. Roads in satellite "
-            "imagery have no preferred orientation, so continuous rotations "
-            "help the self-learned DirectionHead generalize beyond the 8 "
-            "discrete flip/rot90 orientations. Reflect-padding keeps corners "
-            "a fabricated constant/background border (see rotate_pair)."
-        ),
-    )
-    parser.add_argument(
-        "--rotation_max_degrees",
-        type=float,
-        default=45.0,
-        help="+/- degrees for --rotation_probability's continuous rotation.",
-    )
 
     parser.add_argument("--detail_channels", type=int, default=96)
     parser.add_argument("--semantic_channels", type=int, default=192)
+    parser.add_argument("--dappm_channels", type=int, default=32)
     parser.add_argument(
-        "--context_dilations",
-        nargs="+",
-        type=int,
-        default=(1, 2, 4, 8),
-        help=(
-            "Dilation rates for the DilatedContextBlock placed after the "
-            "encoder's S32 stage (D-LinkNet-style center block, replacing "
-            "DAPPM -- gate_statistics() showed DAPPM's contribution to S16 "
-            "barely moved from its init value across training)."
-        ),
+        "--dappm_pool_sizes", nargs="+", type=int, default=(1, 2, 4, 8)
     )
     parser.add_argument(
         "--detail_blocks", nargs=2, type=int, default=(2, 2)
@@ -1740,49 +1443,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decoder_s4_channels", type=int, default=64)
     parser.add_argument("--decoder_s2_channels", type=int, default=32)
     parser.add_argument("--full_channels", type=int, default=24)
-    parser.add_argument(
-        "--full_refine_blocks",
-        type=int,
-        default=0,
-        help=(
-            "Extra RepDepthwiseBlocks after full_refine, at full crop "
-            "resolution (the most expensive spatial size in the decoder -- "
-            "each block here costs far more compute/VRAM than the same "
-            "block at S4/S2, despite full_channels usually being the "
-            "smallest width). Default 0 keeps the original single-block "
-            "full_refine so a plain run fits the same batch size as before; "
-            "opt in only once there is VRAM budget to test it."
-        ),
-    )
-    parser.add_argument(
-        "--oriented_skip",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Use OrientedSkipAggregation for S4/S2 skip connections. Road "
-            "direction is learned end-to-end only from BCE + clDice; there is "
-            "no orientation target or auxiliary loss. --no-oriented_skip "
-            "restores SkipFeatureGate for an ablation."
-        ),
-    )
-    parser.add_argument(
-        "--oriented_skip_span",
-        type=int,
-        default=2,
-        help=(
-            "Sampling offsets per side along the predicted road direction "
-            "in OrientedSkipAggregation (2 -> 4 grid_sample calls per stage, "
-            "8 total across S4+S2). Lower this first if oriented_skip OOMs "
-            "at a batch size SkipFeatureGate fit."
-        ),
-    )
-    parser.add_argument(
-        "--oriented_skip_spacing",
-        type=float,
-        default=3.0,
-        help="Distance in pixels (of that stage's own resolution) between "
-        "consecutive OrientedSkipAggregation sampling offsets.",
-    )
     parser.add_argument("--dropout", type=float, default=0.05)
     parser.add_argument(
         "--imagenet_pretrained",
@@ -1807,20 +1467,6 @@ def parse_args() -> argparse.Namespace:
         default=0.75,
         help="LR factor for detail/semantic branches; old flag kept as alias",
     )
-    parser.add_argument(
-        "--gate_lr_factor",
-        type=float,
-        default=3.0,
-        help=(
-            "LR factor (relative to --lr) for DualResolutionContext's four "
-            "[1,C,1,1] residual-gate scales (semantic_to_detail, "
-            "detail_to_semantic, s32 context, final fusion). Diagnosed near-"
-            "stuck at their init values after 79 epochs even with weight "
-            "decay already excluded for them; higher than "
-            "--dual_branch_lr_factor to test whether they were starved of "
-            "gradient signal by their own small multiplicative scale."
-        ),
-    )
     parser.add_argument("--backbone_lr_factor", type=float, default=0.20)
     parser.add_argument("--early_encoder_lr_factor", type=float, default=0.10)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
@@ -1837,29 +1483,24 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Positive value skips the startup mask scan and uses this CE weight",
     )
+    parser.add_argument("--main_dice_weight", type=float, default=1.0)
+    parser.add_argument("--aux_weight", type=float, default=0.15)
     parser.add_argument(
-        "--bce_weight",
-        type=float,
-        default=1.0,
-        help="Direct multiplier for weighted BCE in the two-loss objective.",
-    )
-    parser.add_argument(
-        "--cldice_weight",
-        type=float,
-        default=1.0,
-        help=(
-            "Direct multiplier for topology-preserving clDice. This is no longer "
-            "a Dice/clDice blend factor because plain Dice has been removed."
-        ),
-    )
-    parser.add_argument(
-        "--cldice_iterations",
+        "--aux_start_epoch",
         type=int,
-        default=10,
-        help=(
-            "Soft-skeletonization erosion steps for clDice. Should roughly "
-            "cover the widest road half-width in pixels at output resolution."
-        ),
+        default=5,
+        help="Keep centerline supervision off before this zero-based epoch",
+    )
+    parser.add_argument("--aux_warmup_epochs", type=int, default=5)
+    parser.add_argument("--centerline_alpha", type=float, default=0.30)
+    parser.add_argument("--centerline_beta", type=float, default=0.70)
+    parser.add_argument("--centerline_dilation", type=int, default=1)
+    parser.add_argument("--skeleton_iterations", type=int, default=8)
+    parser.add_argument(
+        "--fast_centerline_target",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use an S2 intermediate skeleton target instead of full resolution",
     )
 
     parser.add_argument(
@@ -1920,29 +1561,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--transfer_weights", choices=("ema", "model"), default="ema")
     parser.add_argument("--resume", default=None)
     parser.add_argument("--save_dir", default="./checkpoints/dual_branch_roadnet")
-
-    # ---- DEBUG / diagnostics flags -----------------------------------
-    parser.add_argument(
-        "--debug_grad_norms",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Log per-bucket gradient L2 norms every epoch (head/dual_branch/"
-        "layer3/layer2/early_encoder). Cheap (no extra device sync).",
-    )
-    parser.add_argument(
-        "--debug_gate_every_epoch",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Print DualResolutionContext gate statistics every epoch "
-        "instead of only on validation epochs.",
-    )
-    parser.add_argument(
-        "--debug_weight_norms_every",
-        type=int,
-        default=10,
-        help="Print per-bucket trainable weight L2 norm every N epochs "
-        "(0 disables). Useful to directly see weight-decay shrinkage.",
-    )
     return parser.parse_args()
 
 
@@ -1958,11 +1576,6 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("Massachusetts requires --train_list and --test_list")
         if args.test_eval_images < 1:
             raise ValueError("test_eval_images must be positive")
-    elif args.dataset == "deepglobe":
-        if args.deepglobe_train_count < 1:
-            raise ValueError("deepglobe_train_count must be positive")
-        if args.deepglobe_val_from_test_count < 1:
-            raise ValueError("deepglobe_val_from_test_count must be positive")
     if args.fixed_road_weight is not None and args.fixed_road_weight <= 0.0:
         raise ValueError("fixed_road_weight must be positive")
     if not 0.0 < args.val_ratio < 1.0:
@@ -1973,33 +1586,37 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("val_ratio + test_ratio must be smaller than 1")
     if args.resume and args.pretrained_checkpoint:
         raise ValueError("Use either --resume or --pretrained_checkpoint, not both")
-    if not args.context_dilations or min(args.context_dilations) < 1:
-        raise ValueError("context_dilations must be positive")
+    if not args.dappm_pool_sizes or min(args.dappm_pool_sizes) < 1:
+        raise ValueError("dappm_pool_sizes must be positive")
     if min(args.detail_blocks) < 1:
         raise ValueError("detail_blocks must be positive")
     channel_values = (
         args.detail_channels,
         args.semantic_channels,
+        args.dappm_channels,
         args.decoder_s4_channels,
         args.decoder_s2_channels,
         args.full_channels,
     )
     if min(channel_values) < 1:
         raise ValueError("All architecture channel counts must be positive")
+    if not 0.0 <= args.centerline_alpha <= 1.0:
+        raise ValueError("centerline_alpha must be in [0, 1]")
+    if not 0.0 <= args.centerline_beta <= 1.0:
+        raise ValueError("centerline_beta must be in [0, 1]")
+    if args.centerline_alpha + args.centerline_beta <= 0.0:
+        raise ValueError("centerline_alpha + centerline_beta must be positive")
+    if args.centerline_dilation < 0:
+        raise ValueError("centerline_dilation cannot be negative")
     if not 0.0 <= args.road_occlusion_probability <= 1.0:
         raise ValueError("road_occlusion_probability must be in [0, 1]")
     if args.road_occlusion_max_patches < 1:
         raise ValueError("road_occlusion_max_patches must be positive")
-    if not 0.0 <= args.rotation_probability <= 1.0:
-        raise ValueError("rotation_probability must be in [0, 1]")
-    if args.rotation_max_degrees < 0.0:
-        raise ValueError("rotation_max_degrees cannot be negative")
-    if args.bce_weight <= 0.0:
-        raise ValueError("bce_weight must be positive")
-    if args.cldice_weight <= 0.0:
-        raise ValueError("cldice_weight must be positive")
-    if args.cldice_iterations < 1:
-        raise ValueError("cldice_iterations must be positive")
+    for name in ("aux_weight",):
+        if getattr(args, name) < 0.0:
+            raise ValueError(f"{name} cannot be negative")
+    if args.aux_start_epoch < 0 or args.aux_warmup_epochs < 0:
+        raise ValueError("Centerline start/warmup epochs cannot be negative")
     if args.progressive_unfreeze:
         epochs = (
             args.unfreeze_dual_branch_epoch,
@@ -2019,14 +1636,6 @@ def save_split_manifest(
     test_pairs: Sequence[Tuple[Path, Path]],
     split_seed: int,
 ) -> None:
-    train_keys = {sample_key(image) for image, _ in train_pairs}
-    val_keys = {sample_key(image) for image, _ in val_pairs}
-    test_keys = {sample_key(image) for image, _ in test_pairs}
-    overlap_counts = {
-        "train_val": len(train_keys & val_keys),
-        "train_test": len(train_keys & test_keys),
-        "val_test": len(val_keys & test_keys),
-    }
     manifest = {
         "split_seed": int(split_seed),
         "counts": {
@@ -2034,7 +1643,6 @@ def save_split_manifest(
             "val": len(val_pairs),
             "test": len(test_pairs),
         },
-        "overlap_counts": overlap_counts,
         "train": [[str(image), str(mask)] for image, mask in train_pairs],
         "val": [[str(image), str(mask)] for image, mask in val_pairs],
         "test": [[str(image), str(mask)] for image, mask in test_pairs],
@@ -2098,12 +1706,6 @@ def main() -> None:
             test_pairs,
             args.split_seed,
         )
-        if args.dataset == "deepglobe":
-            rank_zero_print(
-                f"[startup] split_manifest.json saved: train={len(train_pairs)}, "
-                f"val={len(val_pairs)}, test={len(test_pairs)}; "
-                "expected overlaps train-test=0, train-val=0, val-test=300"
-            )
     if args.fixed_road_weight is None:
         rank_zero_print(
             f"[startup 3/5] Scanning {len(train_pairs)} training masks "
@@ -2116,14 +1718,18 @@ def main() -> None:
         imbalance = float("nan")
         road_weight = float(args.fixed_road_weight)
         rank_zero_print(
-            f"[startup 3/5] Skipping mask scan; fixed road BCE pos_weight="
+            f"[startup 3/5] Skipping mask scan; fixed road CE weight="
             f"{road_weight:.3f}"
         )
 
+    # A full road checkpoint replaces every weight, so do not require an
+    # unnecessary ImageNet download for transfer/resume runs.
     build_args = copy.copy(args)
     if args.pretrained_checkpoint or args.resume:
         build_args.imagenet_pretrained = False
 
+    # Rank 0 populates the torchvision cache first, preventing two processes
+    # from racing while downloading ImageNet weights on a fresh Kaggle session.
     needs_imagenet_cache = bool(
         build_args.imagenet_pretrained and not build_args.encoder_weights_path
     )
@@ -2149,17 +1755,23 @@ def main() -> None:
         rank_zero_print(f"Transferred {args.transfer_weights} weights from {loaded}")
     rank_zero_print("[startup 5/5] Building optimizer, EMA, loss, and DDP reducer...")
 
+    # Build the optimizer and DDP reducer while every parameter is trainable.
+    # Later phase changes therefore retain optimizer groups and DDP hooks.
     model.set_trainable_phase(4)
     optimizer = build_optimizer(model, args)
     updates_per_epoch = math.ceil(len(train_loader) / args.accumulation_steps)
     scheduler = build_scheduler(optimizer, updates_per_epoch, args)
     scaler = make_grad_scaler(args.use_amp)
     ema = ModelEMA(model, args.ema_decay)
-    criterion = RoadSegBCEClDiceLoss(
+    criterion = RoadSegCenterlineTverskyLoss(
         road_class_weight=road_weight,
-        bce_weight=args.bce_weight,
-        cldice_weight=args.cldice_weight,
-        cldice_iterations=args.cldice_iterations,
+        main_dice_weight=args.main_dice_weight,
+        aux_weight=args.aux_weight,
+        centerline_alpha=args.centerline_alpha,
+        centerline_beta=args.centerline_beta,
+        skeleton_iterations=args.skeleton_iterations,
+        centerline_dilation=args.centerline_dilation,
+        fast_centerline_target=args.fast_centerline_target,
     ).to(device)
 
     start_epoch, best_fixed, best_calibrated = 0, -1.0, -1.0
@@ -2193,28 +1805,30 @@ def main() -> None:
     )
     rank_zero_print(
         f"shared ResNet34 to S8 | detail={args.detail_channels}ch S8 | "
-        f"semantic anchor=256ch S16 | context={args.semantic_channels}ch S32 | "
-        f"dilated context dilations={tuple(args.context_dilations)}"
+        f"semantic anchor=256ch S16 | context={args.semantic_channels}ch S32 | DAPPM="
+        f"{args.dappm_channels}ch grids={tuple(args.dappm_pool_sizes)}"
     )
     rank_zero_print(
         f"decoder S4/S2/S1={args.decoder_s4_channels}/"
         f"{args.decoder_s2_channels}/{args.full_channels}ch | "
-        f"detail blocks={tuple(args.detail_blocks)} | "
-        f"full_refine_blocks={args.full_refine_blocks} | "
-        f"skip={'oriented' if args.oriented_skip else 'gate'}"
+        f"detail blocks={tuple(args.detail_blocks)}"
     )
     rank_zero_print(
         f"bilateral fusion={args.bilateral_fusion} | "
-        "directional decoder learned end-to-end from segmentation loss"
+        "loss and directional decoder unchanged"
     )
     rank_zero_print(
         f"parameters={total_parameters:,} | imbalance={imbalance:.3f} | "
-        f"road BCE pos_weight={road_weight:.3f}"
+        f"road CE weight={road_weight:.3f}"
     )
     rank_zero_print(
-        f"loss={args.bce_weight:.2f}*weighted BCE + "
-        f"{args.cldice_weight:.2f}*clDice(iter={args.cldice_iterations}); "
-        "no Dice, no orientation/centerline auxiliary loss"
+        "loss=weighted CE + Dice + centerline Tversky "
+        f"(centerline max={args.aux_weight:.2f}, starts epoch "
+        f"{args.aux_start_epoch + 1})"
+    )
+    rank_zero_print(
+        "centerline target="
+        + ("fast S2 morphology" if args.fast_centerline_target else "full resolution")
     )
     rank_zero_print(
         f"progressive_unfreeze={args.progressive_unfreeze} | "
@@ -2246,100 +1860,29 @@ def main() -> None:
             args,
         )
         gate_metrics = unwrap_model(model).dual_branch.gate_statistics()
-
-        # DEBUG: print a compact per-epoch line every epoch, not only on
-        # validation epochs. This is what lets you see gate/grad behaviour
-        # at 1-epoch resolution instead of only every val_interval epochs.
-        if is_main_process() and args.debug_gate_every_epoch:
-            group_lr_str = " ".join(
-                f"{name}={lr:.2e}" for name, lr in train_metrics["group_lrs"].items()
-            )
-            grad_norm_str = " ".join(
-                f"{bucket}={train_metrics.get(f'grad_norm_{bucket}', float('nan')):.3f}"
-                for bucket in OPTIMIZER_BUCKETS
-            )
-            rank_zero_print(
-                f"  [debug] train_loss={train_metrics['total']:.5f} "
-                f"(bce={train_metrics['bce']:.4f} "
-                f"cldice={train_metrics['cldice']:.4f}) | "
-                f"pred_road_frac={train_metrics['pred_road_fraction']:.4f} "
-                f"true_road_frac={train_metrics['road_fraction']:.4f} | "
-                f"skipped_nonfinite={int(train_metrics['skipped_nonfinite'])}"
-            )
-            rank_zero_print(f"  [debug] group LRs: {group_lr_str}")
-            if args.debug_grad_norms:
-                rank_zero_print(
-                    f"  [debug] grad norms (total={train_metrics['grad_norm_total']:.3f}): "
-                    f"{grad_norm_str}"
-                )
-            ctx_value = gate_metrics.get(
-                "s32_context_to_s16_spatial_mean",
-                gate_metrics.get("s32_context_to_s16_abs_mean", float("nan")),
-            )
-            final_value = gate_metrics.get(
-                "semantic_to_final_spatial_mean",
-                gate_metrics.get("semantic_to_final_abs_mean", float("nan")),
-            )
-            rank_zero_print(
-                "  [debug] fusion gates s2d/d2s="
-                f"{gate_metrics['semantic_to_detail_abs_mean']:.4f}/"
-                f"{gate_metrics['detail_to_semantic_abs_mean']:.4f}"
-                f" | ctx/final={ctx_value:.4f}/{final_value:.4f}"
-                + (
-                    " | spatial mean(std) s2d/d2s="
-                    f"{gate_metrics['semantic_to_detail_spatial_mean']:.4f}"
-                    f"({gate_metrics['semantic_to_detail_spatial_std']:.4f})/"
-                    f"{gate_metrics['detail_to_semantic_spatial_mean']:.4f}"
-                    f"({gate_metrics['detail_to_semantic_spatial_std']:.4f})"
-                    if args.bilateral_fusion == "spatial"
-                    else ""
-                )
-            )
-            if (
-                args.debug_weight_norms_every
-                and (epoch + 1) % args.debug_weight_norms_every == 0
-            ):
-                weight_norms = bucket_weight_norms(unwrap_model(model))
-                weight_norm_str = " ".join(
-                    f"{name}={norm:.2f}" for name, norm in weight_norms.items()
-                )
-                rank_zero_print(f"  [debug] bucket weight L2 norms: {weight_norm_str}")
-
         validation_metrics: Dict[str, float] = {}
         should_validate = (epoch + 1) % args.val_interval == 0 or epoch + 1 == args.epochs
         if should_validate:
             if distributed_active():
                 for tensor in ema.module.state_dict().values():
                     dist.broadcast(tensor, src=0)
-            validation_metrics = validate(
-                ema.module,
-                val_loader,
-                device,
-                args,
-                criterion,
-            )
+            validation_metrics = validate(ema.module, val_loader, device, args)
             fixed = validation_metrics["fixed_road_iou"]
             calibrated = validation_metrics["calibrated_road_iou"]
             fixed_improved, calibrated_improved = fixed > best_fixed, calibrated > best_calibrated
             best_fixed, best_calibrated = max(best_fixed, fixed), max(best_calibrated, calibrated)
-            # Train and validation now use the exact same BCE + clDice objective,
-            # so their loss curves are directly comparable for overfitting.
             rank_zero_print(
                 f"train loss={train_metrics['total']:.5f} | "
-                f"val loss={validation_metrics['val_loss']:.5f} "
-                f"(bce={validation_metrics['val_loss_bce']:.4f} "
-                f"cldice={validation_metrics['val_loss_cldice']:.4f}) | "
                 f"throughput={train_metrics['images_per_second']:.1f} img/s | "
                 f"fixed@.50 road IoU={fixed:.5f} | "
                 f"calibrated road IoU={calibrated:.5f} "
                 f"@{validation_metrics['calibrated_threshold']:.2f} | "
                 f"F1={validation_metrics['fixed_f1']:.5f} | "
-                f"gates s2d/d2s="
+                f"gates s2d/d2s/ctx/final="
                 f"{gate_metrics['semantic_to_detail_abs_mean']:.3f}/"
-                f"{gate_metrics['detail_to_semantic_abs_mean']:.3f}"
-                " ctx/final="
-                f"{gate_metrics.get('s32_context_to_s16_spatial_mean', gate_metrics.get('s32_context_to_s16_abs_mean', float('nan'))):.3f}/"
-                f"{gate_metrics.get('semantic_to_final_spatial_mean', gate_metrics.get('semantic_to_final_abs_mean', float('nan'))):.3f}"
+                f"{gate_metrics['detail_to_semantic_abs_mean']:.3f}/"
+                f"{gate_metrics['s32_context_to_s16_abs_mean']:.3f}/"
+                f"{gate_metrics['semantic_to_final_abs_mean']:.3f}"
                 + (
                     " | spatial mean s2d/d2s="
                     f"{gate_metrics['semantic_to_detail_spatial_mean']:.3f}/"
@@ -2350,21 +1893,6 @@ def main() -> None:
                     if args.bilateral_fusion == "spatial"
                     else ""
                 )
-            )
-            # DEBUG: calibration / confusion diagnostics, printed every
-            # validation epoch so under-confidence vs. genuine confusion is
-            # visible without post-hoc log parsing.
-            rank_zero_print(
-                "  [debug] precision/recall(fixed)="
-                f"{validation_metrics['fixed_precision']:.4f}/"
-                f"{validation_metrics['fixed_recall']:.4f} | "
-                f"relaxed_f1={validation_metrics['fixed_relaxed_f1']:.4f} | "
-                f"mean_prob(road/bg)="
-                f"{validation_metrics['mean_probability_on_road']:.4f}/"
-                f"{validation_metrics['mean_probability_on_background']:.4f} | "
-                f"pred_road_frac/true_road_frac="
-                f"{validation_metrics['predicted_road_fraction']:.4f}/"
-                f"{validation_metrics['true_road_fraction']:.4f}"
             )
             if is_main_process():
                 state = checkpoint_state(
