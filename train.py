@@ -1102,7 +1102,7 @@ def train_one_epoch(
         name: RunningAverage()
         for name in (
             "total",
-            "main_ce",
+            "main_bce",
             "main_dice",
             "cldice",
             "orientation",
@@ -1183,7 +1183,7 @@ def train_one_epoch(
         metric_values = torch.stack(
             (
                 losses["loss_total"].detach(),
-                losses["loss_main_ce"],
+                losses["loss_main_bce"],
                 losses["loss_main_dice"],
                 losses["loss_cldice"],
                 losses["loss_aux_orientation"],
@@ -1194,7 +1194,7 @@ def train_one_epoch(
         for name, value in zip(
             (
                 "total",
-                "main_ce",
+                "main_bce",
                 "main_dice",
                 "cldice",
                 "orientation",
@@ -1428,17 +1428,22 @@ def validate(
         relaxed = relaxed_components(
             prediction[0], target[0], args.relaxed_buffer_px
         )
-        # DEBUG: main-loss-only (CE + Dice) validation loss, for comparing
+        # DEBUG: main-loss-only (BCE + Dice) validation loss, for comparing
         # against train_metrics["total"] to spot overfitting. The orientation
         # auxiliary term is excluded because RoadReconstructionDecoder only
         # returns OrientedSkipAggregation's prediction in training mode
         # (self.training), and running the model in train() mode here would
         # corrupt BatchNorm running stats / enable dropout -- not an
-        # acceptable trade for one extra loss term.
+        # acceptable trade for one extra loss term. clDice is excluded for
+        # the same reason plain Dice (not the training criterion's blend) is
+        # used here: this is a cheap approximate sanity check, not a full
+        # mirror of the training objective.
         labels = target.long()
-        class_weights = logits.new_tensor([1.0, road_class_weight])
-        loss_main_ce = F.cross_entropy(
-            logits.float(), labels, weight=class_weights
+        road_logit = logits.float()[:, 1] - logits.float()[:, 0]
+        loss_main_bce = F.binary_cross_entropy_with_logits(
+            road_logit,
+            labels.float(),
+            pos_weight=logits.new_tensor(road_class_weight),
         )
         loss_main_dice = binary_dice_loss(
             probability.unsqueeze(1), labels.unsqueeze(1).float()
@@ -1446,7 +1451,7 @@ def validate(
         totals += totals.new_tensor(
             [
                 tp, fp, fn, tn, per_image_iou, 1.0, *relaxed,
-                float(loss_main_ce.detach()), float(loss_main_dice.detach()),
+                float(loss_main_bce.detach()), float(loss_main_dice.detach()),
             ]
         )
         positive, negative = histogram_counts(probability, target, bins)
@@ -1511,10 +1516,10 @@ def validate(
     metrics["calibrated_threshold"] = float(best_threshold)
 
     image_count = max(float(totals[5]), 1.0)
-    metrics["val_loss_main_ce"] = float(totals[10] / image_count)
+    metrics["val_loss_main_bce"] = float(totals[10] / image_count)
     metrics["val_loss_main_dice"] = float(totals[11] / image_count)
     metrics["val_loss_main"] = (
-        metrics["val_loss_main_ce"]
+        metrics["val_loss_main_bce"]
         + float(main_dice_weight) * metrics["val_loss_main_dice"]
     )
     return metrics
@@ -1871,17 +1876,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cldice_weight",
         type=float,
-        default=0.5,
+        default=1.0,
         help=(
             "Blend factor for soft_cldice_loss against plain Dice within the "
-            "shape term (0.0 = pure Dice as before, 1.0 = pure clDice). "
+            "shape term (0.0 = pure Dice, 1.0 = pure clDice -- the default). "
             "clDice (Shit et al., CVPR 2021) scores overlap on each side's "
             "soft skeleton instead of the whole road area, so it penalizes a "
             "broken road connection much more than Dice does for the same "
-            "pixel count. Blended rather than a straight swap because "
-            "clDice's skeleton-sum denominators are near zero (noisy "
-            "gradient) before the model predicts any road at all, which "
-            "plain Dice does not suffer from."
+            "pixel count. Lower this (down to 0.0) if pure clDice proves "
+            "unstable early in a run: its skeleton-sum denominators are "
+            "near zero (noisy gradient) before the model predicts any road "
+            "at all, which plain Dice does not suffer from."
         ),
     )
     parser.add_argument(
@@ -2159,7 +2164,7 @@ def main() -> None:
         imbalance = float("nan")
         road_weight = float(args.fixed_road_weight)
         rank_zero_print(
-            f"[startup 3/5] Skipping mask scan; fixed road CE weight="
+            f"[startup 3/5] Skipping mask scan; fixed road BCE pos_weight="
             f"{road_weight:.3f}"
         )
 
@@ -2253,10 +2258,10 @@ def main() -> None:
     )
     rank_zero_print(
         f"parameters={total_parameters:,} | imbalance={imbalance:.3f} | "
-        f"road CE weight={road_weight:.3f}"
+        f"road BCE pos_weight={road_weight:.3f}"
     )
     rank_zero_print(
-        "loss=weighted CE + "
+        "loss=weighted BCE + "
         + (
             f"{1.0 - args.cldice_weight:.2f}*Dice+{args.cldice_weight:.2f}*clDice"
             f"(iter={args.cldice_iterations})"
@@ -2315,7 +2320,7 @@ def main() -> None:
             )
             rank_zero_print(
                 f"  [debug] train_loss={train_metrics['total']:.5f} "
-                f"(ce={train_metrics['main_ce']:.4f} "
+                f"(bce={train_metrics['main_bce']:.4f} "
                 f"dice={train_metrics['main_dice']:.4f} "
                 f"cldice={train_metrics['cldice']:.4f} "
                 f"orientation={train_metrics['orientation']:.4f}) | "
@@ -2374,15 +2379,15 @@ def main() -> None:
             calibrated = validation_metrics["calibrated_road_iou"]
             fixed_improved, calibrated_improved = fixed > best_fixed, calibrated > best_calibrated
             best_fixed, best_calibrated = max(best_fixed, fixed), max(best_calibrated, calibrated)
-            # DEBUG: train vs. val main loss (CE+Dice; train loss below also
-            # includes the orientation term, val_loss_main does not -- see
-            # its computation site in validate() for why it can't). A train
-            # loss that keeps falling while val_loss_main flattens or rises
-            # is the overfitting signal to watch for.
+            # DEBUG: train vs. val main loss (BCE+Dice; train loss below also
+            # includes clDice and the orientation term, val_loss_main does
+            # not -- see its computation site in validate() for why it
+            # can't). A train loss that keeps falling while val_loss_main
+            # flattens or rises is the overfitting signal to watch for.
             rank_zero_print(
                 f"train loss={train_metrics['total']:.5f} | "
                 f"val loss={validation_metrics['val_loss_main']:.5f} "
-                f"(ce={validation_metrics['val_loss_main_ce']:.4f} "
+                f"(bce={validation_metrics['val_loss_main_bce']:.4f} "
                 f"dice={validation_metrics['val_loss_main_dice']:.4f}) | "
                 f"throughput={train_metrics['images_per_second']:.1f} img/s | "
                 f"fixed@.50 road IoU={fixed:.5f} | "

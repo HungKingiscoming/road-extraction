@@ -785,7 +785,7 @@ def soft_cldice_loss(
 
 
 class RoadSegOrientationLoss(nn.Module):
-    """Road objective: weighted CE + (Dice/clDice blend) + road-orientation supervision.
+    """Road objective: weighted BCE + clDice (default) + road-orientation supervision.
 
     The orientation term supervises both OrientedSkipAggregation stages'
     OrientHead (S4 and S2) against ``structure_tensor_angle`` of the
@@ -802,13 +802,21 @@ class RoadSegOrientationLoss(nn.Module):
     (plain SkipFeatureGate, no direction to supervise), ``outputs[0]``'s
     entries are ``None`` and this term is simply zero.
 
-    The shape term blends plain Dice with ``soft_cldice_loss`` (see its
-    docstring) rather than switching outright: clDice alone divides by each
-    side's skeleton sum, which can be near-zero (and its gradient
-    correspondingly noisy) before the model has learned to predict any road
-    at all, whereas Dice is well-behaved from step one. ``cldice_weight=1.0``
-    recovers pure clDice once training is stable enough to try it;
-    ``cldice_weight=0.0`` recovers the original plain-Dice behavior.
+    The classification term is BCE-with-logits on the road/background logit
+    difference with ``pos_weight=road_class_weight`` -- mathematically
+    identical to the previous 2-class weighted cross-entropy (softmax CE on
+    two logits reduces exactly to BCE on their difference), kept as BCE
+    because that is the convention road-extraction literature (D-LinkNet,
+    CRNet) actually uses, and it reads directly as "one road/not-road logit"
+    rather than a 2-way classification.
+
+    The shape term defaults to pure clDice (``cldice_weight=1.0``) rather
+    than Dice, but the blend with plain Dice remains available:
+    ``soft_cldice_loss``'s skeleton-sum denominators are near-zero (noisy
+    gradient) before the model predicts any road at all, whereas Dice is
+    well-behaved from step one -- lower ``cldice_weight`` (down to 0.0 for
+    the original plain-Dice behavior) if pure clDice proves unstable early
+    in a given run.
     """
 
     def __init__(
@@ -816,7 +824,7 @@ class RoadSegOrientationLoss(nn.Module):
         road_class_weight: float = 2.0,
         main_dice_weight: float = 1.0,
         aux_weight: float = 0.15,
-        cldice_weight: float = 0.5,
+        cldice_weight: float = 1.0,
         cldice_iterations: int = 10,
     ) -> None:
         super().__init__()
@@ -850,9 +858,16 @@ class RoadSegOrientationLoss(nn.Module):
         orientations, road_logits = outputs
         labels = (target > 0).long()
         road_mask = labels.unsqueeze(1).float()
-        class_weights = road_logits.new_tensor([1.0, self.road_class_weight])
-        loss_main_ce = F.cross_entropy(
-            road_logits.float(), labels, weight=class_weights
+        # softmax 2-class CE on (l0, l1) reduces exactly to BCE on (l1 - l0):
+        # -log(softmax(l)[y]) = -log(sigmoid(l1-l0)) for y=1 and
+        # -log(1-sigmoid(l1-l0)) for y=0, and pos_weight scales only the y=1
+        # term the same way cross_entropy's per-class `weight` does. Same
+        # loss value as before, just named/framed as literature convention.
+        road_logit = road_logits.float()[:, 1] - road_logits.float()[:, 0]
+        loss_main_bce = F.binary_cross_entropy_with_logits(
+            road_logit,
+            road_mask[:, 0],
+            pos_weight=road_logits.new_tensor(self.road_class_weight),
         )
         road_probability = road_logits.float().softmax(dim=1)[:, 1:2]
         loss_main_dice = binary_dice_loss(road_probability, road_mask)
@@ -883,13 +898,13 @@ class RoadSegOrientationLoss(nn.Module):
         )
 
         total = (
-            loss_main_ce
+            loss_main_bce
             + self.main_dice_weight * loss_shape
             + self.aux_weight * loss_orientation
         )
         return {
             "loss_total": total,
-            "loss_main_ce": loss_main_ce.detach(),
+            "loss_main_bce": loss_main_bce.detach(),
             "loss_main_dice": loss_main_dice.detach(),
             "loss_cldice": loss_cldice.detach(),
             "loss_aux_orientation": loss_orientation.detach(),

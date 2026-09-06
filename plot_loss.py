@@ -2,7 +2,7 @@
 
 Reads the metrics.jsonl produced by train.py (one JSON record per epoch,
 with "train" and "validation" sub-dicts) and renders a two-panel PNG:
-top panel is train loss vs. val_loss_main (CE+Dice on the native-resolution
+top panel is train loss vs. val_loss_main (BCE+Dice on the native-resolution
 validation set), bottom panel is calibrated road IoU for context.
 
 val_loss_main intentionally excludes the centerline auxiliary term that
