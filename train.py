@@ -28,7 +28,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
-from modeling.decoder import RoadSegOrientationLoss, binary_dice_loss
+from modeling.decoder import RoadSegBCEClDiceLoss
 from modeling.model import DualBranchRoadNet, build_model
 
 
@@ -488,8 +488,7 @@ def rotate_pair(
 
     Roads in satellite imagery have no preferred orientation, but the
     existing augmentation only ever shows the model 8 discrete angles (4
-    rot90 steps x horizontal flip). That under-covers what OrientHead /
-    structure_tensor_angle is meant to generalize across, since they predict
+    rot90 steps x horizontal flip). That under-covers what DirectionHead is meant to generalize across, since they predict
     a continuous double-angle direction. A plain ``Image.rotate`` would fill
     the corners it exposes with a constant color and, worse, fill the mask
     corners with 0 (background) -- fabricated labels the model would
@@ -1075,7 +1074,7 @@ def train_one_epoch(
     model: nn.Module,
     ema: ModelEMA,
     loader: DataLoader,
-    criterion: RoadSegOrientationLoss,
+    criterion: RoadSegBCEClDiceLoss,
     optimizer: torch.optim.Optimizer,
     scheduler: LambdaLR,
     scaler,
@@ -1087,25 +1086,12 @@ def train_one_epoch(
     model.train()
     base_model = unwrap_model(model)
     base_model.enforce_frozen_norm_eval(args.freeze_encoder_bn)
-    if epoch < args.aux_start_epoch:
-        aux_scale = 0.0
-    elif args.aux_warmup_epochs:
-        aux_scale = min(
-            1.0,
-            (epoch - args.aux_start_epoch + 1) / args.aux_warmup_epochs,
-        )
-    else:
-        aux_scale = 1.0
-    criterion.aux_weight = args.aux_weight * aux_scale
-
     meters = {
         name: RunningAverage()
         for name in (
             "total",
-            "main_bce",
-            "main_dice",
+            "bce",
             "cldice",
-            "orientation",
             "road_fraction",
             "pred_road_fraction",  # DEBUG: mean predicted road probability
             "grad_norm_total",  # DEBUG: global clipped grad norm
@@ -1183,10 +1169,8 @@ def train_one_epoch(
         metric_values = torch.stack(
             (
                 losses["loss_total"].detach(),
-                losses["loss_main_bce"],
-                losses["loss_main_dice"],
+                losses["loss_bce"],
                 losses["loss_cldice"],
-                losses["loss_aux_orientation"],
                 (masks > 0).float().mean(),
                 pred_road_fraction,
             )
@@ -1194,10 +1178,8 @@ def train_one_epoch(
         for name, value in zip(
             (
                 "total",
-                "main_bce",
-                "main_dice",
+                "bce",
                 "cldice",
-                "orientation",
                 "road_fraction",
                 "pred_road_fraction",
             ),
@@ -1211,8 +1193,9 @@ def train_one_epoch(
                     meters[f"grad_norm_{bucket}"].update(value, 1)
         progress.set_postfix(
             loss=f"{meters['total'].mean:.4f}",
+            bce=f"{meters['bce'].mean:.3f}",
+            cldice=f"{meters['cldice'].mean:.3f}",
             lr=f"{head_lr(optimizer):.2e}",
-            aux=f"{criterion.aux_weight:.3f}",
             gnorm=f"{meters['grad_norm_total'].mean:.2f}",
         )
 
@@ -1234,7 +1217,6 @@ def train_one_epoch(
     result = {name: meter.mean for name, meter in meters.items()} | {
         "lr": head_lr(optimizer),
         "group_lrs": group_lrs(optimizer),  # DEBUG
-        "aux_weight": criterion.aux_weight,
         "successful_updates": float(successful_updates),
         "skipped_nonfinite": float(skipped_nonfinite),
         "seconds": elapsed,
@@ -1385,20 +1367,20 @@ def validate(
     loader: DataLoader,
     device: torch.device,
     args: argparse.Namespace,
-    road_class_weight: float,
-    main_dice_weight: float,
+    criterion: RoadSegBCEClDiceLoss,
 ) -> Dict[str, float]:
+    """Native sliding-window validation using the exact training objective.
+
+    Validation loss is the same weighted BCE + clDice used during training;
+    no Dice or orientation auxiliary term is computed.
+    """
     model.eval()
     bins = args.threshold_bins
     positive_hist = torch.zeros(bins, dtype=torch.int64, device=device)
     negative_hist = torch.zeros(bins, dtype=torch.int64, device=device)
-    # Slots 0-9 are the pre-existing confusion/relaxed/count accumulators;
-    # 10-11 are the running main-loss sums added for train/val overfitting
-    # comparison (see val_loss_main below). Appending at the end keeps every
-    # existing totals[...] index below unchanged.
-    totals = torch.zeros(12, dtype=torch.float64, device=device)
-    # DEBUG: probability-mass diagnostics to separate "under-confident" from
-    # "wrong" predictions -- summed then normalized after the loop.
+    # 0-9: confusion / relaxed-overlap accumulators.
+    # 10-12: loss_total, BCE, clDice summed per validation image.
+    totals = torch.zeros(13, dtype=torch.float64, device=device)
     probability_sum_on_road = torch.zeros((), dtype=torch.float64, device=device)
     probability_sum_on_background = torch.zeros((), dtype=torch.float64, device=device)
     road_pixel_count = torch.zeros((), dtype=torch.float64, device=device)
@@ -1428,30 +1410,16 @@ def validate(
         relaxed = relaxed_components(
             prediction[0], target[0], args.relaxed_buffer_px
         )
-        # DEBUG: main-loss-only (BCE + Dice) validation loss, for comparing
-        # against train_metrics["total"] to spot overfitting. The orientation
-        # auxiliary term is excluded because RoadReconstructionDecoder only
-        # returns OrientedSkipAggregation's prediction in training mode
-        # (self.training), and running the model in train() mode here would
-        # corrupt BatchNorm running stats / enable dropout -- not an
-        # acceptable trade for one extra loss term. clDice is excluded for
-        # the same reason plain Dice (not the training criterion's blend) is
-        # used here: this is a cheap approximate sanity check, not a full
-        # mirror of the training objective.
-        labels = target.long()
-        road_logit = logits.float()[:, 1] - logits.float()[:, 0]
-        loss_main_bce = F.binary_cross_entropy_with_logits(
-            road_logit,
-            labels.float(),
-            pos_weight=logits.new_tensor(road_class_weight),
-        )
-        loss_main_dice = binary_dice_loss(
-            probability.unsqueeze(1), labels.unsqueeze(1).float()
-        )
+
+        # Exact same objective as training. RoadSegBCEClDiceLoss accepts logits
+        # directly and internally converts the binary target consistently.
+        losses = criterion(logits, masks)
         totals += totals.new_tensor(
             [
                 tp, fp, fn, tn, per_image_iou, 1.0, *relaxed,
-                float(loss_main_bce.detach()), float(loss_main_dice.detach()),
+                float(losses["loss_total"].detach()),
+                float(losses["loss_bce"]),
+                float(losses["loss_cldice"]),
             ]
         )
         positive, negative = histogram_counts(probability, target, bins)
@@ -1474,18 +1442,21 @@ def validate(
             background_pixel_count,
         ):
             dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+
     tp, fp, fn, tn = (int(value) for value in totals[:4].tolist())
-    metrics = {f"fixed_{key}": value for key, value in metrics_from_counts(tp, fp, fn, tn).items()}
-    metrics["fixed_road_iou_macro"] = float(totals[4] / max(float(totals[5]), 1.0))
+    metrics = {
+        f"fixed_{key}": value
+        for key, value in metrics_from_counts(tp, fp, fn, tn).items()
+    }
+    metrics["fixed_road_iou_macro"] = float(
+        totals[4] / max(float(totals[5]), 1.0)
+    )
     relaxed_precision = float(totals[6] / max(float(totals[8]), 1.0))
     relaxed_recall = float(totals[7] / max(float(totals[9]), 1.0))
-    metrics["fixed_relaxed_f1"] = 2.0 * relaxed_precision * relaxed_recall / max(
-        relaxed_precision + relaxed_recall, 1e-12
+    metrics["fixed_relaxed_f1"] = (
+        2.0 * relaxed_precision * relaxed_recall
+        / max(relaxed_precision + relaxed_recall, 1e-12)
     )
-    # DEBUG: mean predicted probability, split by true class. A model that is
-    # merely under-confident (mean prob on road pixels well below 0.5, but
-    # separated from background) benefits from threshold calibration; a
-    # model that is genuinely confused has both means close together.
     metrics["mean_probability_on_road"] = float(
         probability_sum_on_road / road_pixel_count.clamp_min(1.0)
     )
@@ -1516,12 +1487,9 @@ def validate(
     metrics["calibrated_threshold"] = float(best_threshold)
 
     image_count = max(float(totals[5]), 1.0)
-    metrics["val_loss_main_bce"] = float(totals[10] / image_count)
-    metrics["val_loss_main_dice"] = float(totals[11] / image_count)
-    metrics["val_loss_main"] = (
-        metrics["val_loss_main_bce"]
-        + float(main_dice_weight) * metrics["val_loss_main_dice"]
-    )
+    metrics["val_loss"] = float(totals[10] / image_count)
+    metrics["val_loss_bce"] = float(totals[11] / image_count)
+    metrics["val_loss_cldice"] = float(totals[12] / image_count)
     return metrics
 
 
@@ -1727,11 +1695,10 @@ def parse_args() -> argparse.Namespace:
         default=0.5,
         help=(
             "Probability of an additional continuous-angle rotation on top "
-            "of the existing flip/rot90 augmentation. The existing "
-            "augmentation only ever shows 8 discrete angles; roads have no "
-            "preferred orientation, and OrientHead/structure_tensor_angle "
-            "are trained to predict a continuous direction, so this closes "
-            "that gap. Reflect-padded before rotating so corners are never "
+            "of the existing flip/rot90 augmentation. Roads in satellite "
+            "imagery have no preferred orientation, so continuous rotations "
+            "help the self-learned DirectionHead generalize beyond the 8 "
+            "discrete flip/rot90 orientations. Reflect-padding keeps corners "
             "a fabricated constant/background border (see rotate_pair)."
         ),
     )
@@ -1792,12 +1759,10 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Use OrientedSkipAggregation (road-direction-steered context "
-            "aggregation, direction learned + supervised via "
-            "RoadSegOrientationLoss) for the S4/S2 skip connections instead "
-            "of SkipFeatureGate (channel/spatial SE-style gate, no "
-            "orientation loss). --no-oriented_skip restores SkipFeatureGate "
-            "for comparison."
+            "Use OrientedSkipAggregation for S4/S2 skip connections. Road "
+            "direction is learned end-to-end only from BCE + clDice; there is "
+            "no orientation target or auxiliary loss. --no-oriented_skip "
+            "restores SkipFeatureGate for an ablation."
         ),
     )
     parser.add_argument(
@@ -1872,40 +1837,30 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Positive value skips the startup mask scan and uses this CE weight",
     )
-    parser.add_argument("--main_dice_weight", type=float, default=1.0)
+    parser.add_argument(
+        "--bce_weight",
+        type=float,
+        default=1.0,
+        help="Direct multiplier for weighted BCE in the two-loss objective.",
+    )
     parser.add_argument(
         "--cldice_weight",
         type=float,
         default=1.0,
         help=(
-            "Blend factor for soft_cldice_loss against plain Dice within the "
-            "shape term (0.0 = pure Dice, 1.0 = pure clDice -- the default). "
-            "clDice (Shit et al., CVPR 2021) scores overlap on each side's "
-            "soft skeleton instead of the whole road area, so it penalizes a "
-            "broken road connection much more than Dice does for the same "
-            "pixel count. Lower this (down to 0.0) if pure clDice proves "
-            "unstable early in a run: its skeleton-sum denominators are "
-            "near zero (noisy gradient) before the model predicts any road "
-            "at all, which plain Dice does not suffer from."
+            "Direct multiplier for topology-preserving clDice. This is no longer "
+            "a Dice/clDice blend factor because plain Dice has been removed."
         ),
     )
     parser.add_argument(
         "--cldice_iterations",
         type=int,
         default=10,
-        help="Soft-skeletonization erosion steps for --cldice_weight > 0. "
-        "Should roughly match the widest road's half-width in pixels at "
-        "output resolution; too few under-skeletonizes wide roads, too many "
-        "adds unnecessary compute.",
+        help=(
+            "Soft-skeletonization erosion steps for clDice. Should roughly "
+            "cover the widest road half-width in pixels at output resolution."
+        ),
     )
-    parser.add_argument("--aux_weight", type=float, default=0.15)
-    parser.add_argument(
-        "--aux_start_epoch",
-        type=int,
-        default=5,
-        help="Keep orientation supervision off before this zero-based epoch",
-    )
-    parser.add_argument("--aux_warmup_epochs", type=int, default=5)
 
     parser.add_argument(
         "--progressive_unfreeze",
@@ -2039,15 +1994,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("rotation_probability must be in [0, 1]")
     if args.rotation_max_degrees < 0.0:
         raise ValueError("rotation_max_degrees cannot be negative")
-    if not 0.0 <= args.cldice_weight <= 1.0:
-        raise ValueError("cldice_weight must be in [0, 1]")
+    if args.bce_weight <= 0.0:
+        raise ValueError("bce_weight must be positive")
+    if args.cldice_weight <= 0.0:
+        raise ValueError("cldice_weight must be positive")
     if args.cldice_iterations < 1:
         raise ValueError("cldice_iterations must be positive")
-    for name in ("aux_weight",):
-        if getattr(args, name) < 0.0:
-            raise ValueError(f"{name} cannot be negative")
-    if args.aux_start_epoch < 0 or args.aux_warmup_epochs < 0:
-        raise ValueError("Centerline start/warmup epochs cannot be negative")
     if args.progressive_unfreeze:
         epochs = (
             args.unfreeze_dual_branch_epoch,
@@ -2203,10 +2155,9 @@ def main() -> None:
     scheduler = build_scheduler(optimizer, updates_per_epoch, args)
     scaler = make_grad_scaler(args.use_amp)
     ema = ModelEMA(model, args.ema_decay)
-    criterion = RoadSegOrientationLoss(
+    criterion = RoadSegBCEClDiceLoss(
         road_class_weight=road_weight,
-        main_dice_weight=args.main_dice_weight,
-        aux_weight=args.aux_weight,
+        bce_weight=args.bce_weight,
         cldice_weight=args.cldice_weight,
         cldice_iterations=args.cldice_iterations,
     ).to(device)
@@ -2254,27 +2205,16 @@ def main() -> None:
     )
     rank_zero_print(
         f"bilateral fusion={args.bilateral_fusion} | "
-        "loss and directional decoder unchanged"
+        "directional decoder learned end-to-end from segmentation loss"
     )
     rank_zero_print(
         f"parameters={total_parameters:,} | imbalance={imbalance:.3f} | "
         f"road BCE pos_weight={road_weight:.3f}"
     )
     rank_zero_print(
-        "loss=weighted BCE + "
-        + (
-            f"{1.0 - args.cldice_weight:.2f}*Dice+{args.cldice_weight:.2f}*clDice"
-            f"(iter={args.cldice_iterations})"
-            if args.cldice_weight > 0.0
-            else "Dice"
-        )
-        + (
-            " + road-orientation supervision (S4+S2 OrientedSkipAggregation)"
-            if args.oriented_skip
-            else ""
-        )
-        + f" (aux max={args.aux_weight:.2f}, starts epoch "
-        f"{args.aux_start_epoch + 1})"
+        f"loss={args.bce_weight:.2f}*weighted BCE + "
+        f"{args.cldice_weight:.2f}*clDice(iter={args.cldice_iterations}); "
+        "no Dice, no orientation/centerline auxiliary loss"
     )
     rank_zero_print(
         f"progressive_unfreeze={args.progressive_unfreeze} | "
@@ -2320,10 +2260,8 @@ def main() -> None:
             )
             rank_zero_print(
                 f"  [debug] train_loss={train_metrics['total']:.5f} "
-                f"(bce={train_metrics['main_bce']:.4f} "
-                f"dice={train_metrics['main_dice']:.4f} "
-                f"cldice={train_metrics['cldice']:.4f} "
-                f"orientation={train_metrics['orientation']:.4f}) | "
+                f"(bce={train_metrics['bce']:.4f} "
+                f"cldice={train_metrics['cldice']:.4f}) | "
                 f"pred_road_frac={train_metrics['pred_road_fraction']:.4f} "
                 f"true_road_frac={train_metrics['road_fraction']:.4f} | "
                 f"skipped_nonfinite={int(train_metrics['skipped_nonfinite'])}"
@@ -2372,23 +2310,19 @@ def main() -> None:
                 val_loader,
                 device,
                 args,
-                criterion.road_class_weight,
-                criterion.main_dice_weight,
+                criterion,
             )
             fixed = validation_metrics["fixed_road_iou"]
             calibrated = validation_metrics["calibrated_road_iou"]
             fixed_improved, calibrated_improved = fixed > best_fixed, calibrated > best_calibrated
             best_fixed, best_calibrated = max(best_fixed, fixed), max(best_calibrated, calibrated)
-            # DEBUG: train vs. val main loss (BCE+Dice; train loss below also
-            # includes clDice and the orientation term, val_loss_main does
-            # not -- see its computation site in validate() for why it
-            # can't). A train loss that keeps falling while val_loss_main
-            # flattens or rises is the overfitting signal to watch for.
+            # Train and validation now use the exact same BCE + clDice objective,
+            # so their loss curves are directly comparable for overfitting.
             rank_zero_print(
                 f"train loss={train_metrics['total']:.5f} | "
-                f"val loss={validation_metrics['val_loss_main']:.5f} "
-                f"(bce={validation_metrics['val_loss_main_bce']:.4f} "
-                f"dice={validation_metrics['val_loss_main_dice']:.4f}) | "
+                f"val loss={validation_metrics['val_loss']:.5f} "
+                f"(bce={validation_metrics['val_loss_bce']:.4f} "
+                f"cldice={validation_metrics['val_loss_cldice']:.4f}) | "
                 f"throughput={train_metrics['images_per_second']:.1f} img/s | "
                 f"fixed@.50 road IoU={fixed:.5f} | "
                 f"calibrated road IoU={calibrated:.5f} "
