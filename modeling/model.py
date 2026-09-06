@@ -179,9 +179,15 @@ class ControlledRoadFusion(nn.Module):
 
     The two branches are normalized independently and concatenated so their
     channel identities are not destroyed by an element-wise sum.  The detail
-    stream is the residual anchor; a small learnable per-channel scale lets
-    semantic information enter gradually.  One directional RepDepthwise block
-    refines the fused road geometry and is deployable as a single DW 5x5 conv.
+    stream is the residual anchor; a spatial gate (see ``ResidualSpatialGate``)
+    lets semantic information enter gradually and with per-pixel strength --
+    e.g. strongly along predicted road pixels, weakly over background --
+    rather than a single scalar that must trade off both uniformly. A
+    trained checkpoint's ``gate_statistics()`` showed the previous
+    per-channel ``fusion_scale`` (init 0.10) only reached ~0.30 after 150
+    epochs: capped by needing one strength for the whole image. One
+    directional RepDepthwise block refines the fused road geometry and is
+    deployable as a single DW 5x5 conv.
     """
 
     def __init__(
@@ -200,8 +206,8 @@ class ControlledRoadFusion(nn.Module):
             padding=0,
             activation=False,
         )
-        self.fusion_scale = nn.Parameter(
-            torch.full((1, channels, 1, 1), 0.10)
+        self.fusion_gate = ResidualSpatialGate(
+            channels, channels, hidden_channels=max(16, min(64, channels // 2))
         )
         self.refinement = nn.Sequential(
             *[
@@ -223,7 +229,8 @@ class ControlledRoadFusion(nn.Module):
                 dim=1,
             )
         )
-        fused = self.activation(detail + self.fusion_scale * mixed)
+        gate = self.fusion_gate(detail, mixed)
+        fused = self.activation(detail + gate * mixed)
         return self.refinement(fused)
 
 
@@ -349,16 +356,23 @@ class DualResolutionContext(nn.Module):
             512, semantic_channels, 1, padding=0
         )
 
-        # The only bilateral exchange: semantic S16 <-> detail S8.
-        self.semantic_to_detail_1 = ConvBNAct(
-            256, detail_channels, 1, padding=0, activation=False
+        # The only bilateral exchange: semantic S16 <-> detail S8. Each
+        # projection is two conv layers (one nonlinear, one linear) rather
+        # than a single linear 1x1/3x3 -- the exchanged signal itself gets a
+        # chance to be a nontrivial spatial transform of the source branch,
+        # not just a channel remap, before the gate below decides how much
+        # of it to use.
+        self.semantic_to_detail_1 = nn.Sequential(
+            ConvBNAct(256, detail_channels, 1, padding=0, activation=True),
+            ConvBNAct(
+                detail_channels, detail_channels, 3, padding=1, activation=False
+            ),
         )
-        self.detail_to_semantic_1 = ConvBNAct(
-            detail_channels,
-            256,
-            3,
-            stride=2,
-            activation=False,
+        self.detail_to_semantic_1 = nn.Sequential(
+            ConvBNAct(
+                detail_channels, 256, 3, stride=2, padding=1, activation=True
+            ),
+            ConvBNAct(256, 256, 3, padding=1, activation=False),
         )
 
         # Cross-resolution exchange is residual and initially conservative.
@@ -390,14 +404,20 @@ class DualResolutionContext(nn.Module):
         self.context_block = DilatedContextBlock(
             semantic_channels, dilations=context_dilations
         )
-        self.context_to_s16 = ConvBNAct(
-            semantic_channels,
-            256,
-            1,
-            padding=0,
-            activation=False,
+        self.context_to_s16 = nn.Sequential(
+            ConvBNAct(semantic_channels, 256, 1, padding=0, activation=True),
+            ConvBNAct(256, 256, 3, padding=1, activation=False),
         )
-        self.context_scale = nn.Parameter(torch.full((1, 256, 1, 1), 0.10))
+        # Spatial gate, not a per-channel scalar: a checkpoint's
+        # gate_statistics() showed the previous scalar (init 0.10) only
+        # reached ~0.11 after 79 epochs -- one strength applied to the whole
+        # S16 map has to trade off usefulness along roads against risk of
+        # disturbing background everywhere else, so it stays timid. Letting
+        # the gate vary per pixel (as ResidualSpatialGate already does for
+        # the S8<->S16 exchange above) removes that forced compromise.
+        self.context_spatial_gate = ResidualSpatialGate(
+            256, 256, hidden_channels=32
+        )
         self.semantic_to_fusion = ConvBNAct(
             256,
             detail_channels,
@@ -467,7 +487,8 @@ class DualResolutionContext(nn.Module):
         context_s16 = self._resize(
             self.context_to_s16(context_s32), semantic.shape[-2:]
         )
-        semantic = self.activation(semantic + self.context_scale * context_s16)
+        context_gate = self.context_spatial_gate(semantic, context_s16)
+        semantic = self.activation(semantic + context_gate * context_s16)
 
         semantic_s8 = self._resize(
             self.semantic_to_fusion(semantic), detail.shape[-2:]
@@ -477,14 +498,12 @@ class DualResolutionContext(nn.Module):
     @torch.no_grad()
     def gate_statistics(self) -> Dict[str, float]:
         """Small diagnostics showing whether each information route is used."""
-        gates = {
+        scalar_gates = {
             "semantic_to_detail": self.semantic_to_detail_scale_1,
             "detail_to_semantic": self.detail_to_semantic_scale_1,
-            "s32_context_to_s16": self.context_scale,
-            "semantic_to_final": self.final_fusion.fusion_scale,
         }
         statistics: Dict[str, float] = {}
-        for name, gate in gates.items():
+        for name, gate in scalar_gates.items():
             detached = gate.detach().float()
             statistics[f"{name}_abs_mean"] = float(detached.abs().mean().cpu())
             statistics[f"{name}_abs_max"] = float(detached.abs().max().cpu())
@@ -501,6 +520,22 @@ class DualResolutionContext(nn.Module):
             statistics["detail_to_semantic_spatial_std"] = float(
                 self.detail_to_semantic_spatial_gate_1.last_std.cpu()
             )
+        # s32_context_to_s16 and semantic_to_final were previously per-channel
+        # scalars; both are now ResidualSpatialGate (see class docstrings for
+        # why), so they report the same spatial mean/std diagnostics as the
+        # bilateral exchange above instead of an abs_mean/abs_max pair.
+        statistics["s32_context_to_s16_spatial_mean"] = float(
+            self.context_spatial_gate.last_mean.cpu()
+        )
+        statistics["s32_context_to_s16_spatial_std"] = float(
+            self.context_spatial_gate.last_std.cpu()
+        )
+        statistics["semantic_to_final_spatial_mean"] = float(
+            self.final_fusion.fusion_gate.last_mean.cpu()
+        )
+        statistics["semantic_to_final_spatial_std"] = float(
+            self.final_fusion.fusion_gate.last_std.cpu()
+        )
         return statistics
 
 
@@ -643,23 +678,26 @@ class DualBranchRoadNet(nn.Module):
         return trainable, total
 
     def optimization_modules(self) -> Dict[str, Iterable[nn.Parameter]]:
-        # These four are the small [1,C,1,1] residual-gate scales that
-        # control how much each cross-branch/cross-resolution pathway is
-        # allowed to contribute (semantic<->detail exchange, DAPPM-replacing
-        # context back into S16, final semantic->detail fusion) -- see
-        # gate_statistics(). Diagnosed on a trained checkpoint (epoch 79):
+        # These four control how much each cross-branch/cross-resolution
+        # pathway is allowed to contribute (semantic<->detail exchange,
+        # dilated-context back into S16, final semantic->detail fusion) --
+        # see gate_statistics(). Diagnosed on a trained checkpoint (epoch 79):
         # after the existing no-decay fix for broadcast scales
-        # (_is_broadcast_scale in train.py), context_scale had only moved
-        # from its 0.10 init to 0.1124 and detail_to_semantic_scale_1 from
-        # 0.0 to 0.0297 -- weight decay was already ruled out as the cause,
-        # so these four get their own LR bucket (see --gate_lr_factor) to
-        # test whether they are simply starved of gradient signal by their
-        # own small multiplicative scale, rather than genuinely unhelpful.
+        # (_is_broadcast_scale in train.py), the [1,C,1,1] scalar that used to
+        # gate context injection had only moved from its 0.10 init to 0.1124,
+        # and detail_to_semantic_scale_1 from 0.0 to 0.0297 -- weight decay
+        # was already ruled out as the cause, so these get their own LR
+        # bucket (see --gate_lr_factor) to test whether they are simply
+        # starved of gradient signal, rather than genuinely unhelpful. The
+        # context/final-fusion scalars were since replaced by
+        # ResidualSpatialGate submodules (per-pixel strength instead of one
+        # global number); every parameter of those two submodules is
+        # included here for the same reason the scalars were.
         gate_scale_ids = {
             id(self.dual_branch.semantic_to_detail_scale_1),
             id(self.dual_branch.detail_to_semantic_scale_1),
-            id(self.dual_branch.context_scale),
-            id(self.dual_branch.final_fusion.fusion_scale),
+            *(id(p) for p in self.dual_branch.context_spatial_gate.parameters()),
+            *(id(p) for p in self.dual_branch.final_fusion.fusion_gate.parameters()),
         }
         dual_branch_rest = (
             parameter

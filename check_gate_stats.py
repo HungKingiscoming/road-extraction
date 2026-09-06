@@ -1,11 +1,14 @@
-"""Print DualResolutionContext's learned gate scales from a trained checkpoint.
+"""Print DualResolutionContext's learned gate strengths from a trained checkpoint.
 
 Every cross-branch/cross-resolution path in the model (bilateral S8<->S16
-exchange, DAPPM context injected back into S16, final semantic->detail
-fusion) is a small, zero/near-zero-initialized residual gate. This prints how
-far each has actually grown from its init value after training, which is
-direct evidence of whether that pathway learned to contribute meaningfully
-or stayed suppressed.
+exchange, dilated-context injected back into S16, final semantic->detail
+fusion) is a residual gate. semantic_to_detail_scale_1/detail_to_semantic_
+scale_1 remain plain per-channel scalars; the other two routes (context
+injection, final fusion) were also plain scalars until a trained checkpoint's
+gate_statistics() showed them stuck near their init values, and are now
+ResidualSpatialGate instead (per-pixel strength, matching the existing
+bilateral gates) so this script now reports spatial mean/std for all four
+cross-branch routes except the two scalars.
 """
 
 import argparse
@@ -40,12 +43,12 @@ def main() -> None:
     print(f"oriented_skip={saved_args.get('oriented_skip')}  "
           f"epoch={checkpoint.get('epoch')}\n")
 
-    # Populate the spatial-gate last_mean/last_std buffers with one forward
-    # pass; without this they still hold their register_buffer init values
-    # (1.0 / 0.0) and would look identical to "gate never moved" even though
-    # it just never ran. Random noise input, so treat spatial numbers only as
-    # a rough sanity check -- the four scalar gates below need no forward
-    # pass and are the primary signal.
+    # Populate every ResidualSpatialGate's last_mean/last_std buffers with one
+    # forward pass; without this they still hold their register_buffer init
+    # values (1.0 / 0.0) and would look identical to "gate never moved" even
+    # though it just never ran. Random noise input, so treat spatial numbers
+    # only as a rough sanity check -- the two scalar gates below need no
+    # forward pass and are exact regardless.
     with torch.no_grad():
         dummy = torch.randn(1, 3, 512, 512)
         model(dummy)
@@ -54,8 +57,10 @@ def main() -> None:
     init_values = {
         "semantic_to_detail_abs_mean": 0.10,
         "detail_to_semantic_abs_mean": 0.0,
-        "s32_context_to_s16_abs_mean": 0.10,
-        "semantic_to_final_abs_mean": 0.10,
+        "semantic_to_detail_spatial_mean": 1.0,
+        "detail_to_semantic_spatial_mean": 1.0,
+        "s32_context_to_s16_spatial_mean": 1.0,
+        "semantic_to_final_spatial_mean": 1.0,
     }
     print(f"{'gate':38s}{'value':>10s}{'init':>10s}")
     for name, value in stats.items():

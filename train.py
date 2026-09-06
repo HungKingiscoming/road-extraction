@@ -2282,11 +2282,12 @@ def main() -> None:
                     f"{grad_norm_str}"
                 )
             rank_zero_print(
-                "  [debug] fusion gates s2d/d2s/ctx/final="
+                "  [debug] fusion gates s2d/d2s(scalar)="
                 f"{gate_metrics['semantic_to_detail_abs_mean']:.4f}/"
-                f"{gate_metrics['detail_to_semantic_abs_mean']:.4f}/"
-                f"{gate_metrics['s32_context_to_s16_abs_mean']:.4f}/"
-                f"{gate_metrics['semantic_to_final_abs_mean']:.4f}"
+                f"{gate_metrics['detail_to_semantic_abs_mean']:.4f}"
+                " | ctx/final(spatial mean)="
+                f"{gate_metrics['s32_context_to_s16_spatial_mean']:.4f}/"
+                f"{gate_metrics['semantic_to_final_spatial_mean']:.4f}"
                 + (
                     " | spatial mean(std) s2d/d2s="
                     f"{gate_metrics['semantic_to_detail_spatial_mean']:.4f}"
@@ -2340,11 +2341,12 @@ def main() -> None:
                 f"calibrated road IoU={calibrated:.5f} "
                 f"@{validation_metrics['calibrated_threshold']:.2f} | "
                 f"F1={validation_metrics['fixed_f1']:.5f} | "
-                f"gates s2d/d2s/ctx/final="
+                f"gates s2d/d2s(scalar)="
                 f"{gate_metrics['semantic_to_detail_abs_mean']:.3f}/"
-                f"{gate_metrics['detail_to_semantic_abs_mean']:.3f}/"
-                f"{gate_metrics['s32_context_to_s16_abs_mean']:.3f}/"
-                f"{gate_metrics['semantic_to_final_abs_mean']:.3f}"
+                f"{gate_metrics['detail_to_semantic_abs_mean']:.3f}"
+                " ctx/final(spatial)="
+                f"{gate_metrics['s32_context_to_s16_spatial_mean']:.3f}/"
+                f"{gate_metrics['semantic_to_final_spatial_mean']:.3f}"
                 + (
                     " | spatial mean s2d/d2s="
                     f"{gate_metrics['semantic_to_detail_spatial_mean']:.3f}/"
