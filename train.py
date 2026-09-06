@@ -1104,6 +1104,7 @@ def train_one_epoch(
             "total",
             "main_ce",
             "main_dice",
+            "cldice",
             "orientation",
             "road_fraction",
             "pred_road_fraction",  # DEBUG: mean predicted road probability
@@ -1184,13 +1185,22 @@ def train_one_epoch(
                 losses["loss_total"].detach(),
                 losses["loss_main_ce"],
                 losses["loss_main_dice"],
+                losses["loss_cldice"],
                 losses["loss_aux_orientation"],
                 (masks > 0).float().mean(),
                 pred_road_fraction,
             )
         ).float().cpu().tolist()
         for name, value in zip(
-            ("total", "main_ce", "main_dice", "orientation", "road_fraction", "pred_road_fraction"),
+            (
+                "total",
+                "main_ce",
+                "main_dice",
+                "cldice",
+                "orientation",
+                "road_fraction",
+                "pred_road_fraction",
+            ),
             metric_values,
         ):
             meters[name].update(value, batch)
@@ -1858,6 +1868,31 @@ def parse_args() -> argparse.Namespace:
         help="Positive value skips the startup mask scan and uses this CE weight",
     )
     parser.add_argument("--main_dice_weight", type=float, default=1.0)
+    parser.add_argument(
+        "--cldice_weight",
+        type=float,
+        default=0.5,
+        help=(
+            "Blend factor for soft_cldice_loss against plain Dice within the "
+            "shape term (0.0 = pure Dice as before, 1.0 = pure clDice). "
+            "clDice (Shit et al., CVPR 2021) scores overlap on each side's "
+            "soft skeleton instead of the whole road area, so it penalizes a "
+            "broken road connection much more than Dice does for the same "
+            "pixel count. Blended rather than a straight swap because "
+            "clDice's skeleton-sum denominators are near zero (noisy "
+            "gradient) before the model predicts any road at all, which "
+            "plain Dice does not suffer from."
+        ),
+    )
+    parser.add_argument(
+        "--cldice_iterations",
+        type=int,
+        default=10,
+        help="Soft-skeletonization erosion steps for --cldice_weight > 0. "
+        "Should roughly match the widest road's half-width in pixels at "
+        "output resolution; too few under-skeletonizes wide roads, too many "
+        "adds unnecessary compute.",
+    )
     parser.add_argument("--aux_weight", type=float, default=0.15)
     parser.add_argument(
         "--aux_start_epoch",
@@ -1999,6 +2034,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("rotation_probability must be in [0, 1]")
     if args.rotation_max_degrees < 0.0:
         raise ValueError("rotation_max_degrees cannot be negative")
+    if not 0.0 <= args.cldice_weight <= 1.0:
+        raise ValueError("cldice_weight must be in [0, 1]")
+    if args.cldice_iterations < 1:
+        raise ValueError("cldice_iterations must be positive")
     for name in ("aux_weight",):
         if getattr(args, name) < 0.0:
             raise ValueError(f"{name} cannot be negative")
@@ -2163,6 +2202,8 @@ def main() -> None:
         road_class_weight=road_weight,
         main_dice_weight=args.main_dice_weight,
         aux_weight=args.aux_weight,
+        cldice_weight=args.cldice_weight,
+        cldice_iterations=args.cldice_iterations,
     ).to(device)
 
     start_epoch, best_fixed, best_calibrated = 0, -1.0, -1.0
@@ -2215,7 +2256,13 @@ def main() -> None:
         f"road CE weight={road_weight:.3f}"
     )
     rank_zero_print(
-        "loss=weighted CE + Dice"
+        "loss=weighted CE + "
+        + (
+            f"{1.0 - args.cldice_weight:.2f}*Dice+{args.cldice_weight:.2f}*clDice"
+            f"(iter={args.cldice_iterations})"
+            if args.cldice_weight > 0.0
+            else "Dice"
+        )
         + (
             " + road-orientation supervision (S4+S2 OrientedSkipAggregation)"
             if args.oriented_skip
@@ -2270,6 +2317,7 @@ def main() -> None:
                 f"  [debug] train_loss={train_metrics['total']:.5f} "
                 f"(ce={train_metrics['main_ce']:.4f} "
                 f"dice={train_metrics['main_dice']:.4f} "
+                f"cldice={train_metrics['cldice']:.4f} "
                 f"orientation={train_metrics['orientation']:.4f}) | "
                 f"pred_road_frac={train_metrics['pred_road_fraction']:.4f} "
                 f"true_road_frac={train_metrics['road_fraction']:.4f} | "

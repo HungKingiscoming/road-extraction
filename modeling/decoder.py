@@ -712,8 +712,80 @@ def binary_dice_loss(
     return (1.0 - (2.0 * intersection + eps) / (denominator + eps)).mean()
 
 
+def _soft_erode(x: Tensor) -> Tensor:
+    """Cross-shaped (not square) morphological erosion.
+
+    A full 3x3 erosion would shrink a road already only a few pixels wide
+    almost as fast as it shrinks the background it's supposed to remove --
+    two 1-pixel-wide (3x1 and 1x3) erosions, combined with min, approximate
+    a disk-shaped structuring element that thins more gently.
+    """
+    p1 = -F.max_pool2d(-x, (3, 1), stride=1, padding=(1, 0))
+    p2 = -F.max_pool2d(-x, (1, 3), stride=1, padding=(0, 1))
+    return torch.min(p1, p2)
+
+
+def _soft_dilate(x: Tensor) -> Tensor:
+    return F.max_pool2d(x, 3, stride=1, padding=1)
+
+
+def _soft_open(x: Tensor) -> Tensor:
+    return _soft_dilate(_soft_erode(x))
+
+
+def soft_skeletonize(x: Tensor, iterations: int) -> Tensor:
+    """Differentiable soft skeleton (Shit et al., clDice, CVPR 2021).
+
+    A morphological opening restores everything erosion removed except the
+    thin centerline; repeatedly eroding and taking what opening can no
+    longer restore accumulates that centerline into a skeleton map, entirely
+    with maxpool/minpool so it stays differentiable end to end.
+    """
+    skeleton = F.relu(x - _soft_open(x))
+    eroded = x
+    for _ in range(iterations):
+        eroded = _soft_erode(eroded)
+        opened = _soft_open(eroded)
+        delta = F.relu(eroded - opened)
+        skeleton = skeleton + F.relu(delta - skeleton * delta)
+    return skeleton
+
+
+def soft_cldice_loss(
+    probability: Tensor,
+    target: Tensor,
+    iterations: int = 10,
+    eps: float = 1e-6,
+) -> Tensor:
+    """1 - clDice: topology-preserving loss for tubular/curvilinear structures
+    (Shit et al., "clDice -- A Novel Topology-Preserving Loss Function for
+    Tubular Structure Segmentation", CVPR 2021).
+
+    Plain Dice scores overlap over the *whole* road area, so a broken
+    connection (a short missing segment) barely moves the score if the
+    surrounding road pixels are still correct -- exactly the failure mode
+    that tanks a road network's usefulness without tanking Dice/IoU much.
+    clDice instead measures overlap against each side's *soft skeleton*
+    (topology precision: how much of the predicted skeleton lies on real
+    road; topology sensitivity: how much of the true skeleton is covered by
+    the prediction), so a disconnection is penalized in proportion to how
+    much of the route it breaks, not how many pixels it spans.
+    """
+    probability = probability.float()
+    target = target.float()
+    skeleton_pred = soft_skeletonize(probability, iterations)
+    with torch.no_grad():
+        skeleton_true = soft_skeletonize(target, iterations)
+    precision = (skeleton_pred * target).sum(dim=(1, 2, 3))
+    precision = (precision + eps) / (skeleton_pred.sum(dim=(1, 2, 3)) + eps)
+    sensitivity = (skeleton_true * probability).sum(dim=(1, 2, 3))
+    sensitivity = (sensitivity + eps) / (skeleton_true.sum(dim=(1, 2, 3)) + eps)
+    cl_dice = 2.0 * precision * sensitivity / (precision + sensitivity + eps)
+    return (1.0 - cl_dice).mean()
+
+
 class RoadSegOrientationLoss(nn.Module):
-    """Road objective: weighted CE + Dice + road-orientation supervision.
+    """Road objective: weighted CE + (Dice/clDice blend) + road-orientation supervision.
 
     The orientation term supervises both OrientedSkipAggregation stages'
     OrientHead (S4 and S2) against ``structure_tensor_angle`` of the
@@ -729,6 +801,14 @@ class RoadSegOrientationLoss(nn.Module):
     rather than adds to a fourth loss term. When ``oriented_skip=False``
     (plain SkipFeatureGate, no direction to supervise), ``outputs[0]``'s
     entries are ``None`` and this term is simply zero.
+
+    The shape term blends plain Dice with ``soft_cldice_loss`` (see its
+    docstring) rather than switching outright: clDice alone divides by each
+    side's skeleton sum, which can be near-zero (and its gradient
+    correspondingly noisy) before the model has learned to predict any road
+    at all, whereas Dice is well-behaved from step one. ``cldice_weight=1.0``
+    recovers pure clDice once training is stable enough to try it;
+    ``cldice_weight=0.0`` recovers the original plain-Dice behavior.
     """
 
     def __init__(
@@ -736,11 +816,15 @@ class RoadSegOrientationLoss(nn.Module):
         road_class_weight: float = 2.0,
         main_dice_weight: float = 1.0,
         aux_weight: float = 0.15,
+        cldice_weight: float = 0.5,
+        cldice_iterations: int = 10,
     ) -> None:
         super().__init__()
         self.road_class_weight = float(road_class_weight)
         self.main_dice_weight = float(main_dice_weight)
         self.aux_weight = float(aux_weight)
+        self.cldice_weight = float(cldice_weight)
+        self.cldice_iterations = int(cldice_iterations)
         self.register_buffer("_sobel_x", _SKIP_SOBEL_X, persistent=False)
 
     def _orientation_term(
@@ -772,6 +856,15 @@ class RoadSegOrientationLoss(nn.Module):
         )
         road_probability = road_logits.float().softmax(dim=1)[:, 1:2]
         loss_main_dice = binary_dice_loss(road_probability, road_mask)
+        if self.cldice_weight > 0.0:
+            loss_cldice = soft_cldice_loss(
+                road_probability, road_mask, iterations=self.cldice_iterations
+            )
+        else:
+            loss_cldice = road_logits.new_zeros(())
+        loss_shape = (
+            1.0 - self.cldice_weight
+        ) * loss_main_dice + self.cldice_weight * loss_cldice
 
         # Always computed (even when aux_weight==0.0 during warmup), same as
         # the pre-warmup centerline loss this replaced: a term that is
@@ -791,13 +884,14 @@ class RoadSegOrientationLoss(nn.Module):
 
         total = (
             loss_main_ce
-            + self.main_dice_weight * loss_main_dice
+            + self.main_dice_weight * loss_shape
             + self.aux_weight * loss_orientation
         )
         return {
             "loss_total": total,
             "loss_main_ce": loss_main_ce.detach(),
             "loss_main_dice": loss_main_dice.detach(),
+            "loss_cldice": loss_cldice.detach(),
             "loss_aux_orientation": loss_orientation.detach(),
         }
 
