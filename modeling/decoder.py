@@ -8,11 +8,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-try:
-    from torchvision.ops import DeformConv2d
-except ImportError:  # pragma: no cover
-    DeformConv2d = None
-
 
 class ConvBNAct(nn.Sequential):
     """Convolution, BatchNorm, and an optional ReLU."""
@@ -79,17 +74,60 @@ class ConvGNAct(nn.Sequential):
         super().__init__(*layers)
 
 
-class DeformableConvBlock(nn.Module):
-    """Deformable, dense-conv drop-in thay cho RepVGGBlock.
+class ConvBN(nn.Sequential):
+    """Linear Conv-BN branch used by re-parameterizable blocks."""
 
-    Học một trường offset (+ mask điều biến) trực tiếp từ input để lấy mẫu
-    kernel tại vị trí không cố định trên lưới vuông -- biểu diễn được đường
-    cong/chéo ở mọi hướng, không chỉ ngang/dọc/45 độ cố định như conv thường.
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: Union[int, Tuple[int, int]],
+        stride: int,
+        padding: Union[int, Tuple[int, int]],
+        groups: int = 1,
+    ) -> None:
+        super().__init__(
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride=stride,
+                padding=padding,
+                groups=groups,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_channels),
+        )
 
-    Khác biệt so với RepVGGBlock: offset phụ thuộc input nên KHÔNG fuse được
-    thành một conv tĩnh. deploy=True raise lỗi rõ ràng thay vì âm thầm sai.
-    switch_to_deploy() là no-op chỉ để tương thích với các vòng quét
-    isinstance hiện có.
+    @property
+    def conv(self) -> nn.Conv2d:
+        return self[0]
+
+    @property
+    def bn(self) -> nn.BatchNorm2d:
+        return self[1]
+
+
+def _fuse_conv_bn(branch: ConvBN) -> Tuple[Tensor, Tensor]:
+    weight = branch.conv.weight
+    norm = branch.bn
+    std = torch.sqrt(norm.running_var + norm.eps)
+    scale = norm.weight / std
+    return (
+        weight * scale.reshape(-1, 1, 1, 1),
+        norm.bias - norm.running_mean * scale,
+    )
+
+
+class RepVGGBlock(nn.Module):
+    """RepVGG block exactly fused to one dense 3x3 convolution at deploy.
+
+    Khôi phục lại (2026-09-07) sau khi thí nghiệm với DeformableConvBlock
+    (torchvision.ops.DeformConv2d) cho thấy: (1) không cải thiện IoU trên
+    Massachusetts so với block này, (2) chậm hơn ~3.6x đo thực tế, (3) chính
+    SegRoadv2 (paper road extraction, cùng benchmark) cũng tự so sánh và kết
+    luận strip-conv-reparam nhanh hơn DCN. Xem lịch sử hội thoại để biết đầy
+    đủ bằng chứng dẫn tới quyết định quay lại.
     """
 
     def __init__(
@@ -98,143 +136,204 @@ class DeformableConvBlock(nn.Module):
         out_channels: Optional[int] = None,
         stride: int = 1,
         deploy: bool = False,
-        kernel_size: int = 3,
-        offset_kernel: int = 3,
     ) -> None:
         super().__init__()
-        if DeformConv2d is None:
-            raise ImportError(
-                "DeformableConvBlock cần torchvision.ops.DeformConv2d "
-                "(torchvision >= 0.8)."
-            )
-        if deploy:
-            raise ValueError(
-                "DeformableConvBlock không hỗ trợ deploy=True: offset tính "
-                "từ input nên không thể fuse thành một conv tĩnh duy nhất."
-            )
         out_channels = in_channels if out_channels is None else out_channels
         self.in_channels = int(in_channels)
         self.out_channels = int(out_channels)
         self.stride = int(stride)
-        self.kernel_size = int(kernel_size)
-        padding = self.kernel_size // 2
-        offset_padding = int(offset_kernel) // 2
-        taps = self.kernel_size * self.kernel_size
-
-        # offset_groups=1 (suy ra từ số kênh offset_conv sinh ra, độc lập với
-        # groups của deform_conv): một trường offset dùng chung cho mọi
-        # channel -- vừa rẻ vừa hợp lý vì hướng đường cục bộ là thuộc tính
-        # không gian, không phải thuộc tính riêng của từng channel.
-        self.offset_conv = nn.Conv2d(
-            self.in_channels, 2 * taps, offset_kernel,
-            stride=self.stride, padding=offset_padding,
-        )
-        self.mask_conv = nn.Conv2d(
-            self.in_channels, taps, offset_kernel,
-            stride=self.stride, padding=offset_padding,
-        )
-        # Zero-init: lúc bắt đầu train, offset=0 (lấy mẫu đúng lưới chuẩn,
-        # hệt conv thường) và mask ~ 1 (sigmoid(4)~=0.98) -- không phá vỡ
-        # feature pretrained ngay từ epoch đầu.
-        nn.init.zeros_(self.offset_conv.weight)
-        nn.init.zeros_(self.offset_conv.bias)
-        nn.init.zeros_(self.mask_conv.weight)
-        nn.init.constant_(self.mask_conv.bias, 4.0)
-
-        self.deform_conv = DeformConv2d(
-            self.in_channels, self.out_channels, self.kernel_size,
-            stride=self.stride, padding=padding, bias=False,
-        )
-        self.norm = nn.BatchNorm2d(self.out_channels)
+        self.deploy = bool(deploy)
         self.activation = nn.ReLU(inplace=True)
-        self.use_residual = (
-            self.in_channels == self.out_channels and self.stride == 1
-        )
+
+        if self.deploy:
+            self.reparam = nn.Conv2d(
+                self.in_channels,
+                self.out_channels,
+                3,
+                stride=self.stride,
+                padding=1,
+                bias=True,
+            )
+        else:
+            self.branch_3x3 = ConvBN(
+                self.in_channels, self.out_channels, 3, self.stride, 1
+            )
+            self.branch_1x1 = ConvBN(
+                self.in_channels, self.out_channels, 1, self.stride, 0
+            )
+            if self.in_channels == self.out_channels and self.stride == 1:
+                self.branch_identity: Optional[nn.BatchNorm2d] = nn.BatchNorm2d(
+                    self.in_channels
+                )
+            else:
+                self.branch_identity = None
 
     def forward(self, x: Tensor) -> Tensor:
-        offset = self.offset_conv(x)
-        mask = torch.sigmoid(self.mask_conv(x))
-        out = self.norm(self.deform_conv(x, offset, mask))
-        if self.use_residual:
-            out = out + x
-        return self.activation(out)
+        if self.deploy:
+            return self.activation(self.reparam(x))
+        identity: Union[Tensor, int]
+        identity = self.branch_identity(x) if self.branch_identity else 0
+        return self.activation(
+            self.branch_3x3(x) + self.branch_1x1(x) + identity
+        )
+
+    def _fuse_identity_bn(self) -> Tuple[Union[Tensor, int], Union[Tensor, int]]:
+        if self.branch_identity is None:
+            return 0, 0
+        norm = self.branch_identity
+        kernel = norm.weight.new_zeros(
+            self.out_channels, self.in_channels, 3, 3
+        )
+        indices = torch.arange(self.in_channels, device=kernel.device)
+        kernel[indices, indices, 1, 1] = 1.0
+        std = torch.sqrt(norm.running_var + norm.eps)
+        scale = norm.weight / std
+        return (
+            kernel * scale.reshape(-1, 1, 1, 1),
+            norm.bias - norm.running_mean * scale,
+        )
+
+    def get_equivalent_kernel_bias(self) -> Tuple[Tensor, Tensor]:
+        if self.deploy:
+            return self.reparam.weight, self.reparam.bias
+        kernel_3, bias_3 = _fuse_conv_bn(self.branch_3x3)
+        kernel_1, bias_1 = _fuse_conv_bn(self.branch_1x1)
+        kernel_id, bias_id = self._fuse_identity_bn()
+        kernel = kernel_3 + F.pad(kernel_1, (1, 1, 1, 1)) + kernel_id
+        return kernel, bias_3 + bias_1 + bias_id
 
     def switch_to_deploy(self) -> None:
-        return  # no-op, xem docstring
+        if self.deploy:
+            return
+        kernel, bias = self.get_equivalent_kernel_bias()
+        reparam = nn.Conv2d(
+            self.in_channels,
+            self.out_channels,
+            3,
+            stride=self.stride,
+            padding=1,
+            bias=True,
+        ).to(device=kernel.device, dtype=kernel.dtype)
+        with torch.no_grad():
+            reparam.weight.copy_(kernel)
+            reparam.bias.copy_(bias)
+        self.reparam = reparam
+        del self.branch_3x3
+        del self.branch_1x1
+        del self.branch_identity
+        self.deploy = True
 
 
-class DeformableRoadRefineBlock(nn.Module):
-    """Drop-in thay cho RepDepthwiseBlock: depthwise deformable 5x5 tinh
-    chỉnh road geometry ở decoder (final fusion, S4, S2).
+class RepDepthwiseBlock(nn.Module):
+    """Road refinement with a deployable depthwise 5x5 spatial kernel.
 
-    offset_conv/mask_conv chỉ sinh MỘT trường offset dùng chung cho mọi
-    channel (offset_groups=1, độc lập với groups=channels của deform_conv --
-    torchvision suy ra offset_groups từ số kênh của chính tensor offset,
-    tách biệt hoàn toàn với groups của weight). Biến dạng hình học tại một
-    vị trí không gian là thuộc tính chia sẻ giữa các channel của cùng một
-    pixel, không cần offset riêng cho từng channel -- giữ offset predictor rẻ.
+    During training, 3x3, 1x5, 5x1, and identity paths learn complementary
+    road geometry. The four paths are exactly fused into one depthwise 5x5
+    convolution for inference. The inexpensive pointwise mixer remains.
 
-    Không hỗ trợ deploy=True: offset phụ thuộc input nên không fuse được
-    thành một conv tĩnh duy nhất như RepDepthwiseBlock gốc.
+    Khôi phục lại (2026-09-07) -- xem docstring RepVGGBlock ở trên cho lý do.
     """
 
-    def __init__(
-        self,
-        channels: int,
-        deploy: bool = False,
-        kernel_size: int = 5,
-        offset_kernel: int = 3,
-    ) -> None:
+    def __init__(self, channels: int, deploy: bool = False) -> None:
         super().__init__()
-        if DeformConv2d is None:
-            raise ImportError(
-                "DeformableRoadRefineBlock cần torchvision.ops.DeformConv2d "
-                "(torchvision >= 0.8)."
-            )
-        if deploy:
-            raise ValueError(
-                "DeformableRoadRefineBlock không hỗ trợ deploy=True: offset "
-                "phụ thuộc input nên không thể fuse thành một conv tĩnh."
-            )
         self.channels = int(channels)
-        self.kernel_size = int(kernel_size)
-        padding = self.kernel_size // 2
-        offset_padding = int(offset_kernel) // 2
-        taps = self.kernel_size * self.kernel_size
-
-        self.offset_conv = nn.Conv2d(
-            self.channels, 2 * taps, offset_kernel, padding=offset_padding
-        )
-        self.mask_conv = nn.Conv2d(
-            self.channels, taps, offset_kernel, padding=offset_padding
-        )
-        # Zero-init: offset=0 lúc bắt đầu train (lấy mẫu đúng lưới chuẩn, hệt
-        # depthwise conv thường), mask ~ 1 (sigmoid(4)~=0.98) -- không phá vỡ
-        # hành vi đã học của checkpoint transfer ngay từ epoch đầu.
-        nn.init.zeros_(self.offset_conv.weight)
-        nn.init.zeros_(self.offset_conv.bias)
-        nn.init.zeros_(self.mask_conv.weight)
-        nn.init.constant_(self.mask_conv.bias, 4.0)
-
-        self.deform_conv = DeformConv2d(
-            self.channels, self.channels, self.kernel_size,
-            padding=padding, groups=self.channels, bias=False,
-        )
-        self.norm = nn.BatchNorm2d(self.channels)
+        self.deploy = bool(deploy)
         self.spatial_activation = nn.ReLU(inplace=True)
-        self.pointwise = ConvBNAct(
-            self.channels, self.channels, 1, padding=0, activation=False
-        )
         self.output_activation = nn.ReLU(inplace=True)
+        if self.deploy:
+            self.spatial_reparam = nn.Conv2d(
+                channels,
+                channels,
+                5,
+                padding=2,
+                groups=channels,
+                bias=True,
+            )
+        else:
+            self.branch_3x3 = ConvBN(
+                channels, channels, 3, 1, 1, groups=channels
+            )
+            self.branch_1x5 = ConvBN(
+                channels, channels, (1, 5), 1, (0, 2), groups=channels
+            )
+            self.branch_5x1 = ConvBN(
+                channels, channels, (5, 1), 1, (2, 0), groups=channels
+            )
+            self.branch_identity = nn.BatchNorm2d(channels)
+        self.pointwise = ConvBNAct(
+            channels, channels, 1, padding=0, activation=False
+        )
 
     def forward(self, x: Tensor) -> Tensor:
-        offset = self.offset_conv(x)
-        mask = torch.sigmoid(self.mask_conv(x))
-        spatial = self.spatial_activation(self.norm(self.deform_conv(x, offset, mask)))
+        if self.deploy:
+            spatial = self.spatial_reparam(x)
+        else:
+            spatial = (
+                self.branch_3x3(x)
+                + self.branch_1x5(x)
+                + self.branch_5x1(x)
+                + self.branch_identity(x)
+            )
+        spatial = self.spatial_activation(spatial)
         return self.output_activation(x + self.pointwise(spatial))
 
+    @staticmethod
+    def _pad_to_5x5(kernel: Tensor) -> Tensor:
+        height, width = kernel.shape[-2:]
+        pad_h, pad_w = 5 - height, 5 - width
+        return F.pad(
+            kernel,
+            (
+                pad_w // 2,
+                pad_w - pad_w // 2,
+                pad_h // 2,
+                pad_h - pad_h // 2,
+            ),
+        )
+
+    def _fuse_identity(self) -> Tuple[Tensor, Tensor]:
+        norm = self.branch_identity
+        kernel = norm.weight.new_zeros(self.channels, 1, 5, 5)
+        kernel[:, 0, 2, 2] = 1.0
+        std = torch.sqrt(norm.running_var + norm.eps)
+        scale = norm.weight / std
+        return (
+            kernel * scale.reshape(-1, 1, 1, 1),
+            norm.bias - norm.running_mean * scale,
+        )
+
+    def get_equivalent_kernel_bias(self) -> Tuple[Tensor, Tensor]:
+        if self.deploy:
+            return self.spatial_reparam.weight, self.spatial_reparam.bias
+        kernels, biases = [], []
+        for branch in (self.branch_3x3, self.branch_1x5, self.branch_5x1):
+            kernel, bias = _fuse_conv_bn(branch)
+            kernels.append(self._pad_to_5x5(kernel))
+            biases.append(bias)
+        kernel_id, bias_id = self._fuse_identity()
+        return sum(kernels, kernel_id), sum(biases, bias_id)
+
     def switch_to_deploy(self) -> None:
-        return  # no-op, xem docstring
+        if self.deploy:
+            return
+        kernel, bias = self.get_equivalent_kernel_bias()
+        reparam = nn.Conv2d(
+            self.channels,
+            self.channels,
+            5,
+            padding=2,
+            groups=self.channels,
+            bias=True,
+        ).to(device=kernel.device, dtype=kernel.dtype)
+        with torch.no_grad():
+            reparam.weight.copy_(kernel)
+            reparam.bias.copy_(bias)
+        self.spatial_reparam = reparam
+        del self.branch_3x3
+        del self.branch_1x5
+        del self.branch_5x1
+        del self.branch_identity
+        self.deploy = True
 
 
 class SeparableConvBNAct(nn.Sequential):
@@ -339,8 +438,8 @@ class RoadReconstructionDecoder(nn.Module):
             padding=0,
         )
         self.s4_refine = nn.Sequential(
-            DeformableRoadRefineBlock(s4_channels, deploy=deploy),
-            DeformableRoadRefineBlock(s4_channels, deploy=deploy),
+            RepDepthwiseBlock(s4_channels, deploy=deploy),
+            RepDepthwiseBlock(s4_channels, deploy=deploy),
         )
 
         self.stem_proj = ConvBNAct(
@@ -353,8 +452,8 @@ class RoadReconstructionDecoder(nn.Module):
             padding=0,
         )
         self.s2_refine = nn.Sequential(
-            DeformableRoadRefineBlock(s2_channels, deploy=deploy),
-            DeformableRoadRefineBlock(s2_channels, deploy=deploy),
+            RepDepthwiseBlock(s2_channels, deploy=deploy),
+            RepDepthwiseBlock(s2_channels, deploy=deploy),
         )
 
         self.full_refine = SeparableConvBNAct(s2_channels, full_channels)
@@ -393,9 +492,9 @@ class RoadReconstructionDecoder(nn.Module):
         return road_logits
 
     def switch_to_deploy(self) -> None:
-        """Không còn tác dụng: toàn bộ block refine giờ là deformable,
-        offset phụ thuộc input nên không có dạng conv tĩnh để fuse về."""
-        return
+        for module in list(self.modules()):
+            if isinstance(module, RepDepthwiseBlock):
+                module.switch_to_deploy()
 
 
 def _soft_erode(mask: Tensor) -> Tensor:
@@ -559,3 +658,16 @@ class RoadSegCenterlineTverskyLoss(nn.Module):
             "loss_aux_centerline": loss_centerline.detach(),
             "loss_centerline_tversky": loss_centerline.detach(),
         }
+
+
+@torch.no_grad()
+def verify_reparameterization(
+    block: Union[RepVGGBlock, RepDepthwiseBlock],
+    shape: Tuple[int, int, int, int],
+) -> float:
+    """Return max absolute output error before and after branch fusion."""
+    block.eval()
+    x = torch.randn(shape, device=next(block.parameters()).device)
+    reference = block(x)
+    block.switch_to_deploy()
+    return float((reference - block(x)).abs().max())
