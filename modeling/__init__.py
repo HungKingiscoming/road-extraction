@@ -1,15 +1,17 @@
 from .decoder import (
-    DeformableConvBlock,
-    DeformableRoadRefineBlock,
+    DilatedStripBlock,
+    RepDepthwiseBlock,
+    RepVGGBlock,
     RoadReconstructionDecoder,
     RoadSegCenterlineTverskyLoss,
 )
 from .model import DualBranchRoadNet, build_model
 
 __all__ = (
-    "DeformableConvBlock",
-    "DeformableRoadRefineBlock",
+    "DilatedStripBlock",
     "DualBranchRoadNet",
+    "RepDepthwiseBlock",
+    "RepVGGBlock",
     "RoadReconstructionDecoder",
     "RoadSegCenterlineTverskyLoss",
     "build_model",
