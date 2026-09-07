@@ -48,7 +48,7 @@ try:
     module = DCNv4(channels=C, kernel_size=3, stride=1, group=group).to(device)
     x = torch.randn(N, H * W, C, device=device, requires_grad=True)
 
-    out = module(x, shape=(N, H, W, C))
+    out = module(x, shape=(H, W))
     print("forward OK, output shape:", tuple(out.shape))
 
     loss = out.sum()
@@ -64,7 +64,7 @@ try:
     torch.cuda.synchronize()
     start = time.perf_counter()
     for _ in range(10):
-        out2 = module2(x2, shape=(N, H, W, C))
+        out2 = module2(x2, shape=(H, W))
         out2.sum().backward()
         x2.grad = None
     torch.cuda.synchronize()
