@@ -11,9 +11,9 @@ from torch import Tensor
 from .decoder import (
     ConvBNAct,
     ConvGNAct,
-    DeformableConvBlock,
-    DeformableRoadRefineBlock,
     DilatedStripBlock,
+    RepDepthwiseBlock,
+    RepVGGBlock,
     RoadReconstructionDecoder,
 )
 
@@ -116,7 +116,7 @@ class TruncatedResNet34(nn.Module):
 def _detail_stage(channels: int, blocks: int, deploy: bool) -> nn.Sequential:
     return nn.Sequential(
         *[
-            DeformableConvBlock(channels, channels, deploy=deploy)
+            RepVGGBlock(channels, channels, deploy=deploy)
             for _ in range(max(1, int(blocks)))
         ]
     )
@@ -229,7 +229,7 @@ class ControlledRoadFusion(nn.Module):
         )
         self.refinement = nn.Sequential(
             *[
-                DeformableRoadRefineBlock(channels, deploy=deploy)
+                RepDepthwiseBlock(channels, deploy=deploy)
                 for _ in range(max(1, int(refine_blocks)))
             ]
         )
@@ -737,11 +737,13 @@ class DualBranchRoadNet(nn.Module):
         }
 
     def switch_to_deploy(self) -> None:
-        """Không còn tác dụng: kiến trúc hiện tại toàn bộ dùng deformable
-        conv (offset phụ thuộc input), không có block nào fuse được về dạng
-        tĩnh. Giữ lại phương thức để không phá vỡ code gọi
-        model.switch_to_deploy() ở nơi khác (ví dụ script export)."""
-        return
+        """Fuse mọi RepVGGBlock/RepDepthwiseBlock (detail_stages, decoder
+        refine, ControlledRoadFusion) về conv tĩnh. semantic_stages
+        (DilatedStripBlock) không hỗ trợ fuse -- không phải Rep-style block,
+        vẫn giữ nguyên nhiều nhánh cả lúc deploy (vẫn rẻ vì depthwise)."""
+        for module in list(self.modules()):
+            if isinstance(module, (RepVGGBlock, RepDepthwiseBlock)):
+                module.switch_to_deploy()
 
 
 def build_model(args) -> DualBranchRoadNet:
