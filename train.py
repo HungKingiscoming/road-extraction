@@ -1429,12 +1429,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--detail_blocks", nargs=2, type=int, default=(2, 2)
     )
-    parser.add_argument(
-        "--semantic_blocks", nargs=2, type=int, default=(2, 2)
-    )
-    parser.add_argument(
-        "--semantic_dilations", nargs=2, type=int, default=(2, 4)
-    )
+    parser.add_argument("--semantic_blocks", type=int, default=2)
     parser.add_argument("--fusion_blocks", type=int, default=1)
     parser.add_argument(
         "--bilateral_fusion",
@@ -1595,10 +1590,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("dappm_pool_sizes must be positive")
     if min(args.detail_blocks) < 1:
         raise ValueError("detail_blocks must be positive")
-    if min(args.semantic_blocks) < 1:
-        raise ValueError("semantic_blocks must be positive")
-    if min(args.semantic_dilations) < 1:
-        raise ValueError("semantic_dilations must be positive")
     channel_values = (
         args.detail_channels,
         args.semantic_channels,
@@ -1887,24 +1878,18 @@ def main() -> None:
                 f"calibrated road IoU={calibrated:.5f} "
                 f"@{validation_metrics['calibrated_threshold']:.2f} | "
                 f"F1={validation_metrics['fixed_f1']:.5f} | "
-                f"gates s2d1/d2s1/s2d2/d2s2/ctx/final="
-                f"{gate_metrics['semantic_to_detail_1_abs_mean']:.3f}/"
-                f"{gate_metrics['detail_to_semantic_1_abs_mean']:.3f}/"
-                f"{gate_metrics['semantic_to_detail_2_abs_mean']:.3f}/"
-                f"{gate_metrics['detail_to_semantic_2_abs_mean']:.3f}/"
+                f"gates s2d/d2s/ctx/final="
+                f"{gate_metrics['semantic_to_detail_abs_mean']:.3f}/"
+                f"{gate_metrics['detail_to_semantic_abs_mean']:.3f}/"
                 f"{gate_metrics['s32_context_to_s16_abs_mean']:.3f}/"
                 f"{gate_metrics['semantic_to_final_abs_mean']:.3f}"
                 + (
-                    " | spatial mean s2d1/d2s1/s2d2/d2s2="
-                    f"{gate_metrics['semantic_to_detail_spatial_mean_1']:.3f}/"
-                    f"{gate_metrics['detail_to_semantic_spatial_mean_1']:.3f}/"
-                    f"{gate_metrics['semantic_to_detail_spatial_mean_2']:.3f}/"
-                    f"{gate_metrics['detail_to_semantic_spatial_mean_2']:.3f}"
+                    " | spatial mean s2d/d2s="
+                    f"{gate_metrics['semantic_to_detail_spatial_mean']:.3f}/"
+                    f"{gate_metrics['detail_to_semantic_spatial_mean']:.3f}"
                     " std="
-                    f"{gate_metrics['semantic_to_detail_spatial_std_1']:.3f}/"
-                    f"{gate_metrics['detail_to_semantic_spatial_std_1']:.3f}/"
-                    f"{gate_metrics['semantic_to_detail_spatial_std_2']:.3f}/"
-                    f"{gate_metrics['detail_to_semantic_spatial_std_2']:.3f}"
+                    f"{gate_metrics['semantic_to_detail_spatial_std']:.3f}/"
+                    f"{gate_metrics['detail_to_semantic_spatial_std']:.3f}"
                     if args.bilateral_fusion == "spatial"
                     else ""
                 )
