@@ -252,6 +252,63 @@ class SeparableConvBNAct(nn.Sequential):
         )
 
 
+class DilatedStripBlock(nn.Module):
+    """Road-shape-aware block cho semantic branch, dùng ở độ phân giải thô.
+
+    Kết hợp kernel bất đối xứng (3x3 + 1xN + Nx1 + identity, cơ chế ACNet /
+    strip conv -- đã kiểm chứng qua RepDepthwiseBlock và cách SegRoadv2 tự
+    chọn strip conv thay vì DCN vì nhanh hơn) VỚI dilation (mở rộng receptive
+    field không tăng tham số, cơ chế SCA trong DSFC-Net -- theo ablation của
+    paper là thành phần mạnh nhất khi đo riêng lẻ trong SFT).
+
+    LƯU Ý: bản thân SỰ KẾT HỢP hai cơ chế này chưa từng được đo trong bất kỳ
+    paper nào đã tham khảo (SegRoadv2 không dùng dilation; SCA của DSFC-Net
+    dùng kernel vuông, không bất đối xứng) -- đây là thiết kế tổng hợp, cần
+    tự đo tác động, không phải kết luận đã được literature xác nhận.
+    """
+
+    def __init__(self, channels: int, dilation: int = 2, kernel_len: int = 5) -> None:
+        super().__init__()
+        pad_square = dilation
+        pad_strip = ((kernel_len - 1) // 2) * dilation
+
+        self.branch_square = nn.Sequential(
+            nn.Conv2d(
+                channels, channels, 3, padding=pad_square,
+                dilation=dilation, groups=channels, bias=False,
+            ),
+            nn.BatchNorm2d(channels),
+        )
+        self.branch_horizontal = nn.Sequential(
+            nn.Conv2d(
+                channels, channels, (1, kernel_len), padding=(0, pad_strip),
+                dilation=(1, dilation), groups=channels, bias=False,
+            ),
+            nn.BatchNorm2d(channels),
+        )
+        self.branch_vertical = nn.Sequential(
+            nn.Conv2d(
+                channels, channels, (kernel_len, 1), padding=(pad_strip, 0),
+                dilation=(dilation, 1), groups=channels, bias=False,
+            ),
+            nn.BatchNorm2d(channels),
+        )
+        self.branch_identity = nn.BatchNorm2d(channels)
+        self.spatial_activation = nn.ReLU(inplace=True)
+        self.pointwise = ConvBNAct(channels, channels, 1, padding=0, activation=False)
+        self.output_activation = nn.ReLU(inplace=True)
+
+    def forward(self, x: Tensor) -> Tensor:
+        spatial = (
+            self.branch_square(x)
+            + self.branch_horizontal(x)
+            + self.branch_vertical(x)
+            + self.branch_identity(x)
+        )
+        spatial = self.spatial_activation(spatial)
+        return self.output_activation(x + self.pointwise(spatial))
+
+
 class RoadReconstructionDecoder(nn.Module):
     """S8-to-S1 decoder with one train-only S4 centerline head."""
 
