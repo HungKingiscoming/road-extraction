@@ -36,8 +36,13 @@ try:
     # Mô phỏng đúng calling convention thật: input phẳng (N, L, C), NHWC,
     # kèm shape=(N, H, W, C) để module tự suy ra layout không gian.
     N, H, W, C = 2, 32, 32, 32
-    channels_per_group_options = [g for g in (1, 2, 4, 8) if C % g == 0]
-    group = channels_per_group_options[-1]  # ưu tiên group lớn nhất chia hết
+    # Bằng chứng từ paper DCNv4 (arXiv 2401.06197) và mọi config FlashInternImage
+    # chính thức: kernel CUDA được thiết kế quanh channels_per_group = 16 cố định
+    # (vd InternImage-L: channels=160, groups=[10,20,40,80] -> luôn ra D=16).
+    # KHÔNG dùng D nhỏ hơn (4, 8) -- đó là nguyên nhân AssertionError trước đó.
+    D_PER_GROUP = 16
+    assert C % D_PER_GROUP == 0, f"channels={C} phải chia hết cho {D_PER_GROUP}"
+    group = C // D_PER_GROUP
     print(f"channels={C}, group={group}, channels_per_group={C // group}")
 
     module = DCNv4(channels=C, kernel_size=3, stride=1, group=group).to(device)
@@ -54,7 +59,7 @@ try:
     import time
 
     N, H, W, C = 2, 512, 512, 32
-    module2 = DCNv4(channels=C, kernel_size=5, stride=1, group=8).to(device)
+    module2 = DCNv4(channels=C, kernel_size=5, stride=1, group=C // D_PER_GROUP).to(device)
     x2 = torch.randn(N, H * W, C, device=device, requires_grad=True)
     torch.cuda.synchronize()
     start = time.perf_counter()
@@ -68,6 +73,9 @@ try:
 
     print("\n>>> TẤT CẢ TEST PASS. An toàn để tích hợp vào decoder.py.")
 except Exception as error:  # noqa: BLE001
+    import traceback
+
     print(f"\n>>> LỖI: {type(error).__name__}: {error}")
+    traceback.print_exc()
     print(">>> DỪNG Ở ĐÂY. Không nên tích hợp DCNv4 vào training pipeline.")
     sys.exit(1)
