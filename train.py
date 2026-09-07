@@ -1429,7 +1429,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--detail_blocks", nargs=2, type=int, default=(2, 2)
     )
-    parser.add_argument("--semantic_blocks", type=int, default=2)
+    parser.add_argument(
+        "--semantic_blocks", nargs=2, type=int, default=(2, 2)
+    )
+    parser.add_argument(
+        "--semantic_dilations", nargs=2, type=int, default=(2, 4)
+    )
     parser.add_argument("--fusion_blocks", type=int, default=1)
     parser.add_argument(
         "--bilateral_fusion",
@@ -1590,6 +1595,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("dappm_pool_sizes must be positive")
     if min(args.detail_blocks) < 1:
         raise ValueError("detail_blocks must be positive")
+    if min(args.semantic_blocks) < 1:
+        raise ValueError("semantic_blocks must be positive")
+    if min(args.semantic_dilations) < 1:
+        raise ValueError("semantic_dilations must be positive")
     channel_values = (
         args.detail_channels,
         args.semantic_channels,
