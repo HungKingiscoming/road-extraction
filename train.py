@@ -937,7 +937,7 @@ def train_one_epoch(
         for name in (
             "total",
             "main_ce",
-            "main_dice",
+            "main_cldice",
             "centerline",
             "road_fraction",
         )
@@ -999,7 +999,7 @@ def train_one_epoch(
             (
                 losses["loss_total"].detach(),
                 losses["loss_main_ce"],
-                losses["loss_main_dice"],
+                losses["loss_main_cldice"],
                 losses["loss_aux_centerline"],
                 (masks > 0).float().mean(),
             )
@@ -1294,7 +1294,6 @@ def transfer_weights(
     weights: str,
     device: torch.device,
 ) -> Path:
-    """Transfer dual-branch/decoder weights while keeping the new ResNeXt encoder."""
     checkpoint_path, checkpoint = safe_torch_load(path, device)
     if not isinstance(checkpoint, dict):
         raise TypeError("Transfer checkpoint must be a dictionary")
@@ -1304,39 +1303,17 @@ def transfer_weights(
         state = checkpoint.get(fallback, checkpoint.get("state_dict"))
     if not isinstance(state, dict):
         raise KeyError(f"No '{weights}', model, ema, or state_dict weights found")
-
     cleaned = clean_state_dict(state)
-    target = model.state_dict()
-    transfer_prefixes = ("dual_branch.", "decode_head.")
-    selected: Dict[str, Tensor] = {}
-    skipped_shape: List[str] = []
-    skipped_missing: List[str] = []
-
-    for key, value in cleaned.items():
-        if not key.startswith(transfer_prefixes):
-            continue
-        if key not in target:
-            skipped_missing.append(key)
-            continue
-        if target[key].shape != value.shape:
-            skipped_shape.append(key)
-            continue
-        selected[key] = value
-
-    if not selected:
-        raise RuntimeError(
-            "No compatible dual_branch/decode_head tensors were found in the "
-            "transfer checkpoint"
-        )
-
-    model.load_state_dict(selected, strict=False)
-    rank_zero_print(
-        "Partial road checkpoint transfer: "
-        f"loaded={len(selected)} | shape_skips={len(skipped_shape)} | "
-        f"missing_skips={len(skipped_missing)} | encoder=ImageNet ResNeXt50"
+    result = model.load_state_dict(cleaned, strict=False)
+    allowed_missing = all(
+        "spatial_gate" in key for key in result.missing_keys
     )
-    if skipped_shape:
-        rank_zero_print(f"First shape-mismatched transfer keys: {skipped_shape[:10]}")
+    if result.unexpected_keys or not allowed_missing:
+        raise RuntimeError(
+            "Transfer checkpoint architecture does not match DualBranchRoadNet. "
+            f"Missing={result.missing_keys}, unexpected={result.unexpected_keys}. "
+            "Only newly introduced spatial-gate tensors may be absent."
+        )
     return checkpoint_path
 
 
@@ -1475,7 +1452,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--encoder_weights_path",
         default=None,
-        help="Local torchvision-format ResNeXt50-32x4d weights; avoids downloading",
+        help="Local torchvision-format ResNet-34 weights; avoids downloading",
     )
 
     parser.add_argument("--epochs", type=int, default=100)
@@ -1546,7 +1523,7 @@ def parse_args() -> argparse.Namespace:
         "--unfreeze_all_epoch",
         type=int,
         default=-1,
-        help="Negative keeps ResNeXt stem/layer1 frozen for the whole transfer run",
+        help="Negative keeps ResNet stem/layer1 frozen for the whole transfer run",
     )
     parser.add_argument(
         "--freeze_encoder_bn", action=argparse.BooleanOptionalAction, default=True
@@ -1745,12 +1722,10 @@ def main() -> None:
             f"{road_weight:.3f}"
         )
 
-    # Resume restores the same ResNeXt architecture exactly.  A transfer
-    # checkpoint, however, may come from the old ResNet34 model; in that case
-    # only dual_branch/decode_head are transferred and ResNeXt still needs its
-    # ImageNet initialization.
+    # A full road checkpoint replaces every weight, so do not require an
+    # unnecessary ImageNet download for transfer/resume runs.
     build_args = copy.copy(args)
-    if args.resume:
+    if args.pretrained_checkpoint or args.resume:
         build_args.imagenet_pretrained = False
 
     # Rank 0 populates the torchvision cache first, preventing two processes
@@ -1761,7 +1736,7 @@ def main() -> None:
     rank_zero_print(
         "[startup 4/5] Building DualBranchRoadNet"
         + (
-            " and loading/downloading ImageNet ResNeXt50-32x4d weights..."
+            " and loading/downloading ImageNet ResNet-34 weights..."
             if needs_imagenet_cache
             else "..."
         )
@@ -1829,7 +1804,7 @@ def main() -> None:
         f"accumulation={args.accumulation_steps} | effective batch={effective_batch}"
     )
     rank_zero_print(
-        f"native ResNeXt50 64/256/512/1024/2048 | detail={args.detail_channels}ch S8 | "
+        f"shared ResNet34 to S8 | detail={args.detail_channels}ch S8 | "
         f"semantic anchor=256ch S16 | context={args.semantic_channels}ch S32 | DAPPM="
         f"{args.dappm_channels}ch grids={tuple(args.dappm_pool_sizes)}"
     )
