@@ -197,6 +197,14 @@ class ControlledRoadFusion(nn.Module):
     stream is the residual anchor; a small learnable per-channel scale lets
     semantic information enter gradually.  One directional RepDepthwise block
     refines the fused road geometry and is deployable as a single DW 5x5 conv.
+
+    When bilateral_fusion="spatial" (already used for the semantic<->detail
+    exchange), the same treatment now also applies here: a per-pixel
+    ResidualSpatialGate modulates how much of the mixed detail+semantic
+    content enters, instead of a single static per-channel scale. This
+    closes a gap in the original design -- the exchange gate already had a
+    spatial option, this one did not -- reusing the existing, zero-init-safe
+    gate module rather than inventing a new mechanism.
     """
 
     def __init__(
@@ -204,6 +212,7 @@ class ControlledRoadFusion(nn.Module):
         channels: int,
         refine_blocks: int = 1,
         deploy: bool = False,
+        spatial_gate: bool = False,
     ) -> None:
         super().__init__()
         self.detail_norm = nn.BatchNorm2d(channels)
@@ -218,6 +227,13 @@ class ControlledRoadFusion(nn.Module):
         self.fusion_scale = nn.Parameter(
             torch.full((1, channels, 1, 1), 0.10)
         )
+        self.spatial_gate = bool(spatial_gate)
+        if self.spatial_gate:
+            self.fusion_spatial_gate = ResidualSpatialGate(
+                channels,
+                channels,
+                hidden_channels=max(16, min(64, channels // 2)),
+            )
         self.refinement = nn.Sequential(
             *[
                 RepDepthwiseBlock(channels, deploy=deploy)
@@ -238,6 +254,8 @@ class ControlledRoadFusion(nn.Module):
                 dim=1,
             )
         )
+        if self.spatial_gate:
+            mixed = self.fusion_spatial_gate(detail, mixed) * mixed
         fused = self.activation(detail + self.fusion_scale * mixed)
         return self.refinement(fused)
 
@@ -426,6 +444,7 @@ class DualResolutionContext(nn.Module):
             detail_channels,
             refine_blocks=fusion_blocks,
             deploy=deploy,
+            spatial_gate=(bilateral_fusion == "spatial"),
         )
         self.activation = nn.ReLU(inplace=True)
 
