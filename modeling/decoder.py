@@ -349,9 +349,9 @@ class RoadReconstructionDecoder(nn.Module):
         stem_channels: int = 64,
         shallow_channels: int = 64,
         fused_channels: int = 96,
-        s4_channels: int = 80,
-        s2_channels: int = 40,
-        full_channels: int = 32,
+        s4_channels: int = 64,
+        s2_channels: int = 32,
+        full_channels: int = 24,
         num_classes: int = 2,
         dropout: float = 0.05,
         deploy: bool = False,
@@ -466,6 +466,46 @@ def binary_dice_loss(
     return (1.0 - (2.0 * intersection + eps) / (denominator + eps)).mean()
 
 
+def soft_cldice_loss(
+    probability: Tensor,
+    target: Tensor,
+    iterations: int = 8,
+    eps: float = 1e-6,
+) -> Tensor:
+    """clDice loss (Shit et al., CVPR 2021).
+
+    Skeletonizes BOTH the prediction and the target (unlike the existing
+    centerline-Tversky auxiliary loss, which only skeletonizes the target),
+    then measures topology precision/sensitivity:
+      tprec = overlap(skeleton(pred), target)   / |skeleton(pred)|
+      tsens = overlap(skeleton(target), pred)   / |skeleton(target)|
+      clDice = 2 * tprec * tsens / (tprec + tsens)
+    Unlike area Dice, this is insensitive to small width/boundary errors and
+    penalizes broken connectivity directly. Because skeletonizing the
+    prediction must carry gradient (unlike the target skeleton, which is
+    already computed under no_grad elsewhere in this file), this is more
+    expensive than binary_dice_loss at the same resolution.
+    """
+    probability = probability.float()
+    target = target.float()
+    skeleton_pred = soft_skeletonize(probability, iterations)
+    skeleton_true = soft_skeletonize(target, iterations)
+
+    skeleton_pred_flat = skeleton_pred.flatten(1)
+    skeleton_true_flat = skeleton_true.flatten(1)
+    probability_flat = probability.flatten(1)
+    target_flat = target.flatten(1)
+
+    tprec = (skeleton_pred_flat * target_flat).sum(dim=1) / (
+        skeleton_pred_flat.sum(dim=1) + eps
+    )
+    tsens = (skeleton_true_flat * probability_flat).sum(dim=1) / (
+        skeleton_true_flat.sum(dim=1) + eps
+    )
+    cl_dice = 2.0 * tprec * tsens / (tprec + tsens + eps)
+    return (1.0 - cl_dice).mean()
+
+
 def binary_tversky_loss(
     probability: Tensor,
     target: Tensor,
@@ -489,7 +529,7 @@ def binary_tversky_loss(
 
 
 class RoadSegCenterlineTverskyLoss(nn.Module):
-    """Compact road objective: weighted CE + Dice + centerline Tversky."""
+    """Compact road objective: weighted CE + clDice + centerline Tversky."""
 
     def __init__(
         self,
@@ -525,7 +565,9 @@ class RoadSegCenterlineTverskyLoss(nn.Module):
             road_logits.float(), labels, weight=class_weights
         )
         road_probability = road_logits.float().softmax(dim=1)[:, 1:2]
-        loss_main_dice = binary_dice_loss(road_probability, road_mask)
+        loss_main_cldice = soft_cldice_loss(
+            road_probability, road_mask, iterations=self.skeleton_iterations
+        )
 
         with torch.no_grad():
             # Skeletonize before reducing resolution.  This preserves narrow
@@ -581,13 +623,13 @@ class RoadSegCenterlineTverskyLoss(nn.Module):
         )
         total = (
             loss_main_ce
-            + self.main_dice_weight * loss_main_dice
+            + self.main_dice_weight * loss_main_cldice
             + self.aux_weight * loss_centerline
         )
         return {
             "loss_total": total,
             "loss_main_ce": loss_main_ce.detach(),
-            "loss_main_dice": loss_main_dice.detach(),
+            "loss_main_cldice": loss_main_cldice.detach(),
             "loss_aux_centerline": loss_centerline.detach(),
             "loss_centerline_tversky": loss_centerline.detach(),
         }
