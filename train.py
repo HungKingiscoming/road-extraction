@@ -410,6 +410,25 @@ def random_crop_pair(
     )
 
 
+def resize_pair(
+    image: np.ndarray, mask: np.ndarray, size: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Resize the full image/mask to size x size (no crop).
+
+    Ảnh dùng BILINEAR (mượt); mask dùng NEAREST rồi ngưỡng lại nhị phân --
+    resize mask bằng bilinear/bicubic sẽ tạo ra giá trị trung gian (vd 0.4)
+    ở biên đường, làm sai lệch nhãn nhị phân.
+    """
+    pil_image = Image.fromarray(np.ascontiguousarray(image)).resize(
+        (size, size), Image.BILINEAR
+    )
+    pil_mask = Image.fromarray(
+        np.ascontiguousarray(mask * 255).astype(np.uint8)
+    ).resize((size, size), Image.NEAREST)
+    resized_mask = (np.asarray(pil_mask) > 127).astype(np.uint8)
+    return np.asarray(pil_image, dtype=np.uint8), resized_mask
+
+
 def road_guided_occlusion(
     image: np.ndarray,
     mask: np.ndarray,
@@ -535,6 +554,7 @@ class RoadCropDataset(Dataset):
         road_crop_tries: int,
         road_occlusion_probability: float,
         road_occlusion_max_patches: int,
+        train_mode: str = "crop",
     ) -> None:
         self.pairs = list(pairs)
         self.crop_size = int(crop_size)
@@ -543,6 +563,10 @@ class RoadCropDataset(Dataset):
         self.road_crop_tries = int(road_crop_tries)
         self.road_occlusion_probability = float(road_occlusion_probability)
         self.road_occlusion_max_patches = int(road_occlusion_max_patches)
+        train_mode = str(train_mode).lower()
+        if train_mode not in {"crop", "resize"}:
+            raise ValueError("train_mode must be 'crop' or 'resize'")
+        self.train_mode = train_mode
 
     def __len__(self) -> int:
         return len(self.pairs)
@@ -552,14 +576,17 @@ class RoadCropDataset(Dataset):
         image, mask = read_rgb(image_path), read_binary_mask(mask_path)
         if image.shape[:2] != mask.shape:
             raise RuntimeError(f"Shape mismatch: {image_path} vs {mask_path}")
-        image, mask = random_crop_pair(
-            image,
-            mask,
-            self.crop_size,
-            self.road_crop_probability,
-            self.road_crop_min_fraction,
-            self.road_crop_tries,
-        )
+        if self.train_mode == "resize":
+            image, mask = resize_pair(image, mask, self.crop_size)
+        else:
+            image, mask = random_crop_pair(
+                image,
+                mask,
+                self.crop_size,
+                self.road_crop_probability,
+                self.road_crop_min_fraction,
+                self.road_crop_tries,
+            )
         image, mask = augment_pair(
             image,
             mask,
@@ -688,6 +715,7 @@ def make_loaders(
         road_crop_tries=args.road_crop_tries,
         road_occlusion_probability=args.road_occlusion_probability,
         road_occlusion_max_patches=args.road_occlusion_max_patches,
+        train_mode=args.train_mode,
     )
     val_dataset = RoadNativeValidationDataset(val_pairs)
     train_sampler: Optional[DistributedSampler]
@@ -1405,6 +1433,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split_seed", type=int, default=3407)
 
     parser.add_argument("--crop_size", type=int, default=1024)
+    parser.add_argument(
+        "--train_mode",
+        choices=("crop", "resize"),
+        default="crop",
+        help=(
+            "'crop': random_crop_pair, giữ nguyên độ phân giải gốc, mất "
+            "context toàn ảnh. 'resize': resize NGUYÊN ảnh về crop_size x "
+            "crop_size, giữ toàn cảnh nhưng thu nhỏ đường vốn đã mảnh; "
+            "road_crop_probability/road_crop_min_fraction/road_crop_tries "
+            "bị bỏ qua khi dùng 'resize'. LƯU Ý: validate()/sliding_window "
+            "vẫn luôn dùng native resolution (không resize) bất kể "
+            "train_mode -- 'resize' tạo lệch scale giữa train và inference."
+        ),
+    )
     parser.add_argument("--road_crop_probability", type=float, default=0.60)
     parser.add_argument("--road_crop_min_fraction", type=float, default=0.002)
     parser.add_argument("--road_crop_tries", type=int, default=8)
@@ -1803,6 +1845,14 @@ def main() -> None:
         f"crop={args.crop_size} | batch/GPU={args.batch_size} | "
         f"accumulation={args.accumulation_steps} | effective batch={effective_batch}"
     )
+    rank_zero_print(f"train_mode={args.train_mode}")
+    if args.train_mode == "resize":
+        rank_zero_print(
+            "  WARNING: train_mode=resize resizes the FULL image to "
+            f"{args.crop_size}x{args.crop_size}; validate()/sliding-window "
+            "inference still runs at native resolution unresized -- this is "
+            "a real train/inference scale mismatch, not a bug."
+        )
     rank_zero_print(
         f"shared ResNet34 to S8 | detail={args.detail_channels}ch S8 | "
         f"semantic anchor=256ch S16 | context={args.semantic_channels}ch S32 | DAPPM="
