@@ -830,7 +830,16 @@ def build_optimizer(model: DualBranchRoadNet, args: argparse.Namespace) -> AdamW
             # toward 0 proportionally to its own value every step -- while a
             # gate that starts away from 0 (semantic_to_detail_scale_1=0.10)
             # is barely affected. Matching by name fixes this asymmetry.
-            is_scale_param = parameter.ndim <= 1 or "scale" in name.lower()
+            # Match only the parameter's own local name (last dotted
+            # component), not the full path -- otherwise a *module* named
+            # with "scale" in it (e.g. ProgressiveDAPPM.scale0, the first
+            # pyramid pooling branch -- an unrelated naming convention, a
+            # real Conv2d weight, not a per-channel gate) would be wrongly
+            # swept into no_decay too. This was caught by the model's own
+            # verification script printing 7 matches instead of the
+            # expected 4 -- see conversation history.
+            local_name = name.rsplit(".", 1)[-1]
+            is_scale_param = parameter.ndim <= 1 or "scale" in local_name.lower()
             (no_decay if is_scale_param else decay).append(parameter)
         for suffix, values, weight_decay in (
             ("decay", decay, args.weight_decay),
