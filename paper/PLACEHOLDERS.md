@@ -75,9 +75,10 @@ Bracketed *paragraph* directives (`[RESULTS PARAGRAPH: ...]`,
 `[ABLATION PARAGRAPH, GATE: ...]`, and the rest) are drafting instructions, not
 text. Each states what the paragraph must establish once the numbers exist.
 
-Two `[VERIFY: ...]` notes mark claims that must be checked before submission:
-the DeepGlobe protocol used by the comparison methods, and rerunning the
-re-parameterization equivalence check on the final trained checkpoints.
+Three `[VERIFY: ...]` notes mark claims that must be checked before submission:
+the DeepGlobe protocol used by the comparison methods, rerunning the
+re-parameterization equivalence check on the final trained checkpoints, and the
+draft CRediT role assignment, which each author must confirm for themselves.
 
 ## Figures
 

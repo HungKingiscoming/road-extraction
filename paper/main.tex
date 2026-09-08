@@ -1,4 +1,4 @@
-%% DualBranchRoadNet manuscript
+%% DBR-Net manuscript
 %% Elsevier CAS single-column template (cas-sc.cls).
 %% Switch to cas-dc when the target journal requires a double-column layout.
 \documentclass[a4paper,fleqn]{cas-sc}
@@ -18,12 +18,11 @@
 
 \begin{document}
 
-\shorttitle{Dual-resolution road extraction with gated exchange}
+\shorttitle{DBR-Net for road extraction}
 \shortauthors{L.X. Thang et~al.}
 
-\title[mode=title]{DualBranchRoadNet: a persistent detail stream with gated
-semantic exchange and centerline supervision for road extraction from remote
-sensing imagery}
+\title[mode=title]{DBR-Net: A Gated Dual-branch Network with Centerline
+Supervision for Road Extraction from High-resolution Remote Sensing Imagery}
 
 %% Authors
 \author[1,3]{Le Xuan Thang}[type=editor,
@@ -34,8 +33,8 @@ sensing imagery}
 
 \author[1,3]{Giang Tuan Hung}[type=editor,
 	auid=000,bioid=1,
-  orcid=0000-0002-9911-3544]
-\ead{[hunggl@civix.com.vn]}
+  orcid=0009-0000-1313-4516]
+\ead{hunggl@civix.com.vn}
 
 \author[2,3]{Vu Manh Trung}[type=editor,
 	auid=000,bioid=1,
@@ -79,11 +78,12 @@ shadows, and vehicles, and are useful only when their connectivity is preserved.
 Encoder-decoder networks that downsample deeply discard the evidence for narrow
 roads before the decoder can recover it, whereas networks that hold high
 resolution throughout are costly at inference time. This paper presents
-DualBranchRoadNet, a segmentation network built around a detail stream that
-never leaves stride~8 and a semantic stream that descends to stride~32 to gather
-context. The two streams communicate through a single bilateral exchange
-regulated by a zero-initialized spatial gate, so that the network starts as an
-exact copy of an ungated residual exchange and acquires selectivity gradually.
+DBR-Net (Dual-Branch Road Network), a segmentation network built around a detail
+stream that never leaves stride~8 and a semantic stream that descends to
+stride~32 to gather context. The two streams communicate through a single
+bilateral exchange regulated by a zero-initialized spatial gate, so that the
+network starts as an exact copy of an ungated residual exchange and acquires
+selectivity gradually.
 Broad context is aggregated by a progressive pyramid pooling module built on
 group normalization and re-enters the detail stream through a controlled fusion
 step. Connectivity is supervised by an auxiliary centerline head trained with an
@@ -92,7 +92,7 @@ thinning applied before any downsampling. Every multi-branch block fuses exactly
 into a single convolution for deployment. On the Massachusetts Roads and
 DeepGlobe benchmarks, evaluated at native resolution with Hann-weighted
 sliding-window inference, the proposed network reaches a road IoU of
-[IOU\_MASS] and [IOU\_DG], exceeding the strongest baseline
+[Đien ket qua sau] and [Đien ket qua sau], exceeding the strongest baseline
 by [DELTA\_MASS] and [DELTA\_DG] percentage points at
 90.46~GMACs per 1024$\times$1024 tile after re-parameterization.
 \end{abstract}
@@ -164,7 +164,7 @@ preserved by construction, the semantic stream contributes only where it helps,
 connectivity is supervised without external dependencies, and the multi-branch
 machinery collapses into a single-path network for deployment.
 
-DualBranchRoadNet is designed around those requirements. A detail stream is
+DBR-Net is designed around those requirements. A detail stream is
 anchored at stride~8 and never descends further, so evidence for narrow roads is
 never destroyed. A semantic stream anchored at stride~16 reaches stride~32 only
 to collect context, and exactly one bilateral exchange, between stride~8 and
@@ -387,17 +387,17 @@ the detail stream and $\mathbf{S}$ the semantic stream.
 \begin{figure*}[pos=t]
 \centering
 \placeholderfig[0.95\linewidth]{figs/architecture.pdf - overall
-DualBranchRoadNet architecture: shared ResNet-34 encoder, persistent stride-8
+DBR-Net architecture: shared ResNet-34 encoder, persistent stride-8
 detail stream, semantic stride-16/32 stream, single gated bilateral exchange,
 ProgressiveDAPPM, ControlledRoadFusion, and the reconstruction decoder with the
 training-only centerline head.}
-\caption{Architecture of DualBranchRoadNet. Solid arrows carry features, dashed
+\caption{Architecture of DBR-Net. Solid arrows carry features, dashed
 arrows carry gated residual terms, and the centerline head is active only during
 training.}
 \label{fig:architecture}
 \end{figure*}
 
-DualBranchRoadNet is assembled from five modules on top of a shared encoder, as
+DBR-Net is assembled from five modules on top of a shared encoder, as
 shown in Fig.~\ref{fig:architecture}. The encoder
 (Section~\ref{subsec:encoder}) extracts five feature levels from the input tile.
 The dual-resolution context module (Section~\ref{subsec:dualres}) splits those
@@ -429,7 +429,7 @@ widths, and parameter counts. The counts are exact and follow from the default
 configuration; they are independent of any experimental outcome.
 
 \begin{table*}[pos=t]
-\caption{Modules of DualBranchRoadNet in the default configuration.}
+\caption{Modules of DBR-Net in the default configuration.}
 \label{tab:modules}
 \footnotesize
 \begin{tabular*}{\tblwidth}{@{}LLLR@{}}
@@ -1053,7 +1053,7 @@ threshold is then applied unchanged to the test split.
 \label{subsec:sota}
 
 Table~\ref{tab:sota} reports road IoU, F1, and relaxed F1 on the Massachusetts
-and DeepGlobe test splits for DualBranchRoadNet and the comparison methods, all
+and DeepGlobe test splits for DBR-Net and the comparison methods, all
 trained and evaluated under the shared protocol of
 Section~\ref{sec:experimental-setup}.
 
@@ -1078,7 +1078,7 @@ SegFormer \cite{xie2021segformer}      & [VAL] & [VAL] & [VAL] & [VAL] & [VAL] &
 CoANet \cite{mei2021coanet}            & [VAL] & [VAL] & [VAL] & [VAL] & [VAL] & [VAL] \\
 DDRNet \cite{pan2023ddrnet}            & [VAL] & [VAL] & [VAL] & [VAL] & [VAL] & [VAL] \\
 \midrule
-DualBranchRoadNet (ours)                & [VAL] & [VAL] & [VAL] & [VAL] & [VAL] & [VAL] \\
+DBR-Net (ours)                         & [VAL] & [VAL] & [VAL] & [VAL] & [VAL] & [VAL] \\
 \bottomrule
 %* \end{tabular}
 
@@ -1225,7 +1225,7 @@ those values here in place of the untrained-network figures.]
 \begin{figure*}[pos=t]
 \centering
 \placeholderfig[0.95\linewidth]{figs/qualitative.pdf - image, ground truth,
-two strongest baselines, and DualBranchRoadNet on: (a) a tree-occluded suburban
+two strongest baselines, and DBR-Net on: (a) a tree-occluded suburban
 road; (b) a narrow rural road adjacent to a river; (c) a multi-lane interchange;
 (d) a failure case.}
 \caption{Qualitative comparison on selected test scenes. Rows (a) to (c)
@@ -1268,7 +1268,7 @@ resolution sensitivity or degradation on a particular scene type.]
 This paper addressed road extraction from high-resolution optical imagery under
 the three constraints that distinguish it from general segmentation: severe class
 imbalance, structures too thin to survive deep downsampling, and a quality
-criterion that depends on connectivity rather than on area. DualBranchRoadNet
+criterion that depends on connectivity rather than on area. DBR-Net
 responds with a detail stream held at stride~8 for its entire length, a semantic
 stream that gathers context at stride~32 without being asked to preserve thin
 structures, and a single bilateral exchange between them regulated by a
@@ -1292,16 +1292,28 @@ stage, and testing whether the gated exchange transfers to sensors other than
 three-band optical imagery, are the directions we consider most likely to be
 productive.
 
+\section*{CRediT authorship contribution statement}
+\textbf{Le Xuan Thang:} Conceptualization, Methodology, Writing -- original
+draft. \textbf{Giang Tuan Hung:} Software, Data curation, Investigation,
+Validation, Visualization. \textbf{Vu Manh Trung:} Software, Formal analysis,
+Investigation, Writing -- original draft. \textbf{Tran Ngoc Hoa:}
+Conceptualization, Supervision, Project administration, Resources, Writing --
+review \& editing.
+
 \section*{Declaration of competing interest}
 The authors declare that they have no known competing financial interests or
 personal relationships that could have appeared to influence the work reported in
 this paper.
 
+\section*{Acknowledgements}
+
+This research is funded by ...... under grant number .......
+
+
 \section*{Data availability}
-The Massachusetts Roads dataset \cite{mnih2013aerial} and the DeepGlobe road
-extraction dataset \cite{demir2018deepglobe} are publicly available from their
-original sources. The implementation, training configurations, and split
-manifests supporting this study are available at [CODE\_REPOSITORY\_URL].
+All datasets used in this study are publicly available. 
+The The Massachusetts Roads dataset used in this study is publicly available via Kaggle (\url{https://www.kaggle.com/datasets/datnguyentien204/massachu}). 
+The DeepGlobe Dataset used in this study is publicly available via Kaggle (\url{https://www.kaggle.com/datasets/balraj98/deepglobe-road-extraction-dataset}). 
 
 \bibliographystyle{IEEEtran}
 \bibliography{references}
