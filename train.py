@@ -1620,6 +1620,18 @@ def parse_args() -> argparse.Namespace:
         "--channels_last", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument("--pretrained_checkpoint", default=None)
+    parser.add_argument(
+        "--freeze_params",
+        nargs="*",
+        default=(),
+        help=(
+            "Exact model.named_parameters() names to permanently freeze "
+            "(requires_grad=False) after loading weights, before the "
+            "optimizer is built -- e.g. "
+            "dual_branch.detail_to_semantic_scale_1. Unlike resetting a "
+            "value alone, this stops gradient from moving it back."
+        ),
+    )
     parser.add_argument("--transfer_weights", choices=("ema", "model"), default="ema")
     parser.add_argument("--resume", default=None)
     parser.add_argument("--save_dir", default="./checkpoints/dual_branch_roadnet")
@@ -1815,6 +1827,21 @@ def main() -> None:
             model, args.pretrained_checkpoint, args.transfer_weights, device
         )
         rank_zero_print(f"Transferred {args.transfer_weights} weights from {loaded}")
+    if args.freeze_params:
+        available = dict(model.named_parameters())
+        for target_name in args.freeze_params:
+            if target_name not in available:
+                raise ValueError(
+                    f"--freeze_params: '{target_name}' not found in "
+                    f"model.named_parameters(). Example valid names: "
+                    f"{list(available)[:5]}"
+                )
+            parameter = available[target_name]
+            parameter.requires_grad_(False)
+            rank_zero_print(
+                f"[freeze_params] {target_name}: requires_grad=False, "
+                f"value frozen at {parameter.detach().flatten()[:3].tolist()}..."
+            )
     rank_zero_print("[startup 5/5] Building optimizer, EMA, loss, and DDP reducer...")
 
     # Build the optimizer and DDP reducer while every parameter is trainable.
