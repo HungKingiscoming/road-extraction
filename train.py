@@ -814,13 +814,24 @@ def build_optimizer(model: DualBranchRoadNet, args: argparse.Namespace) -> AdamW
     }
     groups: List[Dict] = []
     seen: set[int] = set()
-    for group_name, parameters in model.optimization_modules().items():
+    for group_name, named_parameters in model.optimization_modules().items():
         decay, no_decay = [], []
-        for parameter in parameters:
+        for name, parameter in named_parameters:
             if id(parameter) in seen:
                 raise RuntimeError(f"Duplicate optimizer parameter in {group_name}")
             seen.add(id(parameter))
-            (no_decay if parameter.ndim <= 1 else decay).append(parameter)
+            # Per-channel gate/scale parameters (semantic_to_detail_scale_1,
+            # detail_to_semantic_scale_1, context_scale, fusion_scale) are
+            # stored with broadcast shape (1, C, 1, 1) -- ndim==4 -- but play
+            # the exact same role as BatchNorm weight/bias (ndim==1): a
+            # per-channel multiplicative scale, not a weight matrix. A plain
+            # ndim<=1 check puts them in the decay group by mistake, pulling
+            # a zero-initialized gate (detail_to_semantic_scale_1) back
+            # toward 0 proportionally to its own value every step -- while a
+            # gate that starts away from 0 (semantic_to_detail_scale_1=0.10)
+            # is barely affected. Matching by name fixes this asymmetry.
+            is_scale_param = parameter.ndim <= 1 or "scale" in name.lower()
+            (no_decay if is_scale_param else decay).append(parameter)
         for suffix, values, weight_decay in (
             ("decay", decay, args.weight_decay),
             ("no_decay", no_decay, 0.0),
