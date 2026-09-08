@@ -46,3 +46,16 @@ events.out.tfevents.*
 /CoANet_prepared_reference/
 /data/
 /datasets/
+
+# Paper build products (source remains tracked)
+paper/**/*.aux
+paper/**/*.bbl
+paper/**/*.blg
+paper/**/*.fdb_latexmk
+paper/**/*.fls
+paper/**/*.log
+paper/**/*.out
+paper/**/*.synctex.gz
+paper/**/*.abs
+paper/**/*.spl
+paper/main.pdf

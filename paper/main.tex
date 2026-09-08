@@ -1,0 +1,1309 @@
+%% DualBranchRoadNet manuscript
+%% Elsevier CAS single-column template (cas-sc.cls).
+%% Switch to cas-dc when the target journal requires a double-column layout.
+\documentclass[a4paper,fleqn]{cas-sc}
+
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{amsmath}
+
+% Placeholder figure box.  Every occurrence marks a figure that still has to be
+% produced from an experiment snapshot and placed in figs/.
+\newcommand{\placeholderfig}[2][0.86\linewidth]{%
+  \fbox{\parbox[c][3.4cm][c]{#1}{\centering\footnotesize\ttfamily
+    [FIGURE PLACEHOLDER]\\[4pt]#2}}%
+}
+
+\begin{document}
+
+\shorttitle{Dual-resolution road extraction with gated exchange}
+\shortauthors{L.X. Thang et~al.}
+
+\title[mode=title]{DualBranchRoadNet: a persistent detail stream with gated
+semantic exchange and centerline supervision for road extraction from remote
+sensing imagery}
+
+%% Authors
+\author[1,3]{Le Xuan Thang}[type=editor,
+	auid=000,bioid=1,
+	orcid=0000-0002-9911-3544]
+\ead{lexuanthang.official@outlook.com}
+\ead[url]{https://lexuanthang.vn}
+
+\author[1,3]{Giang Tuan Hung}[type=editor,
+	auid=000,bioid=1,
+  orcid=0000-0002-9911-3544]
+\ead{[hunggl@civix.com.vn]}
+
+\author[2,3]{Vu Manh Trung}[type=editor,
+	auid=000,bioid=1,
+	orcid=0009-0009-7596-1520]
+\ead{trung211101196@lms.utc.edu.vn}
+
+\author[2,3]{Tran Ngoc Hoa}[type=editor,
+	auid=000,bioid=1,
+	orcid=0009-0005-9255-3263]
+\cormark[1]
+\ead{ngochoa@utc.edu.vn}
+
+%% Corresponding author
+\cortext[cor=1]{Corresponding author}
+
+%% Affiliations
+\affiliation[1]{
+	organization={CIVIX - Civil Intelligence and eXpanded Data Company Limited},
+	city={Hanoi},
+	country={Vietnam}
+}
+
+\affiliation[2]{
+	organization={Faculty of Civil and Environmental Engineering, University of Transport and Communications},
+	city={Hanoi},
+	country={Vietnam}
+}
+
+\affiliation[3]{
+	organization={The Application of Artificial Intelligence in Structural Health Monitoring (AI-SHM) Research Group, University of Transport and Communications},
+	city={Hanoi},
+	country={Vietnam}
+}
+
+\begin{abstract}
+Automatic road extraction from high-resolution satellite and aerial imagery
+supports map updating, logistics planning, and post-disaster response. The task
+remains difficult because road surfaces cover only a few percent of the pixels,
+form thin and elongated structures that are frequently occluded by trees,
+shadows, and vehicles, and are useful only when their connectivity is preserved.
+Encoder-decoder networks that downsample deeply discard the evidence for narrow
+roads before the decoder can recover it, whereas networks that hold high
+resolution throughout are costly at inference time. This paper presents
+DualBranchRoadNet, a segmentation network built around a detail stream that
+never leaves stride~8 and a semantic stream that descends to stride~32 to gather
+context. The two streams communicate through a single bilateral exchange
+regulated by a zero-initialized spatial gate, so that the network starts as an
+exact copy of an ungated residual exchange and acquires selectivity gradually.
+Broad context is aggregated by a progressive pyramid pooling module built on
+group normalization and re-enters the detail stream through a controlled fusion
+step. Connectivity is supervised by an auxiliary centerline head trained with an
+asymmetric Tversky objective whose targets come from a pure-tensor morphological
+thinning applied before any downsampling. Every multi-branch block fuses exactly
+into a single convolution for deployment. On the Massachusetts Roads and
+DeepGlobe benchmarks, evaluated at native resolution with Hann-weighted
+sliding-window inference, the proposed network reaches a road IoU of
+[IOU\_MASS] and [IOU\_DG], exceeding the strongest baseline
+by [DELTA\_MASS] and [DELTA\_DG] percentage points at
+90.46~GMACs per 1024$\times$1024 tile after re-parameterization.
+\end{abstract}
+
+\begin{keywords}
+road extraction \sep semantic segmentation \sep remote sensing \sep
+structural re-parameterization \sep global-local context \sep feature fusion
+\end{keywords}
+
+\maketitle
+
+\section{Introduction}
+\label{sec:introduction}
+
+Road networks are a primary layer of nearly every geospatial information system,
+and keeping that layer current is a recurring cost. New construction, closures,
+and damage after floods or earthquakes change the network faster than manual
+digitization can follow. High-resolution optical satellite and aerial imagery is
+now acquired at sub-meter to meter ground sampling distance over most inhabited
+areas, which makes automated extraction of road surfaces from such imagery a
+practical route to map maintenance \cite{luweng2025roadreview}. The applications
+that consume the result, including routing, logistics, and the allocation of
+emergency access after a disaster, depend less on the exact area of the predicted
+road surface than on whether the extracted network remains connected.
+
+Road extraction is usually posed as binary semantic segmentation, yet several
+properties separate it from the object-centric problems that drive most
+architectural progress. Roads occupy roughly two to five percent of the pixels in
+a typical scene, so an unweighted pixel objective converges toward a near-empty
+prediction and pixel accuracy carries almost no information. At one meter per
+pixel a two-lane road is between eight and twenty pixels wide; a feature map at
+stride 32 represents it with less than one pixel, and no decoder can reliably
+reconstruct what the encoder has already discarded. The structures are also
+anisotropic and long-range: rivers, field boundaries, fences, and elongated
+rooftops are locally indistinguishable from roads, and only regional context
+resolves the ambiguity. Occlusion compounds the difficulty, because a five-pixel
+gap caused by a tree canopy leaves the intersection-over-union nearly unchanged
+while destroying an entire route. Evaluation protocols that report only pixel
+overlap therefore reward the wrong behavior.
+
+Two lines of work address these properties. The first adapts general-purpose
+encoder-decoder segmentation networks to aerial imagery, from U-Net
+\cite{ronneberger2015unet} and Deep Residual U-Net \cite{zhang2018resunet} to
+D-LinkNet \cite{zhou2018dlinknet}, and then improves feature aggregation through
+multi-resolution exchange \cite{wang2021hrnet} or attention decoders
+\cite{xie2021segformer}. The second supervises connectivity directly, either
+through auxiliary geometric targets such as road orientation
+\cite{batra2019connectivity} and connectivity attention \cite{mei2021coanet}, or
+through topology-aware objectives such as clDice \cite{shit2021cldice} and the
+asymmetric Tversky loss \cite{salehi2017tversky}.
+Section~\ref{sec:related-work} reviews both lines in detail.
+
+Three issues remain unresolved across them. Preserving a high-resolution stream
+is effective, yet the usual mechanism, symmetric exchange among all resolution
+pairs \cite{wang2021hrnet, yu2021bisenetv2, pan2023ddrnet}, spends part of its
+budget on exchanges a thin-structure task cannot use: a stride-32 map cannot
+represent an eight-pixel road, so requiring it to participate in a
+detail-preserving exchange contributes little. Connectivity supervision is
+likewise effective, but published formulations either depend on external
+morphological libraries, which complicates reproducibility and distributed
+training, or skeletonize after the label has been downsampled, which merges
+narrow branches and intersections before they can be supervised. The third issue
+is discussed less often: multi-branch blocks and parallel context modules that
+improve accuracy also slow inference on the large scenes operational mapping
+requires, and structural re-parameterization \cite{ding2021repvgg}, which removes
+that cost exactly, has to our knowledge not been combined with a road-specific
+detail-preserving design. An architecture is needed in which the detail stream is
+preserved by construction, the semantic stream contributes only where it helps,
+connectivity is supervised without external dependencies, and the multi-branch
+machinery collapses into a single-path network for deployment.
+
+DualBranchRoadNet is designed around those requirements. A detail stream is
+anchored at stride~8 and never descends further, so evidence for narrow roads is
+never destroyed. A semantic stream anchored at stride~16 reaches stride~32 only
+to collect context, and exactly one bilateral exchange, between stride~8 and
+stride~16, connects the two. Each direction of that exchange is a residual term
+modulated by a single-channel spatial gate whose final convolution is
+zero-initialized, so the gate evaluates to one at initialization and the network
+begins as an exact copy of the ungated variant, leaving the pretrained feature
+distribution undisturbed. Context is aggregated by a progressive pyramid module
+that adds pooling scales from fine to coarse and uses group normalization
+\cite{wu2018groupnorm}, which keeps the global pooling branch valid at the small
+per-device batch sizes imposed by 1024-pixel crops. The context returns to the
+detail stream through a fusion step that normalizes the two streams separately
+and admits semantics through a learnable per-channel scale. Connectivity is
+supervised by an auxiliary centerline head trained with a Tversky loss
+\cite{salehi2017tversky} whose targets are generated by morphological thinning
+implemented entirely with max-pooling and applied before any downsampling. All
+multi-branch blocks are re-parameterizable \cite{ding2021repvgg} and fuse into
+single convolutions after training.
+
+The experimental program evaluates the model on the Massachusetts Roads dataset
+\cite{mnih2013aerial} and the DeepGlobe road extraction dataset
+\cite{demir2018deepglobe}, which differ in ground sampling distance, scene
+composition, and image size. Every evaluation runs at native resolution with
+overlapping tiles blended by a Hann window in the logit domain, so reported
+scores are not inflated by resizing. The primary metric is the
+intersection-over-union of the road class alone; a relaxed F1 score with a
+three-pixel tolerance is reported alongside it to separate route quality from
+boundary precision. Ablations isolate the spatial gate, the centerline objective,
+the occlusion augmentation, and the progressive context module, and a separate
+study quantifies the accuracy and compute effect of re-parameterization.
+
+The contributions of this work are the following.
+
+\begin{enumerate}
+\item An asymmetric dual-resolution architecture for road extraction in which a
+      stride-8 detail stream is preserved by construction and a single gated
+      bilateral exchange, rather than an all-pairs exchange, couples it to a
+      semantic stream.
+\item A zero-initialized single-channel spatial gate that makes the gated
+      exchange an exact extension of an ungated residual exchange at
+      initialization, so selectivity is learned without perturbing pretrained
+      features.
+\item A centerline supervision scheme whose targets are produced by
+      max-pooling-based morphological thinning applied before downsampling and
+      optimized with an asymmetric Tversky loss that penalizes broken roads more
+      heavily than spurious ones.
+\item A road-guided occlusion augmentation that draws shadows, vegetation, and
+      vehicles onto labeled road pixels while leaving the target mask unchanged,
+      which converts occlusion into an explicit reconstruction objective.
+\item An evaluation and deployment protocol combining native-resolution
+      Hann-blended inference, manifest-recorded splits, validation-only threshold
+      calibration, and structural re-parameterization verified to float32
+      round-off.
+\end{enumerate}
+
+The remainder of this paper is organized as follows.
+Section~\ref{sec:related-work} reviews road extraction architectures,
+multi-resolution designs, connectivity supervision, and structural
+re-parameterization. Section~\ref{sec:methods} presents the overall architecture
+and each of its modules, followed by the training objective.
+Section~\ref{sec:experimental-setup} specifies the datasets, splits, training
+strategy, and metrics. Section~\ref{sec:results-discussion} reports the
+comparison with prior work, the ablation studies, the efficiency analysis, and
+the limitations. Section~\ref{sec:conclusion} summarizes the findings.
+
+\section{Related work}
+\label{sec:related-work}
+
+\subsection{Encoder-decoder networks for road extraction}
+\label{subsec:rw-encdec}
+
+Road extraction moved to fully convolutional models with the release of the
+Massachusetts Roads dataset \cite{mnih2013aerial}, which established patch-based
+learning of road masks from aerial imagery as a benchmark task. U-Net
+\cite{ronneberger2015unet} introduced the skip-connected encoder-decoder that
+most later road models inherit: the encoder builds semantic capacity by
+downsampling, and lateral skips return spatial detail to the decoder. Deep
+Residual U-Net \cite{zhang2018resunet} replaced the plain encoder with residual
+units and reported improved road delineation on Massachusetts with fewer
+parameters than the original.
+
+The DeepGlobe challenge \cite{demir2018deepglobe} shifted attention to
+0.5\,m/pixel satellite imagery and larger scene variety. Its winning entry,
+D-LinkNet \cite{zhou2018dlinknet}, inserted a cascade of dilated convolutions at
+the encoder bottleneck, enlarging the receptive field without an additional
+downsampling stage, and it remains the reference baseline on that benchmark. The
+shared limitation of this family is structural rather than incidental. Skip
+connections return detail that survived the encoder, but a road eight to twenty
+pixels wide is represented by a fraction of a pixel at stride 32, so what the
+decoder receives through the deepest skips is context, not geometry. Dilation
+mitigates the problem by avoiding one downsampling step; it does not remove the
+dependence on a deeply downsampled trunk.
+
+\subsection{Multi-resolution and dual-branch architectures}
+\label{subsec:rw-multires}
+
+A second design maintains high resolution throughout the network instead of
+recovering it. HRNet \cite{wang2021hrnet} runs parallel branches at several
+resolutions and repeatedly exchanges information among all of them, which keeps a
+high-resolution representation available at every depth. The approach is
+effective for position-sensitive tasks, but the exchange is dense: every pair of
+resolutions is fused at every stage, and the cost grows with the number of
+branches.
+
+Real-time segmentation networks reduce that cost to two branches. BiSeNet~V2
+\cite{yu2021bisenetv2} pairs a shallow detail branch with a deeper semantic
+branch and merges them once through a guided aggregation layer. DDRNet
+\cite{pan2023ddrnet} keeps two resolutions throughout and exchanges between them
+repeatedly, and introduces the deep aggregation pyramid pooling module to enlarge
+the receptive field at the low-resolution branch. Both were designed for
+street-level traffic scenes, where objects are large and the detail branch mainly
+sharpens boundaries. Overhead road imagery inverts that balance: the structures
+of interest are themselves near the resolution limit, so which resolutions
+exchange, and under what control, matters more than how many exchanges occur.
+Neither design gates the exchange spatially, and neither is initialized so that
+adding the exchange leaves a pretrained encoder undisturbed.
+
+Context aggregation modules developed for scene parsing are used across both
+families. Pyramid pooling \cite{zhao2017pspnet} and atrous spatial pyramid
+pooling \cite{chen2018deeplabv3plus} both compute several receptive-field scales
+in parallel and combine them once at the end. The deep aggregation variant
+\cite{pan2023ddrnet} adds hierarchical residual connections among the pooling
+branches. These modules are normally built on batch normalization, which becomes
+unreliable at the small per-device batch sizes that 1024-pixel remote sensing
+crops impose, particularly for a branch that pools to a single spatial location.
+
+\subsection{Connectivity and topology-aware supervision}
+\label{subsec:rw-topology}
+
+Because pixel overlap is insensitive to short breaks, a separate line of work
+supervises connectivity explicitly. Batra et al.~\cite{batra2019connectivity}
+predict a road orientation field jointly with the mask and use it in a stacked
+refinement stage that reconnects fragmented predictions. CoANet
+\cite{mei2021coanet} matches the network to road geometry directly, using strip
+convolutions along four directions together with a connectivity attention module
+that predicts whether neighboring locations belong to the same road.
+
+Loss functions attack the same problem without changing the architecture. Region
+losses of the Dice family \cite{milletari2016vnet} and reweighted classification
+losses \cite{lin2017focal} counteract the imbalance itself, and the Tversky loss
+\cite{salehi2017tversky} generalizes Dice with separate weights for false
+positives and false negatives, so an application can declare which error is worse.
+clDice \cite{shit2021cldice} measures overlap between the skeletons of prediction
+and label, which makes a break expensive even when it costs few pixels, and
+provides a differentiable soft skeletonization built from morphological
+operations.
+
+Two practical constraints in this literature motivate the present design. First,
+skeleton-based supervision is often implemented with external morphological
+libraries operating on CPU arrays, which complicates distributed training and
+makes the target dependent on a library version. Second, when the auxiliary head
+sits at a reduced stride, the natural implementation downsamples the label and
+then thins it; that order merges narrow branches and intersections, which are
+precisely the structures the term is meant to protect.
+
+\subsection{Structural re-parameterization}
+\label{subsec:rw-reparam}
+
+Multi-branch blocks improve optimization but cost inference time. RepVGG
+\cite{ding2021repvgg} showed that a training-time block of parallel $3\times3$,
+$1\times1$, and identity paths, each followed by batch normalization, can be
+folded algebraically into a single $3\times3$ convolution, so the deployed model
+is a plain sequential stack with no accuracy loss. The transformation is exact:
+batch normalization folds into the preceding convolution, and kernels padded to a
+common size sum linearly.
+
+Re-parameterization has been applied mainly to classification backbones and
+general-purpose detectors. Its combination with a detail-preserving segmentation
+design for remote sensing, where inference runs over thousands of overlapping
+tiles per scene and branch-level memory traffic is a real cost, has to our
+knowledge not been reported. The blocks used here follow the same algebra but add
+anisotropic $1\times5$ and $5\times1$ depthwise branches, chosen for the
+elongated geometry of road segments, that fuse into a single $5\times5$ depthwise
+kernel.
+
+\section{Methodology}
+\label{sec:methods}
+
+\subsection{Problem formulation and notation}
+\label{subsec:formulation}
+
+Let $\mathbf{I} \in \mathbb{R}^{3 \times H \times W}$ denote an optical RGB image
+of height $H$ and width $W$, and let
+$\mathbf{Y} \in \{0,1\}^{H \times W}$ denote the corresponding label, where
+$Y_{ij} = 1$ marks a road-surface pixel. The task is to learn a mapping
+$f_{\boldsymbol{\theta}}$ that produces two-channel logits at the input
+resolution,
+%
+\begin{equation}
+\label{eq:task}
+\mathbf{Z} = f_{\boldsymbol{\theta}}(\mathbf{I}) \in
+\mathbb{R}^{2 \times H \times W},
+\end{equation}
+%
+where $\boldsymbol{\theta}$ collects all trainable parameters. The road
+probability map $\mathbf{P} \in [0,1]^{H \times W}$ and the predicted mask
+$\hat{\mathbf{Y}}$ follow from the channel-wise softmax and a decision threshold
+$\tau$,
+%
+\begin{equation}
+\label{eq:threshold}
+P_{ij} = \frac{\exp(Z_{1ij})}{\exp(Z_{0ij}) + \exp(Z_{1ij})},
+\qquad
+\hat{Y}_{ij} = \mathbb{1}\!\left[P_{ij} \ge \tau\right],
+\end{equation}
+%
+with $\mathbb{1}[\cdot]$ the indicator function. The default threshold is
+$\tau = 0.5$; Section~\ref{subsec:metrics} describes how a calibrated threshold
+is estimated on validation data only.
+
+Feature tensors are written $\mathbf{F}^{(s)}
+\in \mathbb{R}^{C \times H/s \times W/s}$, where the superscript is the output
+stride $s$ relative to the input. Scalars are italic lowercase, vectors bold
+lowercase, and tensors bold uppercase. Throughout the paper, $\mathbf{D}$ denotes
+the detail stream and $\mathbf{S}$ the semantic stream.
+
+\subsection{Overall architecture}
+\label{subsec:overview}
+
+\begin{figure*}[pos=t]
+\centering
+\placeholderfig[0.95\linewidth]{figs/architecture.pdf - overall
+DualBranchRoadNet architecture: shared ResNet-34 encoder, persistent stride-8
+detail stream, semantic stride-16/32 stream, single gated bilateral exchange,
+ProgressiveDAPPM, ControlledRoadFusion, and the reconstruction decoder with the
+training-only centerline head.}
+\caption{Architecture of DualBranchRoadNet. Solid arrows carry features, dashed
+arrows carry gated residual terms, and the centerline head is active only during
+training.}
+\label{fig:architecture}
+\end{figure*}
+
+DualBranchRoadNet is assembled from five modules on top of a shared encoder, as
+shown in Fig.~\ref{fig:architecture}. The encoder
+(Section~\ref{subsec:encoder}) extracts five feature levels from the input tile.
+The dual-resolution context module (Section~\ref{subsec:dualres}) splits those
+features into a detail stream held at stride~8 and a semantic stream anchored at
+stride~16, and couples them through one bilateral exchange whose two directions
+are modulated by residual spatial gates (Section~\ref{subsec:gate}). Broad
+context is collected at stride~32 by a progressive pyramid pooling module
+(Section~\ref{subsec:dappm}) and returned to the semantic stream. The two streams
+merge in a controlled fusion module (Section~\ref{subsec:fusion}), and a
+reconstruction decoder (Section~\ref{subsec:decoder}) restores the full input
+resolution and emits the logits of Eq.~\eqref{eq:task}. Every convolutional
+refinement inside these modules is a re-parameterizable block
+(Section~\ref{subsec:reparam}) that collapses to a single convolution after
+training.
+
+The organizing principle is an asymmetry between the two streams. The detail
+stream is responsible for spatial fidelity and is never downsampled, so evidence
+for a road eight to twenty pixels wide is preserved end to end. The semantic
+stream is responsible for regional context and is never asked to preserve thin
+structures, which is why it is free to descend to stride~32. Consequently there
+is exactly one genuine bilateral exchange in the network, between stride~8 and
+stride~16, rather than an exchange between every pair of resolutions as in
+HRNet~\cite{wang2021hrnet}. Information passes from stride~32 to the detail
+stream only indirectly, through the semantic stream, so the coarsest map is never
+required to carry road geometry.
+
+Table~\ref{tab:modules} lists the modules with their operating strides, channel
+widths, and parameter counts. The counts are exact and follow from the default
+configuration; they are independent of any experimental outcome.
+
+\begin{table*}[pos=t]
+\caption{Modules of DualBranchRoadNet in the default configuration.}
+\label{tab:modules}
+\footnotesize
+\begin{tabular*}{\tblwidth}{@{}LLLR@{}}
+
+%* \begin{tabular}
+\toprule
+Module & Role & Stride (channels) & Params \\
+\midrule
+Shared encoder (Section~\ref{subsec:encoder})
+  & Truncated ResNet-34, five feature levels
+  & 2-32 (64-512) & 21\,284\,672 \\
+\midrule
+\multicolumn{4}{@{}l}{\textit{Dual-resolution context module
+  (Section~\ref{subsec:dualres})}} \\
+\quad Detail stream
+  & Projection and four RepVGG blocks, never downsampled
+  & 8 (96) & 383\,424 \\
+\quad Exchange projections
+  & $1\times1$ maps between the two streams
+  & 8 $\leftrightarrow$ 16 & 246\,464 \\
+\quad Residual spatial gates (Section~\ref{subsec:gate})
+  & Two single-channel gates, zero-initialized
+  & 8 and 16 (1) & 232\,050 \\
+\quad ProgressiveDAPPM (Section~\ref{subsec:dappm})
+  & Multi-scale context with projections
+  & 32 $\rightarrow$ 16 (192, 32) & 284\,864 \\
+\quad ControlledRoadFusion (Section~\ref{subsec:fusion})
+  & Normalized concatenation and gated residual
+  & 8 (96) & 55\,872 \\
+\quad Channel scales
+  & Per-channel residual weights $\boldsymbol{\gamma}$
+  & 8 and 16 & 608 \\
+\midrule
+Reconstruction decoder (Section~\ref{subsec:decoder})
+  & Stride 8 to 1, plus training-only centerline head
+  & 8 $\rightarrow$ 1 (64, 32, 24) & 53\,891 \\
+\midrule
+\textbf{Total (training form)} & & & \textbf{22\,541\,845} \\
+\textbf{Total (after fusion)} & & & \textbf{22\,502\,773} \\
+\bottomrule
+%* \end{tabular}
+
+\end{tabular*}
+
+\vspace{2pt}
+\begin{minipage}{\tblwidth}
+\raggedright
+\footnotesize
+\textit{Note:} The decoder count includes 18\,529 parameters of the auxiliary
+centerline head, which is evaluated only in training mode and therefore
+contributes no inference compute. The modules introduced beyond the encoder
+account for 1\,257\,173 parameters, or 5.6\% of the total.
+\end{minipage}
+\end{table*}
+
+\subsection{Re-parameterizable building blocks}
+\label{subsec:reparam}
+
+The refinement stages of every module are built from two block types that are
+multi-branch during training and single-branch at inference, following the
+re-parameterization principle of RepVGG~\cite{ding2021repvgg}. Introducing them
+first makes the module descriptions that follow self-contained.
+
+\paragraph{RepVGGBlock.} A standard-convolution block combining a $3 \times 3$
+convolution, a $1 \times 1$ convolution, and an identity path, each followed by
+batch normalization. It is used for the detail stream, where full channel mixing
+is required.
+
+\paragraph{RepDepthwiseBlock.} A depthwise block combining $3 \times 3$,
+$1 \times 5$, and $5 \times 1$ depthwise convolutions with an identity path,
+followed by a pointwise convolution. The two anisotropic kernels are chosen for
+the elongated geometry of road segments, so the block can learn horizontal and
+vertical responses separately rather than approximating both with one square
+kernel. It is used wherever refinement follows a fusion step, in the decoder and
+at the output of the controlled fusion module.
+
+Fusion into a single convolution proceeds in two stages. First, a convolution
+with weight $\mathbf{W}$ and bias $\mathbf{b}$ followed by batch normalization
+with running mean $\mu_c$, running variance $v_c$, scale $\beta_c$, shift
+$\delta_c$, and stability constant $\epsilon$ is equivalent to a single
+convolution whose parameters, for output channel $c$, are
+%
+\begin{equation}
+\label{eq:bnfold}
+\mathbf{W}'_c = \frac{\beta_c}{\sqrt{v_c + \epsilon}}\,\mathbf{W}_c,
+\qquad
+b'_c = \delta_c +
+\frac{\beta_c\,(b_c - \mu_c)}{\sqrt{v_c + \epsilon}} .
+\end{equation}
+%
+Second, every branch is folded by Eq.~\eqref{eq:bnfold}, the resulting kernels
+are zero-padded to the largest kernel size in the block, and the padded kernels
+and biases are summed,
+%
+\begin{equation}
+\label{eq:repsum}
+\mathbf{W}^{\star} = \sum_{m} \mathrm{Pad}\!\left(\mathbf{W}'_{m}\right),
+\qquad
+\mathbf{b}^{\star} = \sum_{m} \mathbf{b}'_{m},
+\end{equation}
+%
+where $m$ indexes the branches, including the identity path expressed as a
+centered Dirac kernel. A RepVGGBlock collapses to one $3 \times 3$ convolution
+with bias and a RepDepthwiseBlock to one $5 \times 5$ depthwise convolution with
+bias. The transformation is algebraic and introduces no approximation beyond
+floating-point rounding, which Section~\ref{subsec:efficiency} quantifies.
+
+\subsection{Shared encoder}
+\label{subsec:encoder}
+
+The encoder is a ResNet-34~\cite{he2016resnet} truncated after its last residual
+stage and initialized from ImageNet weights~\cite{deng2009imagenet}. It returns
+five feature levels rather than one: a stride-2 stem with 64 channels, a stride-4
+map with 64 channels, a stride-8 map with 128 channels, a stride-16 map with 256
+channels, and a stride-32 map with 512 channels. The stride-8 map is the input of
+the detail stream, the stride-16 and stride-32 maps feed the semantic stream, and
+the stride-2 and stride-4 maps are reserved as decoder skips.
+
+Both branches therefore start from pretrained features. This matters for the
+initialization strategy used throughout the network: several modules below begin
+as identity or near-identity operators specifically so that the pretrained
+statistics are not disturbed before the randomly initialized parts have learned
+anything useful.
+
+\subsection{Dual-resolution context module}
+\label{subsec:dualres}
+
+This module holds the two streams and the exchange between them.
+
+\paragraph{Detail stream.} The stride-8 encoder map is projected to
+$C_d = 96$ channels by a $1 \times 1$ convolution and refined by two RepVGG
+blocks, giving $\mathbf{D}_0 \in \mathbb{R}^{96 \times H/8 \times W/8}$. After
+the exchange it passes through two further RepVGG blocks. It stays at stride~8
+over its whole length, which is the structural commitment the design is built
+around.
+
+\paragraph{Semantic stream.} The semantic stream is anchored at the pretrained
+stride-16 map, $\mathbf{S}_0 \in \mathbb{R}^{256 \times H/16 \times W/16}$. The
+stride-32 map is projected to $C_s = 192$ channels and serves only as the input
+of the context module of Section~\ref{subsec:dappm}.
+
+\paragraph{Bilateral exchange.} Writing $\phi_{s \to d}$ and $\phi_{d \to s}$ for
+the $1 \times 1$ projections followed by bilinear resampling to the target
+resolution, the two residual terms are
+%
+\begin{equation}
+\label{eq:deltas}
+\boldsymbol{\Delta}_{s \to d} = \phi_{s \to d}(\mathbf{S}_0),
+\qquad
+\boldsymbol{\Delta}_{d \to s} = \phi_{d \to s}(\mathbf{D}_0).
+\end{equation}
+%
+Each term is modulated by a spatial gate $\mathbf{G}$ and weighted by a
+per-channel scale before it is added,
+%
+\begin{align}
+\label{eq:exchange-detail}
+\mathbf{D}_1 &= \mathrm{ReLU}\!\left(
+  \mathbf{D}_0 + \boldsymbol{\gamma}_{s \to d} \odot
+  \mathbf{G}_{s \to d} \odot \boldsymbol{\Delta}_{s \to d}
+\right), \\
+\label{eq:exchange-semantic}
+\mathbf{S}_1 &= \mathrm{ReLU}\!\left(
+  \mathbf{S}_0 + \boldsymbol{\gamma}_{d \to s} \odot
+  \mathbf{G}_{d \to s} \odot \boldsymbol{\Delta}_{d \to s}
+\right),
+\end{align}
+%
+where $\odot$ denotes broadcast elementwise multiplication,
+$\boldsymbol{\gamma}_{s \to d} \in \mathbb{R}^{96}$, and
+$\boldsymbol{\gamma}_{d \to s} \in \mathbb{R}^{256}$. The scales are initialized
+asymmetrically: every entry of $\boldsymbol{\gamma}_{s \to d}$ starts at $0.10$,
+so semantics assist the detail stream weakly from the first step, whereas
+$\boldsymbol{\gamma}_{d \to s}$ starts at zero, so the randomly initialized detail
+stream cannot perturb the pretrained semantic features before it carries useful
+information. Both remain free to grow or change sign during training, and their
+magnitudes are logged each epoch as a diagnostic of which route the network
+actually uses.
+
+\subsection{Residual spatial gate}
+\label{subsec:gate}
+
+Each direction of the exchange is filtered by a gate that decides \emph{where},
+not by how much on average, the residual term should act. The gate $g$ is a small
+convolutional block that receives the independently group-normalized target
+stream $\mathbf{T}$ and residual term $\boldsymbol{\Delta}$, and returns a
+single-channel map at the target resolution $h \times w$,
+%
+\begin{equation}
+\label{eq:gate}
+\mathbf{G} = 2\,\sigma\!\left(
+  g\!\left(\mathrm{GN}(\mathbf{T}),\, \mathrm{GN}(\boldsymbol{\Delta})\right)
+\right)
+\in \mathbb{R}^{1 \times h \times w},
+\end{equation}
+%
+where $\sigma$ is the logistic function and $\mathrm{GN}$ denotes group
+normalization~\cite{wu2018groupnorm}. Internally $g$ concatenates the two
+normalized inputs, applies a $3 \times 3$ convolution with group normalization
+and a SiLU activation, and reduces to one channel with a $1 \times 1$
+convolution.
+
+Three properties of Eq.~\eqref{eq:gate} are deliberate. The final convolution is
+initialized to zero, so $\mathbf{G} \equiv 1$ at the first step and the gated
+network is numerically identical to an ungated one; gating is therefore an exact
+extension of the simpler design rather than a different starting point, and the
+pretrained feature distribution is left untouched. The factor of two places unit
+gain in the interior of the range instead of at a saturated endpoint, so the gate
+can amplify as well as suppress. The output has a single channel because the
+decision the exchange has to make, whether a location is road-like, is primarily
+spatial; channel selectivity is already expressed by the per-channel scales
+$\boldsymbol{\gamma}$ in Eqs.~\eqref{eq:exchange-detail}
+and~\eqref{eq:exchange-semantic}, so a full channel attention map would add
+parameters without addressing the dominant factor.
+
+\subsection{Progressive deep aggregation pyramid pooling}
+\label{subsec:dappm}
+
+Context is aggregated at stride~32 by a progressive variant of deep aggregation
+pyramid pooling~\cite{pan2023ddrnet}. Let $\mathbf{X}$ be the projected stride-32
+map and let the pooling grids be traversed from fine to coarse,
+$k \in (8, 4, 2, 1)$. With $\mathbf{U}_0 = \psi_0(\mathbf{X})$ the output of a
+$1 \times 1$ projection, each stage is
+%
+\begin{equation}
+\label{eq:dappm}
+\mathbf{U}_k = \pi_k\!\left(
+  \mathbf{U}_{k^{-}} +
+  \mathrm{Up}\!\left(\psi_k\!\left(\mathrm{AvgPool}_{k \times k}
+  (\mathbf{X})\right)\right)
+\right),
+\end{equation}
+%
+where $\psi_k$ is a $1 \times 1$ projection, $\mathrm{Up}$ bilinear resampling to
+the resolution of $\mathbf{X}$, $\pi_k$ a $3 \times 3$ convolution, and $k^{-}$
+the preceding grid in the traversal. Each stage adds a broader context scale to
+the accumulated representation \emph{before} processing it, in contrast to
+pyramid pooling~\cite{zhao2017pspnet} and atrous spatial pyramid
+pooling~\cite{chen2018deeplabv3plus}, whose branches are computed independently
+and combined only at the end. All stages are concatenated, compressed by a
+$1 \times 1$ convolution, and added to a projected shortcut of $\mathbf{X}$.
+
+Every convolution in this module uses group normalization rather than batch
+normalization. The coarsest branch pools to a $1 \times 1$ grid, where batch
+statistics are estimated from a single spatial location per sample and are
+unreliable at the per-device batch size of two that 1024-pixel crops impose on a
+single device.
+
+The context returns to the semantic stream as a third gated residual,
+%
+\begin{equation}
+\label{eq:context}
+\mathbf{S}_2 = \mathrm{ReLU}\!\left(
+  \mathbf{S}_1 + \boldsymbol{\gamma}_c \odot \mathrm{Up}(\rho(\mathbf{U}))
+\right),
+\end{equation}
+%
+with $\rho$ a $1 \times 1$ projection to the semantic channel width and
+$\boldsymbol{\gamma}_c \in \mathbb{R}^{256}$ initialized to $0.10$ in every
+entry.
+
+\subsection{Controlled road fusion}
+\label{subsec:fusion}
+
+The semantic stream is projected to the detail width and resampled to stride~8,
+producing $\tilde{\mathbf{S}}$. Summing the two streams elementwise would force
+unrelated channel identities into correspondence, so the module instead
+normalizes them separately, concatenates along the channel axis, and compresses
+the result,
+%
+\begin{equation}
+\label{eq:fusion}
+\mathbf{M} = \omega\!\left(
+  \left[\mathrm{BN}_d(\mathbf{D}_2);\,
+        \mathrm{BN}_s(\tilde{\mathbf{S}})\right]
+\right),
+\qquad
+\mathbf{D}_3 = \mathcal{R}\!\left(
+  \mathrm{ReLU}\!\left(\mathbf{D}_2 +
+  \boldsymbol{\gamma}_f \odot \mathbf{M}\right)
+\right),
+\end{equation}
+%
+where $[\cdot;\cdot]$ is channel concatenation, $\omega$ a $1 \times 1$
+convolution back to $C_d$ channels, $\boldsymbol{\gamma}_f \in \mathbb{R}^{96}$ a
+per-channel scale initialized to $0.10$, and $\mathcal{R}$ a RepDepthwiseBlock
+that refines the fused road geometry. The detail stream remains the residual
+anchor, so semantic evidence enters as a correction whose magnitude the network
+controls channel by channel.
+
+\subsection{Road reconstruction decoder and centerline head}
+\label{subsec:decoder}
+
+The decoder returns the fused stride-8 representation to the input resolution in
+three steps. The fused map is projected to 64 channels and upsampled to stride~4,
+concatenated with a 32-channel projection of the stride-4 encoder map, fused back
+to 64 channels, and refined by two RepDepthwiseBlocks. The same pattern repeats
+at stride~2 against a 16-channel projection of the stem, with a fused width of 32
+channels. The result is resampled to the exact input size, passed through a
+separable convolution with 24 channels and dropout at rate 0.05, and mapped to
+two logits by a $1 \times 1$ convolution.
+
+An auxiliary head at stride~4 predicts a single-channel centerline map from the
+64-channel stride-4 representation, using a $3 \times 3$ convolution to 32
+channels followed by a $1 \times 1$ convolution. The head is evaluated only when
+the module is in training mode, so inference returns a single logits tensor and
+the auxiliary branch adds no inference compute. Its 18\,529 parameters remain in
+the checkpoint but are never executed at deployment.
+
+\subsection{Training objective}
+\label{subsec:loss}
+
+The objective combines a class-balanced pixel term, a region term, and a
+connectivity term,
+%
+\begin{equation}
+\label{eq:loss}
+\mathcal{L} = \mathcal{L}_{\mathrm{CE}}
++ \lambda_{\mathrm{dice}}\,\mathcal{L}_{\mathrm{dice}}
++ \lambda_{\mathrm{aux}}(t)\,\mathcal{L}_{\mathrm{cl}},
+\end{equation}
+%
+where $t$ is the epoch index. The three terms are defined below.
+
+\paragraph{Class-balanced cross-entropy.} $\mathcal{L}_{\mathrm{CE}}$ is the
+two-class cross-entropy with a weight of one on background and $w$ on the road
+class. The weight is derived from the training-set imbalance rather than tuned.
+Let $n_1$ be the number of road pixels and $n_0$ the number of background pixels
+over the training split; then
+%
+\begin{equation}
+\label{eq:roadweight}
+r = \frac{n_0}{n_1},
+\qquad
+w = \min\!\left(\sqrt{r},\, w_{\max}\right),
+\end{equation}
+%
+with $w_{\max} = 2.0$. The square root damps the raw ratio, which reaches one to
+two orders of magnitude, and the cap prevents the objective from being dominated
+by recall on datasets with especially sparse labels.
+
+\paragraph{Region term.} $\mathcal{L}_{\mathrm{dice}}$ is the soft Dice
+loss~\cite{milletari2016vnet} computed on the road probability map of
+Eq.~\eqref{eq:threshold} against the binary label, which stabilizes gradients
+when the positive class is rare. Its weight is $\lambda_{\mathrm{dice}} = 1$.
+
+\paragraph{Centerline term.} The connectivity term supervises the auxiliary head
+of Section~\ref{subsec:decoder} against a centerline target derived from the
+label without any external morphological library. Erosion and dilation on a soft
+mask $\mathbf{A}$ are expressed through max-pooling,
+%
+\begin{equation}
+\label{eq:morph}
+\mathrm{er}(\mathbf{A}) = -\mathrm{maxpool}_{3\times3}(-\mathbf{A}),
+\qquad
+\mathrm{di}(\mathbf{A}) = \mathrm{maxpool}_{3\times3}(\mathbf{A}),
+\end{equation}
+%
+and the opening is $\mathrm{op}(\mathbf{A}) =
+\mathrm{di}(\mathrm{er}(\mathbf{A}))$. The skeleton accumulates the residual
+between each eroded mask and its opening over $n_{\mathrm{it}}$ iterations,
+%
+\begin{equation}
+\label{eq:skeleton}
+\mathbf{K} = \sum_{i=0}^{n_{\mathrm{it}}}
+\mathrm{ReLU}\!\left(
+  \mathbf{A}_i - \mathrm{op}(\mathbf{A}_i)
+\right),
+\qquad
+\mathbf{A}_{i+1} = \mathrm{er}(\mathbf{A}_i),
+\end{equation}
+%
+with $\mathbf{A}_0 = \mathbf{Y}$ and $n_{\mathrm{it}} = 8$. Because the whole
+construction uses only pooling operations, it runs on the accelerator inside the
+training graph and introduces no dependency on an external morphology library.
+The skeleton is computed at the label resolution and only then dilated by one
+pixel and reduced to stride~4 by adaptive max-pooling. The reverse order,
+downsampling before thinning, merges adjacent branches and intersections, which
+is exactly the structure the term is meant to supervise.
+
+The centerline head is trained with the Tversky loss~\cite{salehi2017tversky}.
+Writing $\hat{k}_j$ for the predicted centerline probability at location $j$ and
+$k_j$ for the target,
+%
+\begin{equation}
+\label{eq:tversky}
+\mathcal{L}_{\mathrm{cl}} = 1 -
+\frac{\sum_j \hat{k}_j k_j + \varepsilon}
+     {\sum_j \hat{k}_j k_j
+      + \alpha \sum_j \hat{k}_j (1 - k_j)
+      + \beta \sum_j (1 - \hat{k}_j) k_j + \varepsilon},
+\end{equation}
+%
+with $\alpha = 0.30$, $\beta = 0.70$, and $\varepsilon$ a small constant. Since
+$\beta > \alpha$, a missed centerline pixel costs more than a spurious one, which
+matches the operational asymmetry of the task: a break severs a route, whereas an
+extra centerline pixel does not.
+
+The auxiliary weight follows a ramp,
+%
+\begin{equation}
+\label{eq:ramp}
+\lambda_{\mathrm{aux}}(t) =
+\lambda_{\mathrm{aux}}^{\max}
+\min\!\left(
+  1, \frac{\max(0,\, t - t_0)}{t_w}
+\right),
+\end{equation}
+%
+with $\lambda_{\mathrm{aux}}^{\max} = 0.15$, start epoch $t_0 = 5$, and ramp
+length $t_w = 5$. Supervising a centerline before the coarse mask is
+approximately correct would provide a target the model cannot yet use.
+
+\section{Experimental setup}
+\label{sec:experimental-setup}
+
+\subsection{Datasets and splits}
+\label{subsec:datasets}
+
+Two public benchmarks with different ground sampling distances and scene
+compositions are used. Table~\ref{tab:datasets} summarizes their properties.
+
+\begin{table}[pos=t]
+\caption{Datasets and split protocol.}
+\label{tab:datasets}
+\begin{tabular*}{\tblwidth}{@{}LLL@{}}
+
+%* \begin{tabular}
+\toprule
+Property & Massachusetts Roads & DeepGlobe \\
+\midrule
+Image size (px)      & $1500\times1500$ & $1024\times1024$ \\
+Ground sampling (m)  & 1.0              & 0.5 \\
+Labeled pairs        & [MASS\_PAIRS]    & 6226 \\
+Training images      & [MASS\_TRAIN]    & 5000 \\
+Validation images    & 61               & 300 \\
+Test images          & 117              & 1226 \\
+Split source         & official lists   & seeded deterministic shuffle \\
+\bottomrule
+%* \end{tabular}
+
+\end{tabular*}
+\end{table}
+
+The Massachusetts Roads dataset \cite{mnih2013aerial} provides aerial imagery of
+the state of Massachusetts at one meter per pixel with official training and test
+lists. Splits follow the order given in those lists rather than a random shuffle.
+The first 61 entries of the test list are held out as the validation split and
+the remaining 117 images form the test split, so that no image used for model
+selection or threshold calibration appears in the reported test results. The
+training pipeline verifies that the training and test key sets are disjoint and
+aborts on any overlap.
+
+The DeepGlobe road extraction dataset \cite{demir2018deepglobe} provides 6226
+publicly labeled image and mask pairs at 0.5 meters per pixel. The distributed
+validation directory ships without masks in many mirrors, so a deterministic
+holdout is carved out of the labeled pool instead: the pairs are shuffled with a
+fixed seed of 3407, the first 5000 form the training split, and the remaining
+1226 form the test split. The first 300 images of the test split serve as the
+validation split. This validation split is therefore a subset of the test split,
+a protocol adopted for comparability with prior work on this benchmark. The
+overlap is recorded explicitly rather than left implicit, and results on the
+1226-image test split should be read with the knowledge that 300 of those images
+were also used for model selection. [VERIFY: confirm that the comparison methods
+in Table~\ref{tab:sota} use the same DeepGlobe protocol before claiming a
+like-for-like comparison.]
+
+Every run writes a split manifest recording the split seed, the per-split counts,
+the pairwise overlap counts between splits, and the absolute path of every image
+and mask pair. Native-resolution evaluation reads the same manifest, so the test
+set is identical to the one fixed at training time and is never regenerated from
+random indices. Labels encoded in $\{0,1\}$ and in $\{0,255\}$ are both accepted;
+the binarization threshold is chosen from the maximum value of each mask, and
+three-channel label images are reduced by a per-pixel channel maximum.
+
+\subsection{Sampling and augmentation}
+\label{subsec:augmentation}
+
+Uniform random crops over scenes containing two to five percent road pixels
+produce many crops with no positive pixel at all. Crops are therefore guided by
+the label with probability 0.60: the mask is max-pooled by a factor of eight to a
+grid of road-containing cells, one such cell is sampled uniformly, and the crop
+offset is jittered so the road is not always centered. Up to eight candidates are
+drawn, the candidate with the highest road fraction is kept, and the search stops
+early once the fraction reaches 0.002. Images smaller than the crop are
+reflect-padded, and their masks are zero-padded.
+
+Geometric augmentation is restricted to the dihedral group of order eight,
+horizontal and vertical flips combined with multiples of $90^{\circ}$ rotation,
+which is label-preserving because overhead imagery has no privileged vertical
+direction. Photometric augmentation applies brightness and contrast jitter
+($p = 0.60$), saturation jitter ($p = 0.35$), Gaussian blur ($p = 0.15$), and
+Gaussian noise ($p = 0.15$).
+
+A road-guided occlusion augmentation addresses the occlusion failure mode
+directly. Occluders are drawn onto pixels that the label marks as road, in one of
+three appearance modes: shadow, implemented as a multiplicative brightness
+reduction between 0.30 and 0.65; vegetation, implemented as a green patch; and
+vehicle, implemented as a bright patch. The segmentation target is left
+unchanged, so the network is required to infer the hidden segment from the
+continuity of its neighborhood rather than to learn that occluded road is
+background. Occluder size is limited to between 0.6\% and 1.8\% of the shorter
+image side so that the reconstruction remains solvable from local evidence. All
+comparison methods are trained with the same sampling and augmentation pipeline
+except for this road-guided occlusion, whose effect is isolated in the ablation
+of Section~\ref{subsec:ablation}.
+
+\subsection{Implementation details}
+\label{subsec:implementation}
+
+The encoder is a ResNet-34 \cite{he2016resnet} initialized from ImageNet weights
+\cite{deng2009imagenet}. The detail stream carries 96 channels, the semantic
+projection 192 channels, and the context module 32 channels per branch. Training
+uses $1024 \times 1024$ crops with a per-device batch size of two and two
+gradient accumulation steps, giving an effective batch size of four on a single
+device.
+
+Optimization uses AdamW \cite{loshchilov2018adamw} with decoupled weight decay
+of $1\times10^{-4}$ applied only to tensors with more than one dimension, so that
+biases, normalization parameters, and gate scales are excluded. Learning rates
+are layered relative to a base rate of $\eta = 2\times10^{-4}$: the decoder uses
+the full rate, the dual-resolution module a factor of 0.75, the stride-16 and
+stride-32 encoder stages together with the stride-8 stage a factor of 0.20, and
+the stem with the first residual stage a factor of 0.10. The schedule is a linear
+warmup over five epochs starting from a factor of 0.10, followed by cosine
+annealing to 2\% of the base rate, stepped once per optimizer update rather than
+once per epoch. Gradients are clipped to a norm of 3.0. Mixed-precision training
+in float16 with dynamic loss scaling is used throughout; when the scaler skips an
+update because of non-finite gradients, the scheduler and the weight average skip
+the same update, which keeps them synchronized. An exponential moving average of
+the weights with decay 0.999 and warmup ramp
+$d_t = 0.999\,(1 - e^{-t/2000})$ is maintained, and the averaged weights are the
+ones validated, tested, and reported.
+
+Transfer runs enable progressive unfreezing: the decoder alone is trained for
+epochs 0 to 2, the dual-resolution module joins at epoch 3, the stride-16 and
+stride-32 encoder stages at epoch 6, and the stride-8 stage at epoch 12, while
+the stem and first residual stage remain frozen unless explicitly released.
+Frozen sections run inside a no-gradient context inside the forward pass, which
+saves activation memory rather than only blocking gradient flow, and their batch
+normalization layers are kept in evaluation mode so that running statistics
+cannot drift. The optimizer, the schedule, and the distributed reducer are all
+constructed while every parameter is trainable, so later phase transitions never
+invalidate a parameter group.
+
+Runs use a fixed seed of 42 for model initialization and data order, and 3407 for
+split generation. Training was carried out on [HARDWARE] using PyTorch
+[PYTORCH\_VERSION] with CUDA [CUDA\_VERSION]; the pipeline depends only on
+PyTorch, torchvision, NumPy, and Pillow, with no segmentation or augmentation
+framework. Massachusetts models were trained for [MASS\_EPOCHS] epochs and
+DeepGlobe models for [DG\_EPOCHS] epochs. Results are reported over
+[NUMBER\_OF\_SEEDS] independent runs. Checkpoints are selected by road IoU on the
+validation split only.
+
+\subsection{Evaluation protocol and metrics}
+\label{subsec:metrics}
+
+Images are never resized for evaluation. A sliding window of $1024 \times 1024$
+with an overlap of 256 pixels, giving a stride of 768, traverses each scene, and
+tiles smaller than the window are reflect-padded. Each tile is weighted by a
+separable two-dimensional Hann window clamped below at 0.05 and accumulated in
+the logit domain; the accumulated logits are divided by the accumulated weights,
+which removes tile seams. Writing $\mathbf{W}^{(p)}$ for the window at position
+$p$ and $\mathbf{Z}^{(p)}$ for the tile logits placed in scene coordinates,
+%
+\begin{equation}
+\label{eq:blend}
+\mathbf{Z} = \frac{\sum_p \mathbf{W}^{(p)} \odot \mathbf{Z}^{(p)}}
+                  {\sum_p \mathbf{W}^{(p)}} .
+\end{equation}
+
+Metrics are computed from a confusion matrix pooled over the whole split. Let
+$\mathrm{TP}$, $\mathrm{FP}$, and $\mathrm{FN}$ count road-class true positives,
+false positives, and false negatives. The primary metric is the road-class
+intersection-over-union,
+%
+\begin{equation}
+\label{eq:iou}
+\mathrm{IoU}_{\mathrm{road}} =
+\frac{\mathrm{TP}}{\mathrm{TP} + \mathrm{FP} + \mathrm{FN}},
+\end{equation}
+%
+reported as a micro-average over pooled counts. Background IoU, mean IoU,
+precision, recall, and F1 follow from the same pooled matrix, and a macro variant
+of road IoU averaged over images is reported alongside the micro value because
+the two diverge when road density varies strongly across scenes.
+
+Route quality is quantified by a relaxed F1 score with a tolerance of three
+pixels, which corresponds to three meters on Massachusetts imagery and 1.5 meters
+on DeepGlobe imagery. Let $\mathcal{D}_b(\cdot)$ denote binary dilation by $b$
+pixels. Relaxed precision counts predicted road pixels that fall inside the
+dilated label, relaxed recall counts label pixels that fall inside the dilated
+prediction, and the relaxed F1 is their harmonic mean,
+%
+\begin{equation}
+\label{eq:relaxedf1}
+\mathrm{P}_{b} =
+\frac{\left|\hat{\mathbf{Y}} \cap \mathcal{D}_b(\mathbf{Y})\right|}
+     {\left|\hat{\mathbf{Y}}\right|},
+\qquad
+\mathrm{R}_{b} =
+\frac{\left|\mathbf{Y} \cap \mathcal{D}_b(\hat{\mathbf{Y}})\right|}
+     {\left|\mathbf{Y}\right|} .
+\end{equation}
+%
+The tolerance absorbs the one- to two-pixel jitter of hand-drawn road labels, so
+the score reflects whether a route was found rather than whether its boundary was
+placed exactly.
+
+Two thresholds are reported for every metric. The fixed setting uses
+$\tau = 0.5$. The calibrated setting sweeps $\tau$ from 0.20 to 0.80 in steps of
+0.02 and selects the value maximizing road IoU, using a 1001-bin histogram of
+predicted probabilities per true class so that full probability maps never have
+to be stored. The sweep is permitted on validation splits only; the selected
+threshold is then applied unchanged to the test split.
+
+\section{Results and discussion}
+\label{sec:results-discussion}
+
+\subsection{Comparison with prior methods}
+\label{subsec:sota}
+
+Table~\ref{tab:sota} reports road IoU, F1, and relaxed F1 on the Massachusetts
+and DeepGlobe test splits for DualBranchRoadNet and the comparison methods, all
+trained and evaluated under the shared protocol of
+Section~\ref{sec:experimental-setup}.
+
+\begin{table*}[pos=t]
+\caption{Comparison on the Massachusetts and DeepGlobe test splits.}
+\label{tab:sota}
+\begin{tabular*}{\tblwidth}{@{}LRRRRRR@{}}
+
+%* \begin{tabular}
+\toprule
+& \multicolumn{3}{c}{Massachusetts (test117)}
+& \multicolumn{3}{c}{DeepGlobe (test1226)} \\
+\cmidrule(lr){2-4} \cmidrule(lr){5-7}
+Method & IoU (\%) & F1 (\%) & Relaxed F1 (\%)
+       & IoU (\%) & F1 (\%) & Relaxed F1 (\%) \\
+\midrule
+U-Net \cite{ronneberger2015unet}       & [VAL] & [VAL] & [VAL] & [VAL] & [VAL] & [VAL] \\
+Deep ResUNet \cite{zhang2018resunet}   & [VAL] & [VAL] & [VAL] & [VAL] & [VAL] & [VAL] \\
+D-LinkNet \cite{zhou2018dlinknet}      & [VAL] & [VAL] & [VAL] & [VAL] & [VAL] & [VAL] \\
+HRNet \cite{wang2021hrnet}              & [VAL] & [VAL] & [VAL] & [VAL] & [VAL] & [VAL] \\
+SegFormer \cite{xie2021segformer}      & [VAL] & [VAL] & [VAL] & [VAL] & [VAL] & [VAL] \\
+CoANet \cite{mei2021coanet}            & [VAL] & [VAL] & [VAL] & [VAL] & [VAL] & [VAL] \\
+DDRNet \cite{pan2023ddrnet}            & [VAL] & [VAL] & [VAL] & [VAL] & [VAL] & [VAL] \\
+\midrule
+DualBranchRoadNet (ours)                & [VAL] & [VAL] & [VAL] & [VAL] & [VAL] & [VAL] \\
+\bottomrule
+%* \end{tabular}
+
+\end{tabular*}
+
+\vspace{2pt}
+\begin{minipage}{\tblwidth}
+\raggedright
+\footnotesize
+\textit{Note:} Values are reported as mean$\pm$sample SD across independent
+training seeds. The best result is shown in bold, and the second-best result is
+underlined.
+\end{minipage}
+\end{table*}
+
+[RESULTS PARAGRAPH: state the ranking on the primary metric first, dataset by
+dataset, then name the largest single gap and the closest competitor. Report
+absolute differences in percentage points. Name at least one metric or dataset on
+which the proposed model does not rank first, if such a case exists, and do not
+omit it.]
+
+[SYNTHESIS PARAGRAPH: relate the pattern across the two datasets to the
+difference in ground sampling distance and scene composition. Massachusetts is
+one meter per pixel with dense suburban and forested scenes; DeepGlobe is 0.5
+meters per pixel with a larger share of rural and unpaved roads. State whether
+the advantage is consistent across both or concentrated in one.]
+
+\subsection{Ablation studies}
+\label{subsec:ablation}
+
+Table~\ref{tab:ablation} isolates the four components introduced in
+Section~\ref{sec:methods}. Each row removes exactly one component from the full
+model and retrains under the identical protocol.
+
+\begin{table}[pos=t]
+\caption{Component ablation on the [ABLATION\_DATASET] test split.}
+\label{tab:ablation}
+\begin{tabular*}{\tblwidth}{@{}LRRR@{}}
+
+%* \begin{tabular}
+\toprule
+Configuration & IoU (\%) & Relaxed F1 (\%) & Params (M) \\
+\midrule
+Full model                             & [VAL] & [VAL] & 22.54 \\
+Static exchange (no spatial gate)       & [VAL] & [VAL] & 22.31 \\
+No centerline Tversky term              & [VAL] & [VAL] & 22.54 \\
+No road-guided occlusion                & [VAL] & [VAL] & 22.54 \\
+Parallel pooling instead of progressive & [VAL] & [VAL] & [VAL] \\
+\bottomrule
+%* \end{tabular}
+
+\end{tabular*}
+
+\vspace{2pt}
+\begin{minipage}{\tblwidth}
+\raggedright
+\footnotesize
+\textit{Note:} Values are reported as mean$\pm$sample SD across independent
+training seeds. The best result is shown in bold, and the second-best result is
+underlined.
+\end{minipage}
+\end{table}
+
+The parameter column is exact and independent of any experimental outcome. The
+spatial gate accounts for 232\,050 of the 22\,541\,845 parameters of the full
+model, or 1.0\% of the total; the entire set of components introduced beyond the
+ResNet-34 encoder accounts for 1\,257\,173 parameters, or 5.6\% of the total.
+
+[ABLATION PARAGRAPH, GATE: report the change in IoU and in relaxed F1 when the
+spatial gate is replaced by the static exchange. Because the gate is
+zero-initialized and therefore identical to the static variant at step zero, any
+difference is attributable to what the gate learned rather than to a different
+starting point. Report the learned gate statistics, mean [GATE\_MEAN] and
+standard deviation [GATE\_STD], to show whether the gate departed from unity at
+all.]
+
+[ABLATION PARAGRAPH, CENTERLINE: the connectivity claim is tested by relaxed F1
+rather than by IoU. Report both. If IoU is unchanged while relaxed F1 improves,
+say so directly; that pattern is the expected signature of a topology term and is
+more informative than a uniform improvement.]
+
+[ABLATION PARAGRAPH, OCCLUSION AND CONTEXT: report the effect of removing the
+road-guided occlusion augmentation and of replacing progressive pooling with
+parallel pooling.]
+
+\subsection{Efficiency and re-parameterization}
+\label{subsec:efficiency}
+
+Table~\ref{tab:efficiency} reports the cost of the training-time and
+deployment-time forms of the network. The parameter and multiply-accumulate
+counts are exact and were measured by counting convolution and linear operations
+during a forward pass at $1024 \times 1024$ input resolution.
+
+\begin{table}[pos=t]
+\caption{Cost of the training-time and deployment-time forms at
+$1024\times1024$ input resolution.}
+\label{tab:efficiency}
+\begin{tabular*}{\tblwidth}{@{}LRRRR@{}}
+
+%* \begin{tabular}
+\toprule
+Form & Params (M) & GMACs & Latency (ms) & Peak VRAM (MiB) \\
+\midrule
+Training (multi-branch) & 22.54 & 90.90 & [VAL] & [VAL] \\
+Deploy (fused)          & 22.50 & 90.46 & [VAL] & [VAL] \\
+\bottomrule
+%* \end{tabular}
+
+\end{tabular*}
+
+\vspace{2pt}
+\begin{minipage}{\tblwidth}
+\raggedright
+\footnotesize
+\textit{Note:} Latency and peak memory are averaged over [BENCHMARK\_RUNS]
+forward passes on [BENCHMARK\_HARDWARE] after [WARMUP\_RUNS] warmup iterations.
+\end{minipage}
+\end{table}
+
+Fusing the multi-branch blocks removes 39\,072 parameters and 0.44~GMACs per
+tile, a reduction of 0.2\% in parameter count and 0.5\% in multiply-accumulate
+operations. The parameter and compute savings are
+small because the re-parameterizable blocks operate on narrow feature maps at
+stride~8 and below, while most of the cost sits in the ResNet-34 encoder. The
+practical benefit is therefore structural rather than arithmetic: the fused
+network is a single sequential path, which removes the branch-level memory
+traffic and kernel launches that dominate latency on small convolutions.
+[LATENCY PARAGRAPH: report the measured latency and peak memory difference and
+state whether it exceeds run-to-run variation.]
+
+The fusion is exact rather than approximate. Comparing the logits of the
+multi-branch and fused forms of the untrained network at $512 \times 512$ in
+float32 gives a maximum absolute difference of $1.2\times10^{-7}$ against a logit
+magnitude of order $10^{-1}$, which is float32 round-off. At block level the
+maximum absolute differences are $9.5\times10^{-6}$ for the RepVGG block and
+$9.5\times10^{-7}$ for the directional depthwise block. The verification runs on
+the trained checkpoint before deployment and aborts if the tolerance is exceeded.
+[VERIFY: rerun the equivalence check on the final trained checkpoints and report
+those values here in place of the untrained-network figures.]
+
+\subsection{Qualitative analysis}
+\label{subsec:qualitative}
+
+\begin{figure*}[pos=t]
+\centering
+\placeholderfig[0.95\linewidth]{figs/qualitative.pdf - image, ground truth,
+two strongest baselines, and DualBranchRoadNet on: (a) a tree-occluded suburban
+road; (b) a narrow rural road adjacent to a river; (c) a multi-lane interchange;
+(d) a failure case.}
+\caption{Qualitative comparison on selected test scenes. Rows (a) to (c)
+illustrate the occlusion, linear-confuser, and topology cases discussed in
+Section~\ref{subsec:qualitative}; row (d) is a failure case.}
+\label{fig:qualitative}
+\end{figure*}
+
+[QUALITATIVE PARAGRAPH: each row of Fig.~\ref{fig:qualitative} must be selected
+to test a specific claim made in Section~\ref{sec:methods}, not to display the
+best available output. Row (a) tests the occlusion augmentation, row (b) tests
+whether the semantic stream suppresses linear confusers such as rivers and field
+boundaries, and row (c) tests the centerline term at intersections. Describe what
+is visible and confirm that the visible behavior agrees with the quantitative
+result for the corresponding ablation.]
+
+[FAILURE PARAGRAPH: describe the failure mode shown in row (d) and state the
+conditions under which it occurs.]
+
+\subsection{Limitations}
+\label{subsec:limitations}
+
+Several limitations bound the scope of these results. The model predicts raster
+masks and does not extract a road graph, so vectorization, node and edge
+recovery, and downstream routing are outside the evaluated pipeline. Roads are
+treated as a single class, with no distinction between highway, urban, and
+unpaved surfaces. The input is restricted to three-band optical imagery, so
+multispectral, synthetic aperture radar, and time-series inputs are untested. On
+DeepGlobe, the validation split is a subset of the test split, as stated in
+Section~\ref{subsec:datasets}, so DeepGlobe test scores carry a model-selection
+dependency that Massachusetts scores do not. Both benchmarks cover a limited
+range of geographies and acquisition conditions, and generalization to regions or
+sensors not represented in them is not established by these experiments.
+[LIMITATION: add any limitation revealed by the completed experiments, such as
+resolution sensitivity or degradation on a particular scene type.]
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+This paper addressed road extraction from high-resolution optical imagery under
+the three constraints that distinguish it from general segmentation: severe class
+imbalance, structures too thin to survive deep downsampling, and a quality
+criterion that depends on connectivity rather than on area. DualBranchRoadNet
+responds with a detail stream held at stride~8 for its entire length, a semantic
+stream that gathers context at stride~32 without being asked to preserve thin
+structures, and a single bilateral exchange between them regulated by a
+zero-initialized spatial gate that begins as an identity and learns selectivity
+during training. Connectivity is supervised by an auxiliary centerline head whose
+targets are produced by max-pooling-based thinning applied before downsampling
+and optimized with an asymmetric Tversky loss.
+
+Under a protocol that evaluates at native resolution with Hann-blended
+overlapping tiles and calibrates decision thresholds on validation data only, the
+model reaches a road IoU of [IOU\_MASS] on the Massachusetts test split and
+[IOU\_DG] on the DeepGlobe test split. [CONCLUSION SENTENCE:
+summarize which component the ablation identifies as the principal contributor,
+and to which metric.] After re-parameterization the deployed network is a
+single-path model of 22.50~M parameters and 90.46~GMACs per $1024\times1024$
+tile, and the fusion is exact to float32 round-off.
+
+The raster-mask formulation is the natural boundary of this work. Extending the
+centerline head from a supervision signal into an explicit graph extraction
+stage, and testing whether the gated exchange transfers to sensors other than
+three-band optical imagery, are the directions we consider most likely to be
+productive.
+
+\section*{Declaration of competing interest}
+The authors declare that they have no known competing financial interests or
+personal relationships that could have appeared to influence the work reported in
+this paper.
+
+\section*{Data availability}
+The Massachusetts Roads dataset \cite{mnih2013aerial} and the DeepGlobe road
+extraction dataset \cite{demir2018deepglobe} are publicly available from their
+original sources. The implementation, training configurations, and split
+manifests supporting this study are available at [CODE\_REPOSITORY\_URL].
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}
