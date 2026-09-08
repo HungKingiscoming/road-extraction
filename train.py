@@ -1484,6 +1484,15 @@ def parse_args() -> argparse.Namespace:
         help="Positive value skips the startup mask scan and uses this CE weight",
     )
     parser.add_argument("--main_dice_weight", type=float, default=1.0)
+    parser.add_argument(
+        "--cldice_weight",
+        type=float,
+        default=0.5,
+        help=(
+            "Weight of clDice within the main segmentation term; "
+            "remainder (1 - cldice_weight) is area Dice"
+        ),
+    )
     parser.add_argument("--aux_weight", type=float, default=0.15)
     parser.add_argument(
         "--aux_start_epoch",
@@ -1600,6 +1609,8 @@ def validate_args(args: argparse.Namespace) -> None:
     )
     if min(channel_values) < 1:
         raise ValueError("All architecture channel counts must be positive")
+    if not 0.0 <= args.cldice_weight <= 1.0:
+        raise ValueError("cldice_weight must be in [0, 1]")
     if not 0.0 <= args.centerline_alpha <= 1.0:
         raise ValueError("centerline_alpha must be in [0, 1]")
     if not 0.0 <= args.centerline_beta <= 1.0:
@@ -1766,6 +1777,7 @@ def main() -> None:
     criterion = RoadSegCenterlineTverskyLoss(
         road_class_weight=road_weight,
         main_dice_weight=args.main_dice_weight,
+        cldice_weight=args.cldice_weight,
         aux_weight=args.aux_weight,
         centerline_alpha=args.centerline_alpha,
         centerline_beta=args.centerline_beta,
