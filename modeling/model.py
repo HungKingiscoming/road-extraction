@@ -39,27 +39,25 @@ def _extract_state_dict(checkpoint: object) -> Dict[str, Tensor]:
     return state
 
 
-def _build_resnext50(
+def _build_resnet34(
     imagenet_pretrained: bool,
     encoder_weights_path: Optional[str],
 ) -> nn.Module:
-    """Build a torchvision ResNeXt50-32x4d encoder."""
     try:
-        from torchvision.models import ResNeXt50_32X4D_Weights, resnext50_32x4d
+        from torchvision.models import ResNet34_Weights, resnet34
 
         weights = (
-            ResNeXt50_32X4D_Weights.DEFAULT
+            ResNet34_Weights.DEFAULT
             if imagenet_pretrained and not encoder_weights_path
             else None
         )
-        backbone = resnext50_32x4d(weights=weights)
+        backbone = resnet34(weights=weights)
     except ImportError as error:
-        raise ImportError("torchvision is required for ResNeXt50-32x4d") from error
+        raise ImportError("torchvision is required for ResNet-34") from error
     except TypeError:
-        # Compatibility with older torchvision releases.
-        from torchvision.models import resnext50_32x4d
+        from torchvision.models import resnet34
 
-        backbone = resnext50_32x4d(
+        backbone = resnet34(
             pretrained=bool(imagenet_pretrained and not encoder_weights_path)
         )
 
@@ -72,31 +70,19 @@ def _build_resnext50(
         except TypeError:
             checkpoint = torch.load(path, map_location="cpu")
         state = _extract_state_dict(checkpoint)
-        missing, unexpected = backbone.load_state_dict(state, strict=False)
+        missing, _ = backbone.load_state_dict(state, strict=False)
         matched = len(backbone.state_dict()) - len(missing)
         if matched < 100:
             raise RuntimeError(
-                f"Only {matched} ResNeXt tensors matched {path}; wrong weights?"
+                f"Only {matched} ResNet tensors matched {path}; wrong weights?"
             )
-        print(
-            f"Loaded custom ResNeXt50 encoder: matched={matched}, "
-            f"missing={len(missing)}, unexpected={len(unexpected)}"
-        )
     return backbone
 
 
-class TruncatedResNeXt50(nn.Module):
-    """Return native ResNeXt50 features at S2/S4/S8/S16/S32.
+class TruncatedResNet34(nn.Module):
+    """Return pretrained ResNet features through layer4 (S32)."""
 
-    Native channels are kept intact:
-        S2  = 64
-        S4  = 256
-        S8  = 512
-        S16 = 1024
-        S32 = 2048
-    """
-
-    out_channels = (64, 256, 512, 1024, 2048)
+    out_channels = (64, 64, 128, 256, 512)
 
     def __init__(
         self,
@@ -104,16 +90,16 @@ class TruncatedResNeXt50(nn.Module):
         encoder_weights_path: Optional[str] = None,
     ) -> None:
         super().__init__()
-        backbone = _build_resnext50(
+        backbone = _build_resnet34(
             imagenet_pretrained=imagenet_pretrained,
             encoder_weights_path=encoder_weights_path,
         )
         self.stem = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu)
         self.maxpool = backbone.maxpool
-        self.layer1 = backbone.layer1  # S4: 256
-        self.layer2 = backbone.layer2  # S8: 512
-        self.layer3 = backbone.layer3  # S16: 1024
-        self.layer4 = backbone.layer4  # S32: 2048
+        self.layer1 = backbone.layer1
+        self.layer2 = backbone.layer2
+        self.layer3 = backbone.layer3
+        self.layer4 = backbone.layer4
 
     def forward(
         self, x: Tensor
@@ -124,6 +110,7 @@ class TruncatedResNeXt50(nn.Module):
         semantic_s16 = self.layer3(shared_s8)
         semantic_s32 = self.layer4(semantic_s16)
         return stem_s2, shallow_s4, shared_s8, semantic_s16, semantic_s32
+
 
 def _rep_stage(channels: int, blocks: int, deploy: bool) -> nn.Sequential:
     return nn.Sequential(
@@ -330,18 +317,13 @@ class ResidualSpatialGate(nn.Module):
 
 
 class DualResolutionContext(nn.Module):
-    """Road-specific dual-resolution context on native ResNeXt features.
+    """Persistent detail S8 stream plus semantic S16/S32 context stream.
 
-    The backbone remains native up to the consumer boundary:
-      S8  512  -> detail projection -> compact detail stream
-      S16 1024 -> semantic projection -> 256-channel semantic working stream
-      S32 2048 -> context projection -> compact DAPPM stream
-
-    This avoids the previous double-projection path while keeping the
-    road-specific branches compact enough for 1024x1024 training.
+    There is one genuine bilateral interaction at S8 <-> S16.  S32 is used
+    only to gather broad DAPPM context; it returns to the saved S16 feature as
+    a gated residual before the final S8 fusion.  This avoids asking the S32
+    map to preserve thin roads and avoids a second heavy bilateral module.
     """
-
-    SEMANTIC_WORK_CHANNELS = 256
 
     def __init__(
         self,
@@ -364,63 +346,58 @@ class DualResolutionContext(nn.Module):
                 "bilateral_fusion must be either 'static' or 'spatial'"
             )
         self.bilateral_fusion = bilateral_fusion
-        semantic_work_channels = self.SEMANTIC_WORK_CHANNELS
-
-        # Native ResNeXt S8: 512 -> compact road-detail stream.
-        self.detail_projection = ConvBNAct(
-            512, detail_channels, 1, padding=0
-        )
+        self.detail_projection = ConvBNAct(128, detail_channels, 1, padding=0)
         self.detail_stages = nn.ModuleList(
             _rep_stage(detail_channels, depth, deploy)
             for depth in detail_blocks
         )
 
-        # Native ResNeXt S16: 1024 -> compact semantic working stream.
-        self.semantic_s16_projection = ConvBNAct(
-            1024,
-            semantic_work_channels,
-            1,
-            padding=0,
-        )
-
-        # Native ResNeXt S32: 2048 -> compact context stream before DAPPM.
+        # Pretrained ResNet layer4 now supplies S32 semantics.  A 1x1 adapter
+        # replaces the previous randomly initialized stride-2 semantic stage;
+        # ``semantic_blocks`` is retained in the public signature so old
+        # experiment commands remain valid, but no extra S32 blocks are added.
         _ = semantic_blocks
+        # Keep the original checkpoint key name.  The epoch-230 baseline stores
+        # these tensors under ``dual_branch.semantic_projection.*``.
         self.semantic_projection = ConvBNAct(
-            2048, semantic_channels, 1, padding=0
+            512, semantic_channels, 1, padding=0
         )
 
-        # One bilateral exchange at S8 <-> S16 in compact working channels.
+        # The only bilateral exchange: semantic S16 <-> detail S8.
         self.semantic_to_detail_1 = ConvBNAct(
-            semantic_work_channels,
-            detail_channels,
-            1,
-            padding=0,
-            activation=False,
+            256, detail_channels, 1, padding=0, activation=False
         )
         self.detail_to_semantic_1 = ConvBNAct(
             detail_channels,
-            semantic_work_channels,
+            256,
             3,
             stride=2,
             activation=False,
         )
 
+        # Cross-resolution exchange is residual and initially conservative.
+        # Semantic context is allowed to assist detail weakly, while the new
+        # detail branch cannot immediately disturb pretrained semantics.
         self.semantic_to_detail_scale_1 = nn.Parameter(
             torch.full((1, detail_channels, 1, 1), 0.10)
         )
         self.detail_to_semantic_scale_1 = nn.Parameter(
-            torch.zeros(1, semantic_work_channels, 1, 1)
+            torch.zeros(1, 256, 1, 1)
         )
-
         if bilateral_fusion == "spatial":
+            # Single-channel spatial gates are intentionally used instead of
+            # C-channel attention maps.  Road/background selection is mainly
+            # spatial, while the existing learned residual scales retain
+            # channel selectivity with far fewer parameters and less risk of
+            # overfitting Massachusetts.
             self.semantic_to_detail_spatial_gate_1 = ResidualSpatialGate(
                 detail_channels,
                 detail_channels,
                 hidden_channels=max(16, min(64, detail_channels // 2)),
             )
             self.detail_to_semantic_spatial_gate_1 = ResidualSpatialGate(
-                semantic_work_channels,
-                semantic_work_channels,
+                256,
+                256,
                 hidden_channels=32,
             )
 
@@ -432,16 +409,14 @@ class DualResolutionContext(nn.Module):
         )
         self.context_to_s16 = ConvBNAct(
             semantic_channels,
-            semantic_work_channels,
+            256,
             1,
             padding=0,
             activation=False,
         )
-        self.context_scale = nn.Parameter(
-            torch.full((1, semantic_work_channels, 1, 1), 0.10)
-        )
+        self.context_scale = nn.Parameter(torch.full((1, 256, 1, 1), 0.10))
         self.semantic_to_fusion = ConvBNAct(
-            semantic_work_channels,
+            256,
             detail_channels,
             1,
             padding=0,
@@ -464,7 +439,7 @@ class DualResolutionContext(nn.Module):
         semantic_s32: Tensor,
     ) -> Tensor:
         detail = self.detail_stages[0](self.detail_projection(shared_s8))
-        semantic = self.semantic_s16_projection(semantic_s16)
+        semantic = semantic_s16
 
         detail_before, semantic_before = detail, semantic
         semantic_delta = self._resize(
@@ -475,7 +450,6 @@ class DualResolutionContext(nn.Module):
             self.detail_to_semantic_1(detail_before),
             semantic_before.shape[-2:],
         )
-
         if self.bilateral_fusion == "spatial":
             semantic_delta = (
                 self.semantic_to_detail_spatial_gate_1(
@@ -489,23 +463,28 @@ class DualResolutionContext(nn.Module):
                 )
                 * detail_delta
             )
-
         detail = self.activation(
-            detail_before + self.semantic_to_detail_scale_1 * semantic_delta
+            detail_before
+            + self.semantic_to_detail_scale_1
+            * semantic_delta
         )
         semantic = self.activation(
-            semantic_before + self.detail_to_semantic_scale_1 * detail_delta
+            semantic_before
+            + self.detail_to_semantic_scale_1
+            * detail_delta
         )
 
+        # The detail stream continues at S8 after receiving semantic evidence.
         detail = self.detail_stages[1](detail)
 
-        context_s32 = self.dappm(self.semantic_projection(semantic_s32))
+        # S32 gathers context, then returns to the saved S16 representation.
+        context_s32 = self.dappm(
+            self.semantic_projection(semantic_s32)
+        )
         context_s16 = self._resize(
             self.context_to_s16(context_s32), semantic.shape[-2:]
         )
-        semantic = self.activation(
-            semantic + self.context_scale * context_s16
-        )
+        semantic = self.activation(semantic + self.context_scale * context_s16)
 
         semantic_s8 = self._resize(
             self.semantic_to_fusion(semantic), detail.shape[-2:]
@@ -514,6 +493,7 @@ class DualResolutionContext(nn.Module):
 
     @torch.no_grad()
     def gate_statistics(self) -> Dict[str, float]:
+        """Small diagnostics showing whether each information route is used."""
         gates = {
             "semantic_to_detail": self.semantic_to_detail_scale_1,
             "detail_to_semantic": self.detail_to_semantic_scale_1,
@@ -542,13 +522,13 @@ class DualResolutionContext(nn.Module):
 
 
 class DualBranchRoadNet(nn.Module):
-    """Dual-resolution road model with native ResNeXt50 features."""
+    """Dual-resolution road model with progressive-unfreezing support."""
 
     PHASE_NAMES = {
         0: "head_only",
         1: "head_plus_dual_branch",
-        2: "plus_backbone_layer3_layer4",
-        3: "plus_backbone_layer2",
+        2: "plus_resnet_layer3_layer4",
+        3: "plus_resnet_layer2",
         4: "all_trainable",
     }
 
@@ -572,7 +552,7 @@ class DualBranchRoadNet(nn.Module):
         deploy: bool = False,
     ) -> None:
         super().__init__()
-        self.encoder = TruncatedResNeXt50(
+        self.encoder = TruncatedResNet34(
             imagenet_pretrained=imagenet_pretrained,
             encoder_weights_path=encoder_weights_path,
         )
@@ -589,7 +569,7 @@ class DualBranchRoadNet(nn.Module):
         )
         self.decode_head = RoadReconstructionDecoder(
             stem_channels=64,
-            shallow_channels=256,
+            shallow_channels=64,
             fused_channels=detail_channels,
             s4_channels=decoder_s4_channels,
             s2_channels=decoder_s2_channels,
@@ -602,27 +582,19 @@ class DualBranchRoadNet(nn.Module):
 
     def forward(self, image: Tensor):
         output_size = image.shape[-2:]
-
         if not self.training or self.current_phase >= 4:
             stem, shallow, shared, semantic, context = self.encoder(image)
-
         elif self.current_phase <= 1:
-            # Entire ImageNet backbone frozen; road-specific modules train
-            # from phase 1 using the untouched native ResNeXt feature maps.
             with torch.no_grad():
                 stem, shallow, shared, semantic, context = self.encoder(image)
-
         elif self.current_phase == 2:
-            # layer3/layer4 train; stem/layer1/layer2 frozen.
             with torch.no_grad():
                 stem = self.encoder.stem(image)
                 shallow = self.encoder.layer1(self.encoder.maxpool(stem))
                 shared = self.encoder.layer2(shallow)
             semantic = self.encoder.layer3(shared)
             context = self.encoder.layer4(semantic)
-
         else:
-            # layer2/layer3/layer4 train; stem/layer1 frozen.
             with torch.no_grad():
                 stem = self.encoder.stem(image)
                 shallow = self.encoder.layer1(self.encoder.maxpool(stem))
@@ -635,7 +607,6 @@ class DualBranchRoadNet(nn.Module):
                 fused = self.dual_branch(shared, semantic, context)
         else:
             fused = self.dual_branch(shared, semantic, context)
-
         return self.decode_head(stem, shallow, fused, output_size)
 
     def set_trainable_phase(self, phase: int) -> str:
@@ -655,23 +626,14 @@ class DualBranchRoadNet(nn.Module):
             frozen_modules.append(self.encoder.layer2)
         if self.current_phase <= 3:
             frozen_modules.extend((self.encoder.stem, self.encoder.layer1))
-
         for frozen in frozen_modules:
             for module in frozen.modules():
                 if isinstance(module, nn.BatchNorm2d):
                     module.eval()
-
         if freeze_encoder_bn:
-            for backbone_module in (
-                self.encoder.stem,
-                self.encoder.layer1,
-                self.encoder.layer2,
-                self.encoder.layer3,
-                self.encoder.layer4,
-            ):
-                for module in backbone_module.modules():
-                    if isinstance(module, nn.BatchNorm2d):
-                        module.eval()
+            for module in self.encoder.modules():
+                if isinstance(module, nn.BatchNorm2d):
+                    module.eval()
 
     def trainable_parameter_counts(self) -> Tuple[int, int]:
         total = sum(parameter.numel() for parameter in self.parameters())
@@ -684,15 +646,11 @@ class DualBranchRoadNet(nn.Module):
             modules.append(self.encoder.layer2)
         if self.current_phase >= 4:
             modules.extend((self.encoder.stem, self.encoder.layer1))
-
-        seen: set[int] = set()
-        trainable = 0
-        for module in modules:
-            for parameter in module.parameters():
-                if id(parameter) in seen:
-                    continue
-                seen.add(id(parameter))
-                trainable += parameter.numel()
+        trainable = sum(
+            parameter.numel()
+            for module in modules
+            for parameter in module.parameters()
+        )
         return trainable, total
 
     def optimization_modules(self) -> Dict[str, Iterable[nn.Parameter]]:
@@ -716,6 +674,7 @@ class DualBranchRoadNet(nn.Module):
         for module in list(self.modules()):
             if isinstance(module, (RepVGGBlock, RepDepthwiseBlock)):
                 module.switch_to_deploy()
+
 
 def build_model(args) -> DualBranchRoadNet:
     """Build from an argparse Namespace or compatible attribute container."""
