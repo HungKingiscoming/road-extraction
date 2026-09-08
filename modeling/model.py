@@ -1,697 +1,1952 @@
 from __future__ import annotations
 
+import argparse
+import copy
+import json
+import math
+import os
+import random
+from contextlib import nullcontext
+from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Sequence, Tuple
+from time import perf_counter
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
+from tqdm import tqdm
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data.distributed import DistributedSampler
 
-from .decoder import (
-    ConvBNAct,
-    ConvGNAct,
-    RepDepthwiseBlock,
-    RepVGGBlock,
-    RoadReconstructionDecoder,
-)
-
-
-def _extract_state_dict(checkpoint: object) -> Dict[str, Tensor]:
-    if not isinstance(checkpoint, dict):
-        raise TypeError("Encoder checkpoint must contain a state dictionary")
-    for key in ("state_dict", "model", "ema"):
-        candidate = checkpoint.get(key)
-        if isinstance(candidate, dict):
-            checkpoint = candidate
-            break
-    if not isinstance(checkpoint, dict):
-        raise TypeError("Could not find a state dictionary")
-    state: Dict[str, Tensor] = {}
-    for key, value in checkpoint.items():
-        if not isinstance(value, Tensor):
-            continue
-        clean = str(key)
-        for prefix in ("module.", "encoder.backbone.", "backbone."):
-            if clean.startswith(prefix):
-                clean = clean[len(prefix) :]
-        state[clean] = value
-    return state
+from modeling.decoder import RoadSegCenterlineTverskyLoss
+from modeling.model import DualBranchRoadNet, build_model
 
 
-def _build_resnet34(
-    imagenet_pretrained: bool,
-    encoder_weights_path: Optional[str],
-) -> nn.Module:
-    try:
-        from torchvision.models import ResNet34_Weights, resnet34
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+MASK_SUFFIXES = ("_mask", "_masks", "_gt", "_label", "_labels")
+IMAGENET_MEAN = np.asarray((0.485, 0.456, 0.406), dtype=np.float32)
+IMAGENET_STD = np.asarray((0.229, 0.224, 0.225), dtype=np.float32)
 
-        weights = (
-            ResNet34_Weights.DEFAULT
-            if imagenet_pretrained and not encoder_weights_path
-            else None
+
+# ---------------------------------------------------------------------------
+# Distributed utilities
+# ---------------------------------------------------------------------------
+
+
+def init_distributed() -> Tuple[bool, int, int, int, torch.device]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    distributed = world_size > 1
+    if distributed:
+        if not torch.cuda.is_available():
+            raise RuntimeError("NCCL DDP requires CUDA")
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+        # Print before process-group creation so a NCCL rendezvous problem is
+        # visible immediately in notebook environments.  Passing device_id
+        # eagerly creates the NCCL communicator on recent PyTorch releases and
+        # has been observed to stall on Kaggle T4x2; the classic call is more
+        # portable and torch.cuda.set_device above already pins each rank.
+        print(
+            f"[rank {rank}] Initializing NCCL on cuda:{local_rank} "
+            f"(world_size={world_size})...",
+            flush=True,
         )
-        backbone = resnet34(weights=weights)
-    except ImportError as error:
-        raise ImportError("torchvision is required for ResNet-34") from error
-    except TypeError:
-        from torchvision.models import resnet34
-
-        backbone = resnet34(
-            pretrained=bool(imagenet_pretrained and not encoder_weights_path)
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            # Rank 0 may scan several thousand masks before the first NCCL
+            # collective while the other ranks wait to receive the result.
+            # DeepGlobe can take more than three minutes on Kaggle storage.
+            timeout=timedelta(minutes=15),
         )
-
-    if encoder_weights_path:
-        path = Path(encoder_weights_path)
-        if not path.is_file():
-            raise FileNotFoundError(f"Encoder weights not found: {path}")
-        try:
-            checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-        except TypeError:
-            checkpoint = torch.load(path, map_location="cpu")
-        state = _extract_state_dict(checkpoint)
-        missing, _ = backbone.load_state_dict(state, strict=False)
-        matched = len(backbone.state_dict()) - len(missing)
-        if matched < 100:
-            raise RuntimeError(
-                f"Only {matched} ResNet tensors matched {path}; wrong weights?"
-            )
-    return backbone
+        print(f"[rank {rank}] NCCL process group ready", flush=True)
+    else:
+        rank = 0
+        local_rank = 0
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    return distributed, rank, local_rank, world_size, device
 
 
-class TruncatedResNet34(nn.Module):
-    """Return pretrained ResNet features through layer4 (S32)."""
-
-    out_channels = (64, 64, 128, 256, 512)
-
-    def __init__(
-        self,
-        imagenet_pretrained: bool = True,
-        encoder_weights_path: Optional[str] = None,
-    ) -> None:
-        super().__init__()
-        backbone = _build_resnet34(
-            imagenet_pretrained=imagenet_pretrained,
-            encoder_weights_path=encoder_weights_path,
-        )
-        self.stem = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu)
-        self.maxpool = backbone.maxpool
-        self.layer1 = backbone.layer1
-        self.layer2 = backbone.layer2
-        self.layer3 = backbone.layer3
-        self.layer4 = backbone.layer4
-
-    def forward(
-        self, x: Tensor
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        stem_s2 = self.stem(x)
-        shallow_s4 = self.layer1(self.maxpool(stem_s2))
-        shared_s8 = self.layer2(shallow_s4)
-        semantic_s16 = self.layer3(shared_s8)
-        semantic_s32 = self.layer4(semantic_s16)
-        return stem_s2, shallow_s4, shared_s8, semantic_s16, semantic_s32
+def distributed_active() -> bool:
+    return dist.is_available() and dist.is_initialized()
 
 
-def _rep_stage(channels: int, blocks: int, deploy: bool) -> nn.Sequential:
-    return nn.Sequential(
-        *[
-            RepVGGBlock(channels, channels, deploy=deploy)
-            for _ in range(max(1, int(blocks)))
+def is_main_process() -> bool:
+    return not distributed_active() or dist.get_rank() == 0
+
+
+def rank_zero_print(*values, **kwargs) -> None:
+    if is_main_process():
+        kwargs.setdefault("flush", True)
+        print(*values, **kwargs)
+
+
+def unwrap_model(model: nn.Module) -> DualBranchRoadNet:
+    return model.module if isinstance(model, DDP) else model  # type: ignore[return-value]
+
+
+def cleanup_distributed() -> None:
+    if distributed_active():
+        dist.destroy_process_group()
+
+
+class DistributedEvalSampler(Sampler[int]):
+    """Shard validation exactly, without padded duplicate images."""
+
+    def __init__(self, dataset: Dataset, rank: int, world_size: int) -> None:
+        self.dataset = dataset
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(range(self.rank, len(self.dataset), self.world_size))
+
+    def __len__(self) -> int:
+        remaining = len(self.dataset) - self.rank
+        return max(0, math.ceil(remaining / self.world_size))
+
+
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def seed_worker(worker_id: int) -> None:
+    del worker_id
+    worker_seed = torch.initial_seed() % (2**32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
+# ---------------------------------------------------------------------------
+# Dataset discovery, native crop, and augmentation
+# ---------------------------------------------------------------------------
+
+
+def sample_key(path: Path) -> str:
+    key = path.stem.lower()
+    for suffix in (
+        "_image",
+        "_images",
+        "_img",
+        "_sat",
+        "_mask",
+        "_masks",
+        "_gt",
+        "_label",
+        "_labels",
+    ):
+        if key.endswith(suffix):
+            return key[: -len(suffix)]
+    return key
+
+
+def index_files(folder: str | Path, role: Optional[str] = None) -> Dict[str, Path]:
+    folder = Path(folder)
+    if not folder.is_dir():
+        raise FileNotFoundError(f"Dataset directory not found: {folder}")
+    files = sorted(
+        path
+        for path in folder.rglob("*")
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    )
+    if role is not None:
+        if role not in {"image", "mask"}:
+            raise ValueError("role must be image, mask, or None")
+        files = [
+            path
+            for path in files
+            if any(path.stem.lower().endswith(s) for s in MASK_SUFFIXES)
+            == (role == "mask")
         ]
+    if not files:
+        raise RuntimeError(f"No supported files found in {folder}")
+    indexed: Dict[str, Path] = {}
+    for path in files:
+        key = sample_key(path)
+        if key in indexed:
+            raise RuntimeError(
+                f"Duplicate sample key '{key}': {indexed[key]} and {path}"
+            )
+        indexed[key] = path
+    return indexed
+
+
+def build_pairs(image_dir: str | Path, mask_dir: str | Path) -> List[Tuple[Path, Path]]:
+    image_dir = Path(image_dir)
+    mask_dir = Path(mask_dir)
+    same_folder = image_dir.resolve() == mask_dir.resolve()
+    images = index_files(image_dir, role="image" if same_folder else None)
+    masks = index_files(mask_dir, role="mask" if same_folder else None)
+    common = sorted(images.keys() & masks.keys())
+    if len(common) != len(images) or len(common) != len(masks):
+        raise RuntimeError(
+            "Image/mask pairing mismatch: "
+            f"images={len(images)}, masks={len(masks)}, pairs={len(common)}, "
+            f"missing masks={sorted(images.keys() - masks.keys())[:5]}, "
+            f"missing images={sorted(masks.keys() - images.keys())[:5]}"
+        )
+    return [(images[key], masks[key]) for key in common]
+
+
+def pairs_from_list(
+    image_dir: str | Path,
+    mask_dir: str | Path,
+    list_path: str | Path,
+) -> List[Tuple[Path, Path]]:
+    """Resolve pairs in exactly the order given by a txt split file."""
+    image_dir = Path(image_dir)
+    mask_dir = Path(mask_dir)
+    list_path = Path(list_path)
+    if not list_path.is_file():
+        raise FileNotFoundError(f"Split txt not found: {list_path}")
+
+    images = index_files(image_dir)
+    masks = index_files(mask_dir)
+    pairs: List[Tuple[Path, Path]] = []
+    missing: List[str] = []
+    seen: set[str] = set()
+
+    with list_path.open("r", encoding="utf-8-sig") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            first_field = line.replace(",", " ").split()[0]
+            key = sample_key(Path(first_field))
+            if key in seen:
+                continue
+            seen.add(key)
+            image_path = images.get(key)
+            mask_path = masks.get(key)
+            if image_path is None or mask_path is None:
+                missing.append(first_field)
+                continue
+            pairs.append((image_path, mask_path))
+
+    if missing:
+        raise RuntimeError(
+            f"{list_path} contains {len(missing)} unpaired samples. "
+            f"First missing entries: {missing[:10]}"
+        )
+    if not pairs:
+        raise RuntimeError(f"No image/mask pairs resolved from {list_path}")
+    return pairs
+
+
+def _first_existing_pair(
+    candidates: Sequence[Tuple[Path, Path]],
+) -> Tuple[Path, Path]:
+    for image_dir, mask_dir in candidates:
+        if image_dir.is_dir() and mask_dir.is_dir():
+            return image_dir, mask_dir
+    return candidates[0]
+
+
+def _first_labeled_pair(
+    candidates: Sequence[Tuple[Path, Path]],
+) -> Optional[Tuple[Path, Path]]:
+    """Return the first directory pair that contains matched masks.
+
+    DeepGlobe mirrors commonly ship ``valid`` images without public masks.  A
+    directory existing is therefore not enough to call it a validation split.
+    """
+    for image_dir, mask_dir in candidates:
+        if not image_dir.is_dir() or not mask_dir.is_dir():
+            continue
+        try:
+            if build_pairs(image_dir, mask_dir):
+                return image_dir, mask_dir
+        except RuntimeError:
+            continue
+    return None
+
+
+def configure_dataset_paths(args: argparse.Namespace) -> None:
+    """Resolve common Kaggle layouts while keeping explicit CLI paths final."""
+    if args.dataset == "massachusetts":
+        root = Path(
+            args.data_root
+            or "/kaggle/input/datasets/datnguyentien204/massachu/massachusets"
+        )
+        args.train_image_dir = args.train_image_dir or str(root / "images")
+        args.train_mask_dir = args.train_mask_dir or str(root / "labels")
+        args.train_list = args.train_list or str(root / "train.txt")
+        args.test_list = args.test_list or str(root / "test.txt")
+        args.val_image_dir = None
+        args.val_mask_dir = None
+        return
+
+    root = Path(
+        args.data_root
+        or "/kaggle/input/datasets/balraj98/deepglobe-road-extraction-dataset"
+    )
+    train_images, train_masks = _first_existing_pair(
+        (
+            (root / "train" / "images", root / "train" / "gt"),
+            (root / "train" / "images", root / "train" / "masks"),
+            (root / "images", root / "gt"),
+            (root / "train", root / "train"),
+            (root, root),
+        )
+    )
+    args.train_image_dir = args.train_image_dir or str(train_images)
+    args.train_mask_dir = args.train_mask_dir or str(train_masks)
+    if args.val_image_dir is None and args.val_mask_dir is None:
+        labeled_validation = _first_labeled_pair(
+            (
+                (root / "valid" / "images", root / "valid" / "gt"),
+                (root / "val" / "images", root / "val" / "gt"),
+                (root / "valid", root / "valid"),
+            )
+        )
+        if labeled_validation is not None:
+            val_images, val_masks = labeled_validation
+            args.val_image_dir = str(val_images)
+            args.val_mask_dir = str(val_masks)
+
+
+def read_rgb(path: Path) -> np.ndarray:
+    return np.asarray(Image.open(path).convert("RGB"), dtype=np.uint8)
+
+
+def read_binary_mask(path: Path) -> np.ndarray:
+    mask = np.asarray(Image.open(path))
+    if mask.ndim == 3:
+        mask = mask.max(axis=2)
+    threshold = 0 if int(mask.max(initial=0)) <= 1 else 127
+    return (mask > threshold).astype(np.uint8)
+
+
+def pad_pair_to_size(
+    image: np.ndarray, mask: np.ndarray, size: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    height, width = mask.shape
+    pad_h, pad_w = max(0, size - height), max(0, size - width)
+    if pad_h == 0 and pad_w == 0:
+        return image, mask
+    top, left = pad_h // 2, pad_w // 2
+    bottom, right = pad_h - top, pad_w - left
+    image_mode = "reflect" if min(height, width) > 1 else "edge"
+    image = np.pad(
+        image, ((top, bottom), (left, right), (0, 0)), mode=image_mode
+    )
+    mask = np.pad(mask, ((top, bottom), (left, right)), mode="constant")
+    return image, mask
+
+
+def coarse_max_mask(mask: np.ndarray, factor: int = 8) -> np.ndarray:
+    height, width = mask.shape
+    pooled_h, pooled_w = math.ceil(height / factor), math.ceil(width / factor)
+    padded = np.pad(
+        mask,
+        ((0, pooled_h * factor - height), (0, pooled_w * factor - width)),
+        mode="constant",
+    )
+    return padded.reshape(pooled_h, factor, pooled_w, factor).max(axis=(1, 3))
+
+
+def random_crop_pair(
+    image: np.ndarray,
+    mask: np.ndarray,
+    crop_size: int,
+    road_probability: float,
+    minimum_fraction: float,
+    tries: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    image, mask = pad_pair_to_size(image, mask, crop_size)
+    height, width = mask.shape
+    max_y, max_x = height - crop_size, width - crop_size
+
+    def random_origin() -> Tuple[int, int]:
+        return (
+            random.randint(0, max_y) if max_y else 0,
+            random.randint(0, max_x) if max_x else 0,
+        )
+
+    y0, x0 = random_origin()
+    if mask.any() and random.random() < road_probability:
+        factor = 8
+        coarse = coarse_max_mask(mask, factor)
+        road_cells = np.flatnonzero(coarse)
+        coarse_crop = max(1, math.ceil(crop_size / factor))
+        best_origin = (y0, x0)
+        best_score = -1.0
+        for _ in range(max(1, tries)):
+            flat = int(road_cells[random.randrange(len(road_cells))])
+            cy, cx = np.unravel_index(flat, coarse.shape)
+            road_y = min(height - 1, cy * factor + random.randrange(factor))
+            road_x = min(width - 1, cx * factor + random.randrange(factor))
+            y0 = min(max(road_y - random.randrange(crop_size), 0), max_y)
+            x0 = min(max(road_x - random.randrange(crop_size), 0), max_x)
+            py, px = y0 // factor, x0 // factor
+            region = coarse[
+                py : min(coarse.shape[0], py + coarse_crop),
+                px : min(coarse.shape[1], px + coarse_crop),
+            ]
+            score = float(region.mean()) if region.size else 0.0
+            if score > best_score:
+                best_score, best_origin = score, (y0, x0)
+            if score >= minimum_fraction:
+                break
+        y0, x0 = best_origin
+    return (
+        np.ascontiguousarray(image[y0 : y0 + crop_size, x0 : x0 + crop_size]),
+        np.ascontiguousarray(mask[y0 : y0 + crop_size, x0 : x0 + crop_size]),
     )
 
 
-class ProgressiveDAPPM(nn.Module):
-    """Progressively aggregate adaptive pooled context at the semantic S32 map.
+def road_guided_occlusion(
+    image: np.ndarray,
+    mask: np.ndarray,
+    probability: float,
+    max_patches: int,
+) -> np.ndarray:
+    """Synthesize shadows/vegetation/vehicles over labeled road pixels.
 
-    GroupNorm keeps the global 1x1 branch valid for small per-GPU batches.
-    Pooling proceeds from finer to coarser grids, so each stage adds broader
-    context to the previous representation before concatenation.
+    The segmentation target is deliberately unchanged, forcing the semantic
+    branch to infer short hidden road segments from surrounding continuity.
+    Occluders are kept local so the augmentation does not create an impossible
+    reconstruction problem.
     """
+    if probability <= 0.0 or not mask.any() or random.random() >= probability:
+        return image
 
-    def __init__(
-        self,
-        in_channels: int,
-        branch_channels: int,
-        out_channels: int,
-        pool_sizes: Sequence[int] = (1, 2, 4, 8),
-    ) -> None:
-        super().__init__()
-        sizes = tuple(sorted({int(size) for size in pool_sizes}, reverse=True))
-        if not sizes or min(sizes) < 1:
-            raise ValueError("DAPPM pool sizes must be positive")
-        self.pool_sizes = sizes
-        self.scale0 = ConvGNAct(in_channels, branch_channels, 1, padding=0)
-        self.pool_projections = nn.ModuleList(
-            ConvGNAct(in_channels, branch_channels, 1, padding=0)
-            for _ in sizes
-        )
-        self.processes = nn.ModuleList(
-            ConvGNAct(branch_channels, branch_channels, 3)
-            for _ in sizes
-        )
-        self.compression = ConvGNAct(
-            branch_channels * (len(sizes) + 1),
-            out_channels,
-            1,
-            padding=0,
-            activation=False,
-        )
-        self.shortcut = ConvGNAct(
-            in_channels,
-            out_channels,
-            1,
-            padding=0,
-            activation=False,
-        )
-        self.activation = nn.ReLU(inplace=True)
+    road_y, road_x = np.nonzero(mask)
+    height, width = mask.shape
+    pil = Image.fromarray(np.ascontiguousarray(image))
+    number = random.randint(1, max(1, int(max_patches)))
 
-    def forward(self, x: Tensor) -> Tensor:
-        output_size = x.shape[-2:]
-        previous = self.scale0(x)
-        outputs = [previous]
-        for configured_size, projection, process in zip(
-            self.pool_sizes, self.pool_projections, self.processes
-        ):
-            grid = max(1, min(configured_size, *output_size))
-            pooled = F.adaptive_avg_pool2d(x, (grid, grid))
-            pooled = projection(pooled)
-            pooled = F.interpolate(
-                pooled,
-                size=output_size,
-                mode="bilinear",
-                align_corners=False,
+    for _ in range(number):
+        index = random.randrange(len(road_y))
+        center_y, center_x = int(road_y[index]), int(road_x[index])
+        short_side = random.randint(
+            max(3, round(min(height, width) * 0.006)),
+            max(5, round(min(height, width) * 0.018)),
+        )
+        long_side = random.randint(short_side, max(short_side + 1, short_side * 3))
+        if random.random() < 0.5:
+            box_width, box_height = long_side, short_side
+        else:
+            box_width, box_height = short_side, long_side
+        x0, y0 = center_x - box_width // 2, center_y - box_height // 2
+        x1, y1 = center_x + box_width // 2, center_y + box_height // 2
+
+        alpha = Image.new("L", (width, height), 0)
+        draw = ImageDraw.Draw(alpha)
+        if random.random() < 0.65:
+            draw.ellipse((x0, y0, x1, y1), fill=random.randint(125, 210))
+            alpha = alpha.filter(ImageFilter.GaussianBlur(random.uniform(1.0, 3.0)))
+        else:
+            draw.rounded_rectangle(
+                (x0, y0, x1, y1),
+                radius=max(1, short_side // 4),
+                fill=random.randint(150, 230),
             )
-            previous = process(previous + pooled)
-            outputs.append(previous)
-        context = self.compression(torch.cat(outputs, dim=1))
-        return self.activation(context + self.shortcut(x))
 
-
-class ControlledRoadFusion(nn.Module):
-    """Selectively inject semantic context into the persistent S8 detail path.
-
-    The two branches are normalized independently and concatenated so their
-    channel identities are not destroyed by an element-wise sum.  The detail
-    stream is the residual anchor; a small learnable per-channel scale lets
-    semantic information enter gradually.  One directional RepDepthwise block
-    refines the fused road geometry and is deployable as a single DW 5x5 conv.
-    """
-
-    def __init__(
-        self,
-        channels: int,
-        refine_blocks: int = 1,
-        deploy: bool = False,
-    ) -> None:
-        super().__init__()
-        self.detail_norm = nn.BatchNorm2d(channels)
-        self.semantic_norm = nn.BatchNorm2d(channels)
-        self.fusion_projection = ConvBNAct(
-            channels * 2,
-            channels,
-            1,
-            padding=0,
-            activation=False,
-        )
-        self.fusion_scale = nn.Parameter(
-            torch.full((1, channels, 1, 1), 0.10)
-        )
-        self.refinement = nn.Sequential(
-            *[
-                RepDepthwiseBlock(channels, deploy=deploy)
-                for _ in range(max(1, int(refine_blocks)))
-            ]
-        )
-        self.activation = nn.ReLU(inplace=True)
-
-    def forward(self, detail: Tensor, semantic: Tensor) -> Tensor:
-        if detail.shape[-2:] != semantic.shape[-2:]:
-            raise ValueError("Detail and semantic maps must be spatially aligned")
-        mixed = self.fusion_projection(
-            torch.cat(
-                (
-                    self.detail_norm(detail),
-                    self.semantic_norm(semantic),
-                ),
-                dim=1,
+        mode = random.choice(("shadow", "shadow", "vegetation", "vehicle"))
+        if mode == "shadow":
+            factor = random.uniform(0.30, 0.65)
+            overlay = ImageEnhance.Brightness(pil).enhance(factor)
+        elif mode == "vegetation":
+            color = (
+                random.randint(25, 85),
+                random.randint(65, 135),
+                random.randint(20, 75),
             )
-        )
-        fused = self.activation(detail + self.fusion_scale * mixed)
-        return self.refinement(fused)
-
-
-def _group_count(channels: int, maximum: int = 8) -> int:
-    """Largest small GroupNorm divisor, robust for small per-GPU batches."""
-    for groups in range(min(maximum, int(channels)), 0, -1):
-        if int(channels) % groups == 0:
-            return groups
-    return 1
-
-
-class ResidualSpatialGate(nn.Module):
-    """Predict one spatial modulation map for a residual exchange.
-
-    The gate sees independently normalized target and projected-source
-    features.  Its output is ``2 * sigmoid(logits)`` rather than a plain
-    sigmoid.  Zero-initializing the last convolution therefore starts the
-    gate at exactly one, making the spatial variant initially identical to
-    the original channel-scaled residual exchange.  Training can then
-    suppress clutter and strengthen road-shaped regions without an abrupt
-    change to the pretrained feature distribution.
-    """
-
-    def __init__(
-        self,
-        target_channels: int,
-        source_channels: int,
-        hidden_channels: int,
-    ) -> None:
-        super().__init__()
-        hidden_channels = max(8, int(hidden_channels))
-        self.target_norm = nn.GroupNorm(
-            _group_count(target_channels), target_channels
-        )
-        self.source_norm = nn.GroupNorm(
-            _group_count(source_channels), source_channels
-        )
-        self.mix = nn.Sequential(
-            nn.Conv2d(
-                target_channels + source_channels,
-                hidden_channels,
-                3,
-                padding=1,
-                bias=False,
-            ),
-            nn.GroupNorm(
-                _group_count(hidden_channels), hidden_channels
-            ),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(hidden_channels, 1, 1, bias=True),
-        )
-        nn.init.zeros_(self.mix[-1].weight)
-        nn.init.zeros_(self.mix[-1].bias)
-        self.register_buffer(
-            "last_mean", torch.ones((), dtype=torch.float32), persistent=False
-        )
-        self.register_buffer(
-            "last_std", torch.zeros((), dtype=torch.float32), persistent=False
-        )
-
-    def forward(self, target: Tensor, projected_source: Tensor) -> Tensor:
-        if target.shape[-2:] != projected_source.shape[-2:]:
-            raise ValueError("Spatial-gate inputs must be spatially aligned")
-        logits = self.mix(
-            torch.cat(
-                (
-                    self.target_norm(target),
-                    self.source_norm(projected_source),
-                ),
-                dim=1,
+            overlay = Image.new("RGB", (width, height), color)
+        else:
+            value = random.randint(135, 235)
+            tint = random.randint(-15, 15)
+            color = (
+                int(np.clip(value + tint, 0, 255)),
+                value,
+                int(np.clip(value - tint, 0, 255)),
             )
-        )
-        gate = 2.0 * torch.sigmoid(logits)
-        self.last_mean.copy_(gate.detach().float().mean())
-        self.last_std.copy_(gate.detach().float().std(unbiased=False))
-        return gate
+            overlay = Image.new("RGB", (width, height), color)
+        pil = Image.composite(overlay, pil, alpha)
+
+    return np.asarray(pil, dtype=np.uint8).copy()
 
 
-class DualResolutionContext(nn.Module):
-    """Persistent detail S8 stream plus semantic S16/S32 context stream.
+def augment_pair(
+    image: np.ndarray,
+    mask: np.ndarray,
+    road_occlusion_probability: float = 0.0,
+    road_occlusion_max_patches: int = 2,
+) -> Tuple[np.ndarray, np.ndarray]:
+    if random.random() < 0.5:
+        image, mask = image[:, ::-1], mask[:, ::-1]
+    if random.random() < 0.5:
+        image, mask = image[::-1], mask[::-1]
+    rotations = random.randrange(4)
+    if rotations:
+        image, mask = np.rot90(image, rotations), np.rot90(mask, rotations)
 
-    There is one genuine bilateral interaction at S8 <-> S16.  S32 is used
-    only to gather broad DAPPM context; it returns to the saved S16 feature as
-    a gated residual before the final S8 fusion.  This avoids asking the S32
-    map to preserve thin roads and avoids a second heavy bilateral module.
-    """
+    pil = Image.fromarray(np.ascontiguousarray(image))
+    if random.random() < 0.60:
+        pil = ImageEnhance.Brightness(pil).enhance(random.uniform(0.85, 1.15))
+    if random.random() < 0.60:
+        pil = ImageEnhance.Contrast(pil).enhance(random.uniform(0.85, 1.15))
+    if random.random() < 0.35:
+        pil = ImageEnhance.Color(pil).enhance(random.uniform(0.90, 1.10))
+    if random.random() < 0.15:
+        pil = pil.filter(ImageFilter.GaussianBlur(random.uniform(0.1, 1.1)))
+    image = np.asarray(pil, dtype=np.uint8).copy()
+    if random.random() < 0.15:
+        noise = np.random.normal(0.0, random.uniform(2.0, 7.0), image.shape)
+        image = np.clip(image.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+    image = road_guided_occlusion(
+        image,
+        mask,
+        probability=road_occlusion_probability,
+        max_patches=road_occlusion_max_patches,
+    )
+    return image, np.ascontiguousarray(mask)
 
+
+def image_to_tensor(image: np.ndarray) -> Tensor:
+    image = image.astype(np.float32) / 255.0
+    image = (image - IMAGENET_MEAN) / IMAGENET_STD
+    return torch.from_numpy(np.ascontiguousarray(image.transpose(2, 0, 1)))
+
+
+class RoadCropDataset(Dataset):
     def __init__(
         self,
-        detail_channels: int = 96,
-        semantic_channels: int = 192,
-        dappm_channels: int = 32,
-        dappm_pool_sizes: Sequence[int] = (1, 2, 4, 8),
-        detail_blocks: Sequence[int] = (2, 2),
-        semantic_blocks: int = 2,
-        fusion_blocks: int = 1,
-        bilateral_fusion: str = "spatial",
-        deploy: bool = False,
+        pairs: Sequence[Tuple[Path, Path]],
+        crop_size: int,
+        road_crop_probability: float,
+        road_crop_min_fraction: float,
+        road_crop_tries: int,
+        road_occlusion_probability: float,
+        road_occlusion_max_patches: int,
     ) -> None:
-        super().__init__()
-        if len(detail_blocks) != 2:
-            raise ValueError("detail_blocks must contain two stage depths")
-        bilateral_fusion = str(bilateral_fusion).lower()
-        if bilateral_fusion not in {"static", "spatial"}:
+        self.pairs = list(pairs)
+        self.crop_size = int(crop_size)
+        self.road_crop_probability = float(road_crop_probability)
+        self.road_crop_min_fraction = float(road_crop_min_fraction)
+        self.road_crop_tries = int(road_crop_tries)
+        self.road_occlusion_probability = float(road_occlusion_probability)
+        self.road_occlusion_max_patches = int(road_occlusion_max_patches)
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def __getitem__(self, index: int):
+        image_path, mask_path = self.pairs[index]
+        image, mask = read_rgb(image_path), read_binary_mask(mask_path)
+        if image.shape[:2] != mask.shape:
+            raise RuntimeError(f"Shape mismatch: {image_path} vs {mask_path}")
+        image, mask = random_crop_pair(
+            image,
+            mask,
+            self.crop_size,
+            self.road_crop_probability,
+            self.road_crop_min_fraction,
+            self.road_crop_tries,
+        )
+        image, mask = augment_pair(
+            image,
+            mask,
+            road_occlusion_probability=self.road_occlusion_probability,
+            road_occlusion_max_patches=self.road_occlusion_max_patches,
+        )
+        return image_to_tensor(image), torch.from_numpy(mask).long()
+
+
+class RoadNativeValidationDataset(Dataset):
+    def __init__(self, pairs: Sequence[Tuple[Path, Path]]) -> None:
+        self.pairs = list(pairs)
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def __getitem__(self, index: int):
+        image_path, mask_path = self.pairs[index]
+        image, mask = read_rgb(image_path), read_binary_mask(mask_path)
+        if image.shape[:2] != mask.shape:
+            raise RuntimeError(f"Shape mismatch: {image_path} vs {mask_path}")
+        return image_to_tensor(image), torch.from_numpy(mask).long(), image_path.stem
+
+
+def resolve_splits(
+    args: argparse.Namespace,
+) -> Tuple[
+    List[Tuple[Path, Path]],
+    List[Tuple[Path, Path]],
+    List[Tuple[Path, Path]],
+]:
+    if args.dataset == "massachusetts":
+        train_pairs = pairs_from_list(
+            args.train_image_dir, args.train_mask_dir, args.train_list
+        )
+        listed_test_pairs = pairs_from_list(
+            args.train_image_dir, args.train_mask_dir, args.test_list
+        )
+        train_keys = {sample_key(image) for image, _ in train_pairs}
+        listed_test_keys = {sample_key(image) for image, _ in listed_test_pairs}
+        overlap = train_keys & listed_test_keys
+        if overlap:
+            raise RuntimeError(
+                f"train.txt and test.txt overlap on {len(overlap)} samples; "
+                f"examples={sorted(overlap)[:10]}"
+            )
+        if args.test_eval_images >= len(listed_test_pairs):
             raise ValueError(
-                "bilateral_fusion must be either 'static' or 'spatial'"
+                "test_eval_images must be smaller than the number of test.txt "
+                "samples so a non-empty final test split remains"
             )
-        self.bilateral_fusion = bilateral_fusion
-        self.detail_projection = ConvBNAct(128, detail_channels, 1, padding=0)
-        self.detail_stages = nn.ModuleList(
-            _rep_stage(detail_channels, depth, deploy)
-            for depth in detail_blocks
+        val_pairs = listed_test_pairs[: args.test_eval_images]
+        test_pairs = listed_test_pairs[args.test_eval_images :]
+        rank_zero_print(
+            f"TXT split: train={len(train_pairs)}, val={len(val_pairs)}, "
+            f"test={len(test_pairs)} | val=first {args.test_eval_images} entries "
+            f"of {args.test_list}"
         )
+        return train_pairs, val_pairs, test_pairs
 
-        # Pretrained ResNet layer4 now supplies S32 semantics.  A 1x1 adapter
-        # replaces the previous randomly initialized stride-2 semantic stage;
-        # ``semantic_blocks`` is retained in the public signature so old
-        # experiment commands remain valid, but no extra S32 blocks are added.
-        _ = semantic_blocks
-        # Keep the original checkpoint key name.  The epoch-230 baseline stores
-        # these tensors under ``dual_branch.semantic_projection.*``.
-        self.semantic_projection = ConvBNAct(
-            512, semantic_channels, 1, padding=0
-        )
-
-        # The only bilateral exchange: semantic S16 <-> detail S8.
-        self.semantic_to_detail_1 = ConvBNAct(
-            256, detail_channels, 1, padding=0, activation=False
-        )
-        self.detail_to_semantic_1 = ConvBNAct(
-            detail_channels,
-            256,
-            3,
-            stride=2,
-            activation=False,
-        )
-
-        # Cross-resolution exchange is residual and initially conservative.
-        # Semantic context is allowed to assist detail weakly, while the new
-        # detail branch cannot immediately disturb pretrained semantics.
-        self.semantic_to_detail_scale_1 = nn.Parameter(
-            torch.full((1, detail_channels, 1, 1), 0.10)
-        )
-        self.detail_to_semantic_scale_1 = nn.Parameter(
-            torch.zeros(1, 256, 1, 1)
-        )
-        if bilateral_fusion == "spatial":
-            # Single-channel spatial gates are intentionally used instead of
-            # C-channel attention maps.  Road/background selection is mainly
-            # spatial, while the existing learned residual scales retain
-            # channel selectivity with far fewer parameters and less risk of
-            # overfitting Massachusetts.
-            self.semantic_to_detail_spatial_gate_1 = ResidualSpatialGate(
-                detail_channels,
-                detail_channels,
-                hidden_channels=max(16, min(64, detail_channels // 2)),
-            )
-            self.detail_to_semantic_spatial_gate_1 = ResidualSpatialGate(
-                256,
-                256,
-                hidden_channels=32,
-            )
-
-        self.dappm = ProgressiveDAPPM(
-            semantic_channels,
-            dappm_channels,
-            semantic_channels,
-            pool_sizes=dappm_pool_sizes,
-        )
-        self.context_to_s16 = ConvBNAct(
-            semantic_channels,
-            256,
-            1,
-            padding=0,
-            activation=False,
-        )
-        self.context_scale = nn.Parameter(torch.full((1, 256, 1, 1), 0.10))
-        self.semantic_to_fusion = ConvBNAct(
-            256,
-            detail_channels,
-            1,
-            padding=0,
-        )
-        self.final_fusion = ControlledRoadFusion(
-            detail_channels,
-            refine_blocks=fusion_blocks,
-            deploy=deploy,
-        )
-        self.activation = nn.ReLU(inplace=True)
-
-    @staticmethod
-    def _resize(x: Tensor, size: Tuple[int, int]) -> Tensor:
-        return F.interpolate(x, size=size, mode="bilinear", align_corners=False)
-
-    def forward(
-        self,
-        shared_s8: Tensor,
-        semantic_s16: Tensor,
-        semantic_s32: Tensor,
-    ) -> Tensor:
-        detail = self.detail_stages[0](self.detail_projection(shared_s8))
-        semantic = semantic_s16
-
-        detail_before, semantic_before = detail, semantic
-        semantic_delta = self._resize(
-            self.semantic_to_detail_1(semantic_before),
-            detail_before.shape[-2:],
-        )
-        detail_delta = self._resize(
-            self.detail_to_semantic_1(detail_before),
-            semantic_before.shape[-2:],
-        )
-        if self.bilateral_fusion == "spatial":
-            semantic_delta = (
-                self.semantic_to_detail_spatial_gate_1(
-                    detail_before, semantic_delta
+    all_pairs = build_pairs(args.train_image_dir, args.train_mask_dir)
+    if args.val_image_dir and args.val_mask_dir:
+        val_images, val_masks = Path(args.val_image_dir), Path(args.val_mask_dir)
+        if val_images.is_dir() and val_masks.is_dir():
+            try:
+                val_pairs = build_pairs(val_images, val_masks)
+            except RuntimeError:
+                if args.dataset != "deepglobe":
+                    raise
+                rank_zero_print(
+                    "DeepGlobe validation directory has no matched masks; "
+                    "using a labeled deterministic holdout from train instead."
                 )
-                * semantic_delta
-            )
-            detail_delta = (
-                self.detail_to_semantic_spatial_gate_1(
-                    semantic_before, detail_delta
+            else:
+                rank_zero_print(
+                    f"Official/provided split: train={len(all_pairs)}, "
+                    f"val={len(val_pairs)}"
                 )
-                * detail_delta
+                return all_pairs, val_pairs, []
+
+    generator = np.random.default_rng(args.split_seed)
+    indices = generator.permutation(len(all_pairs))
+    val_count = max(1, round(len(all_pairs) * args.val_ratio))
+    test_count = (
+        max(1, round(len(all_pairs) * args.test_ratio))
+        if args.test_ratio > 0.0
+        else 0
+    )
+    test_indices = set(indices[:test_count].tolist())
+    val_indices = set(indices[test_count : test_count + val_count].tolist())
+    train_pairs = [
+        pair
+        for index, pair in enumerate(all_pairs)
+        if index not in val_indices and index not in test_indices
+    ]
+    val_pairs = [
+        pair for index, pair in enumerate(all_pairs) if index in val_indices
+    ]
+    test_pairs = [
+        pair for index, pair in enumerate(all_pairs) if index in test_indices
+    ]
+    rank_zero_print(
+        "Deterministic labeled split: "
+        f"train={len(train_pairs)}, val={len(val_pairs)}, "
+        f"test={len(test_pairs)}, seed={args.split_seed}"
+    )
+    return train_pairs, val_pairs, test_pairs
+
+
+def make_loaders(
+    args: argparse.Namespace,
+) -> Tuple[
+    DataLoader,
+    DataLoader,
+    List[Tuple[Path, Path]],
+    List[Tuple[Path, Path]],
+    List[Tuple[Path, Path]],
+    Optional[DistributedSampler],
+]:
+    train_pairs, val_pairs, test_pairs = resolve_splits(args)
+    train_dataset = RoadCropDataset(
+        train_pairs,
+        crop_size=args.crop_size,
+        road_crop_probability=args.road_crop_probability,
+        road_crop_min_fraction=args.road_crop_min_fraction,
+        road_crop_tries=args.road_crop_tries,
+        road_occlusion_probability=args.road_occlusion_probability,
+        road_occlusion_max_patches=args.road_occlusion_max_patches,
+    )
+    val_dataset = RoadNativeValidationDataset(val_pairs)
+    train_sampler: Optional[DistributedSampler]
+    if args.distributed:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=args.world_size,
+            rank=args.rank,
+            shuffle=True,
+            seed=args.seed,
+            drop_last=True,
+        )
+        val_sampler: Optional[Sampler[int]] = DistributedEvalSampler(
+            val_dataset, args.rank, args.world_size
+        )
+    else:
+        train_sampler, val_sampler = None, None
+    generator = torch.Generator().manual_seed(args.seed + args.rank)
+    common = dict(
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=args.num_workers > 0,
+        worker_init_fn=seed_worker,
+        generator=generator,
+    )
+    if args.num_workers > 0:
+        common["prefetch_factor"] = args.prefetch_factor
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
+        drop_last=True,
+        **common,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=1,
+        shuffle=False,
+        sampler=val_sampler,
+        drop_last=False,
+        **common,
+    )
+    return (
+        train_loader,
+        val_loader,
+        train_pairs,
+        val_pairs,
+        test_pairs,
+        train_sampler,
+    )
+
+
+def compute_road_weight(
+    pairs: Sequence[Tuple[Path, Path]], cap: float
+) -> Tuple[float, float]:
+    positive, total = 0, 0
+    report_every = max(1, len(pairs) // 10)
+    for index, (_, mask_path) in enumerate(pairs, start=1):
+        mask = read_binary_mask(mask_path)
+        positive += int(mask.sum())
+        total += int(mask.size)
+        if is_main_process() and (
+            index == 1 or index % report_every == 0 or index == len(pairs)
+        ):
+            print(
+                f"[startup] class-weight scan {index}/{len(pairs)} masks",
+                flush=True,
             )
-        detail = self.activation(
-            detail_before
-            + self.semantic_to_detail_scale_1
-            * semantic_delta
-        )
-        semantic = self.activation(
-            semantic_before
-            + self.detail_to_semantic_scale_1
-            * detail_delta
-        )
+    imbalance = (total - positive) / max(positive, 1)
+    return imbalance, min(math.sqrt(imbalance), cap)
 
-        # The detail stream continues at S8 after receiving semantic evidence.
-        detail = self.detail_stages[1](detail)
 
-        # S32 gathers context, then returns to the saved S16 representation.
-        context_s32 = self.dappm(
-            self.semantic_projection(semantic_s32)
-        )
-        context_s16 = self._resize(
-            self.context_to_s16(context_s32), semantic.shape[-2:]
-        )
-        semantic = self.activation(semantic + self.context_scale * context_s16)
+def distributed_road_weight(
+    pairs: Sequence[Tuple[Path, Path]], cap: float, device: torch.device
+) -> Tuple[float, float]:
+    values = compute_road_weight(pairs, cap) if is_main_process() else (0.0, 0.0)
+    tensor = torch.tensor(values, dtype=torch.float64, device=device)
+    if distributed_active():
+        dist.broadcast(tensor, src=0)
+    return float(tensor[0]), float(tensor[1])
 
-        semantic_s8 = self._resize(
-            self.semantic_to_fusion(semantic), detail.shape[-2:]
+
+# ---------------------------------------------------------------------------
+# Optimizer, progressive unfreezing, EMA, and training
+# ---------------------------------------------------------------------------
+
+
+def build_optimizer(model: DualBranchRoadNet, args: argparse.Namespace) -> AdamW:
+    factors = {
+        "head": 1.0,
+        "dual_branch": args.dual_branch_lr_factor,
+        "layer3": args.backbone_lr_factor,
+        "layer2": args.backbone_lr_factor,
+        "early_encoder": args.early_encoder_lr_factor,
+    }
+    groups: List[Dict] = []
+    seen: set[int] = set()
+    for group_name, parameters in model.optimization_modules().items():
+        decay, no_decay = [], []
+        for parameter in parameters:
+            if id(parameter) in seen:
+                raise RuntimeError(f"Duplicate optimizer parameter in {group_name}")
+            seen.add(id(parameter))
+            (no_decay if parameter.ndim <= 1 else decay).append(parameter)
+        for suffix, values, weight_decay in (
+            ("decay", decay, args.weight_decay),
+            ("no_decay", no_decay, 0.0),
+        ):
+            if values:
+                groups.append(
+                    {
+                        "params": values,
+                        "lr": args.lr * factors[group_name],
+                        "weight_decay": weight_decay,
+                        "group_name": f"{group_name}/{suffix}",
+                    }
+                )
+    if len(seen) != len(list(model.parameters())):
+        raise RuntimeError("Some model parameters were not assigned to the optimizer")
+    optimizer_kwargs = {"betas": (0.9, 0.999)}
+    try:
+        return AdamW(
+            groups,
+            fused=bool(torch.cuda.is_available()),
+            **optimizer_kwargs,
         )
-        return self.final_fusion(detail, semantic_s8)
+    except (TypeError, RuntimeError):
+        # Compatibility fallback for older PyTorch builds/accelerators.
+        return AdamW(groups, **optimizer_kwargs)
+
+
+def build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    updates_per_epoch: int,
+    args: argparse.Namespace,
+) -> LambdaLR:
+    total = max(1, args.epochs * updates_per_epoch)
+    warmup = min(total - 1, max(0, args.warmup_epochs * updates_per_epoch))
+
+    def schedule(update: int) -> float:
+        if warmup and update < warmup:
+            progress = update / max(1, warmup)
+            return args.warmup_start_factor + (
+                1.0 - args.warmup_start_factor
+            ) * progress
+        progress = (update - warmup) / max(1, total - warmup)
+        progress = min(max(progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return args.min_lr_ratio + (1.0 - args.min_lr_ratio) * cosine
+
+    return LambdaLR(optimizer, [schedule] * len(optimizer.param_groups))
+
+
+def make_grad_scaler(enabled: bool):
+    try:
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+class ModelEMA:
+    def __init__(self, model: nn.Module, decay: float) -> None:
+        self.module = copy.deepcopy(model).eval()
+        self.decay = float(decay)
+        self.updates = 0
+        for parameter in self.module.parameters():
+            parameter.requires_grad_(False)
 
     @torch.no_grad()
-    def gate_statistics(self) -> Dict[str, float]:
-        """Small diagnostics showing whether each information route is used."""
-        gates = {
-            "semantic_to_detail": self.semantic_to_detail_scale_1,
-            "detail_to_semantic": self.detail_to_semantic_scale_1,
-            "s32_context_to_s16": self.context_scale,
-            "semantic_to_final": self.final_fusion.fusion_scale,
-        }
-        statistics: Dict[str, float] = {}
-        for name, gate in gates.items():
-            detached = gate.detach().float()
-            statistics[f"{name}_abs_mean"] = float(detached.abs().mean().cpu())
-            statistics[f"{name}_abs_max"] = float(detached.abs().max().cpu())
-        if self.bilateral_fusion == "spatial":
-            statistics["semantic_to_detail_spatial_mean"] = float(
-                self.semantic_to_detail_spatial_gate_1.last_mean.cpu()
-            )
-            statistics["detail_to_semantic_spatial_mean"] = float(
-                self.detail_to_semantic_spatial_gate_1.last_mean.cpu()
-            )
-            statistics["semantic_to_detail_spatial_std"] = float(
-                self.semantic_to_detail_spatial_gate_1.last_std.cpu()
-            )
-            statistics["detail_to_semantic_spatial_std"] = float(
-                self.detail_to_semantic_spatial_gate_1.last_std.cpu()
-            )
-        return statistics
+    def update(self, model: nn.Module) -> None:
+        self.updates += 1
+        decay = self.decay * (1.0 - math.exp(-self.updates / 2000.0))
+        source = model.state_dict()
+        for name, target in self.module.state_dict().items():
+            value = source[name].detach()
+            if target.dtype.is_floating_point:
+                target.mul_(decay).add_(value, alpha=1.0 - decay)
+            else:
+                target.copy_(value)
 
 
-class DualBranchRoadNet(nn.Module):
-    """Dual-resolution road model with progressive-unfreezing support."""
+@dataclass
+class RunningAverage:
+    total: float = 0.0
+    count: int = 0
 
-    PHASE_NAMES = {
-        0: "head_only",
-        1: "head_plus_dual_branch",
-        2: "plus_resnet_layer3_layer4",
-        3: "plus_resnet_layer2",
-        4: "all_trainable",
+    def update(self, value: float, count: int) -> None:
+        self.total += float(value) * int(count)
+        self.count += int(count)
+
+    @property
+    def mean(self) -> float:
+        return self.total / max(self.count, 1)
+
+
+def phase_for_epoch(epoch: int, args: argparse.Namespace) -> int:
+    if not args.progressive_unfreeze:
+        return 4
+    if epoch < args.unfreeze_dual_branch_epoch:
+        return 0
+    if epoch < args.unfreeze_layer3_epoch:
+        return 1
+    if epoch < args.unfreeze_layer2_epoch:
+        return 2
+    if args.unfreeze_all_epoch < 0 or epoch < args.unfreeze_all_epoch:
+        return 3
+    return 4
+
+
+def head_lr(optimizer: torch.optim.Optimizer) -> float:
+    for group in optimizer.param_groups:
+        if group.get("group_name") == "head/decay":
+            return float(group["lr"])
+    return float(optimizer.param_groups[0]["lr"])
+
+
+def train_one_epoch(
+    model: nn.Module,
+    ema: ModelEMA,
+    loader: DataLoader,
+    criterion: RoadSegCenterlineTverskyLoss,
+    optimizer: torch.optim.Optimizer,
+    scheduler: LambdaLR,
+    scaler,
+    device: torch.device,
+    epoch: int,
+    args: argparse.Namespace,
+) -> Dict[str, float]:
+    epoch_start = perf_counter()
+    model.train()
+    base_model = unwrap_model(model)
+    base_model.enforce_frozen_norm_eval(args.freeze_encoder_bn)
+    if epoch < args.aux_start_epoch:
+        aux_scale = 0.0
+    elif args.aux_warmup_epochs:
+        aux_scale = min(
+            1.0,
+            (epoch - args.aux_start_epoch + 1) / args.aux_warmup_epochs,
+        )
+    else:
+        aux_scale = 1.0
+    criterion.aux_weight = args.aux_weight * aux_scale
+
+    meters = {
+        name: RunningAverage()
+        for name in (
+            "total",
+            "main_ce",
+            "main_dice",
+            "centerline",
+            "road_fraction",
+        )
+    }
+    optimizer.zero_grad(set_to_none=True)
+    successful_updates, skipped_nonfinite = 0, 0
+    progress = tqdm(
+        loader,
+        desc=f"Train {epoch + 1:03d}",
+        leave=False,
+        disable=not is_main_process(),
+        mininterval=1.0,
+    )
+    for step, (images, masks) in enumerate(progress):
+        images = images.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
+        if args.channels_last:
+            images = images.contiguous(memory_format=torch.channels_last)
+        group_start = (step // args.accumulation_steps) * args.accumulation_steps
+        group_size = min(args.accumulation_steps, len(loader) - group_start)
+        do_update = (
+            (step + 1) % args.accumulation_steps == 0
+            or step + 1 == len(loader)
+        )
+        sync_context = (
+            model.no_sync()
+            if isinstance(model, DDP) and not do_update
+            else nullcontext()
+        )
+        with sync_context:
+            with torch.autocast(
+                device_type=device.type, dtype=torch.float16, enabled=args.use_amp
+            ):
+                losses = criterion(model(images), masks)
+                scaled_loss = losses["loss_total"] / group_size
+            # All ranks always enter backward. DDP propagates non-finite
+            # gradients across ranks and GradScaler then skips the update on
+            # every rank consistently. This removes a blocking all-reduce and
+            # two device synchronizations from every healthy batch.
+            scaler.scale(scaled_loss).backward()
+
+        if do_update:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            old_scale = float(scaler.get_scale())
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+            if float(scaler.get_scale()) >= old_scale:
+                scheduler.step()
+                ema.update(base_model)
+                successful_updates += 1
+            else:
+                skipped_nonfinite += 1
+
+        batch = int(images.shape[0])
+        # One device-to-host copy replaces five scalar synchronizations.
+        metric_values = torch.stack(
+            (
+                losses["loss_total"].detach(),
+                losses["loss_main_ce"],
+                losses["loss_main_dice"],
+                losses["loss_aux_centerline"],
+                (masks > 0).float().mean(),
+            )
+        ).float().cpu().tolist()
+        for name, value in zip(meters, metric_values):
+            meters[name].update(value, batch)
+        progress.set_postfix(
+            loss=f"{meters['total'].mean:.4f}",
+            lr=f"{head_lr(optimizer):.2e}",
+            aux=f"{criterion.aux_weight:.3f}",
+        )
+
+    if distributed_active():
+        for meter in meters.values():
+            values = torch.tensor(
+                [meter.total, meter.count], dtype=torch.float64, device=device
+            )
+            dist.all_reduce(values, op=dist.ReduceOp.SUM)
+            meter.total, meter.count = float(values[0]), int(values[1])
+        counters = torch.tensor(
+            [successful_updates, skipped_nonfinite],
+            dtype=torch.int64,
+            device=device,
+        )
+        dist.all_reduce(counters, op=dist.ReduceOp.MAX)
+        successful_updates, skipped_nonfinite = map(int, counters.tolist())
+    elapsed = max(perf_counter() - epoch_start, 1e-6)
+    return {name: meter.mean for name, meter in meters.items()} | {
+        "lr": head_lr(optimizer),
+        "aux_weight": criterion.aux_weight,
+        "successful_updates": float(successful_updates),
+        "skipped_nonfinite": float(skipped_nonfinite),
+        "seconds": elapsed,
+        "images_per_second": meters["total"].count / elapsed,
     }
 
-    def __init__(
-        self,
-        num_classes: int = 2,
-        detail_channels: int = 96,
-        semantic_channels: int = 192,
-        dappm_channels: int = 32,
-        dappm_pool_sizes: Sequence[int] = (1, 2, 4, 8),
-        detail_blocks: Sequence[int] = (2, 2),
-        semantic_blocks: int = 2,
-        fusion_blocks: int = 1,
-        bilateral_fusion: str = "spatial",
-        decoder_s4_channels: int = 64,
-        decoder_s2_channels: int = 32,
-        full_channels: int = 24,
-        dropout: float = 0.05,
-        imagenet_pretrained: bool = True,
-        encoder_weights_path: Optional[str] = None,
-        deploy: bool = False,
-    ) -> None:
-        super().__init__()
-        self.encoder = TruncatedResNet34(
-            imagenet_pretrained=imagenet_pretrained,
-            encoder_weights_path=encoder_weights_path,
+
+# ---------------------------------------------------------------------------
+# Native sliding-window validation and metrics
+# ---------------------------------------------------------------------------
+
+
+def sliding_positions(length: int, tile_size: int, overlap: int) -> List[int]:
+    if length <= tile_size:
+        return [0]
+    stride = tile_size - overlap
+    positions = list(range(0, length - tile_size + 1, stride))
+    if positions[-1] != length - tile_size:
+        positions.append(length - tile_size)
+    return positions
+
+
+def hann_weight(tile_size: int, device: torch.device) -> Tensor:
+    axis = torch.hann_window(
+        tile_size, periodic=False, dtype=torch.float32, device=device
+    ).clamp_min_(0.05)
+    return (axis[:, None] * axis[None, :]).unsqueeze(0).unsqueeze(0)
+
+
+@torch.inference_mode()
+def sliding_window_logits(
+    model: nn.Module,
+    image: Tensor,
+    tile_size: int,
+    overlap: int,
+    tile_batch_size: int,
+    device: torch.device,
+    use_amp: bool,
+) -> Tensor:
+    if image.shape[0] != 1:
+        raise ValueError("Native validation requires batch_size=1")
+    original_h, original_w = image.shape[-2:]
+    pad_h, pad_w = max(0, tile_size - original_h), max(0, tile_size - original_w)
+    if pad_h or pad_w:
+        mode = "reflect" if min(original_h, original_w) > 1 else "replicate"
+        image = F.pad(image, (0, pad_w, 0, pad_h), mode=mode)
+    height, width = image.shape[-2:]
+    ys = sliding_positions(height, tile_size, overlap)
+    xs = sliding_positions(width, tile_size, overlap)
+    coordinates = [(y, x) for y in ys for x in xs]
+    accumulator = torch.zeros((1, 2, height, width), device=device)
+    normalizer = torch.zeros((1, 1, height, width), device=device)
+    weight = hann_weight(tile_size, device)
+    for start in range(0, len(coordinates), tile_batch_size):
+        batch_coordinates = coordinates[start : start + tile_batch_size]
+        tiles = torch.cat(
+            [
+                image[:, :, y : y + tile_size, x : x + tile_size]
+                for y, x in batch_coordinates
+            ],
+            dim=0,
         )
-        self.dual_branch = DualResolutionContext(
-            detail_channels=detail_channels,
-            semantic_channels=semantic_channels,
-            dappm_channels=dappm_channels,
-            dappm_pool_sizes=dappm_pool_sizes,
-            detail_blocks=detail_blocks,
-            semantic_blocks=semantic_blocks,
-            fusion_blocks=fusion_blocks,
-            bilateral_fusion=bilateral_fusion,
-            deploy=deploy,
-        )
-        self.decode_head = RoadReconstructionDecoder(
-            stem_channels=64,
-            shallow_channels=64,
-            fused_channels=detail_channels,
-            s4_channels=decoder_s4_channels,
-            s2_channels=decoder_s2_channels,
-            full_channels=full_channels,
-            num_classes=num_classes,
-            dropout=dropout,
-            deploy=deploy,
-        )
-        self.current_phase = 4
-
-    def forward(self, image: Tensor):
-        output_size = image.shape[-2:]
-        if not self.training or self.current_phase >= 4:
-            stem, shallow, shared, semantic, context = self.encoder(image)
-        elif self.current_phase <= 1:
-            with torch.no_grad():
-                stem, shallow, shared, semantic, context = self.encoder(image)
-        elif self.current_phase == 2:
-            with torch.no_grad():
-                stem = self.encoder.stem(image)
-                shallow = self.encoder.layer1(self.encoder.maxpool(stem))
-                shared = self.encoder.layer2(shallow)
-            semantic = self.encoder.layer3(shared)
-            context = self.encoder.layer4(semantic)
-        else:
-            with torch.no_grad():
-                stem = self.encoder.stem(image)
-                shallow = self.encoder.layer1(self.encoder.maxpool(stem))
-            shared = self.encoder.layer2(shallow)
-            semantic = self.encoder.layer3(shared)
-            context = self.encoder.layer4(semantic)
-
-        if self.training and self.current_phase == 0:
-            with torch.no_grad():
-                fused = self.dual_branch(shared, semantic, context)
-        else:
-            fused = self.dual_branch(shared, semantic, context)
-        return self.decode_head(stem, shallow, fused, output_size)
-
-    def set_trainable_phase(self, phase: int) -> str:
-        phase = int(phase)
-        if phase not in self.PHASE_NAMES:
-            raise ValueError(f"Unknown trainable phase: {phase}")
-        self.current_phase = phase
-        return self.PHASE_NAMES[phase]
-
-    def enforce_frozen_norm_eval(self, freeze_encoder_bn: bool = True) -> None:
-        frozen_modules: list[nn.Module] = []
-        if self.current_phase == 0:
-            frozen_modules.append(self.dual_branch)
-        if self.current_phase <= 1:
-            frozen_modules.extend((self.encoder.layer3, self.encoder.layer4))
-        if self.current_phase <= 2:
-            frozen_modules.append(self.encoder.layer2)
-        if self.current_phase <= 3:
-            frozen_modules.extend((self.encoder.stem, self.encoder.layer1))
-        for frozen in frozen_modules:
-            for module in frozen.modules():
-                if isinstance(module, nn.BatchNorm2d):
-                    module.eval()
-        if freeze_encoder_bn:
-            for module in self.encoder.modules():
-                if isinstance(module, nn.BatchNorm2d):
-                    module.eval()
-
-    def trainable_parameter_counts(self) -> Tuple[int, int]:
-        total = sum(parameter.numel() for parameter in self.parameters())
-        modules: list[nn.Module] = [self.decode_head]
-        if self.current_phase >= 1:
-            modules.append(self.dual_branch)
-        if self.current_phase >= 2:
-            modules.extend((self.encoder.layer3, self.encoder.layer4))
-        if self.current_phase >= 3:
-            modules.append(self.encoder.layer2)
-        if self.current_phase >= 4:
-            modules.extend((self.encoder.stem, self.encoder.layer1))
-        trainable = sum(
-            parameter.numel()
-            for module in modules
-            for parameter in module.parameters()
-        )
-        return trainable, total
-
-    def optimization_modules(self) -> Dict[str, Iterable[nn.Parameter]]:
-        return {
-            "head": self.decode_head.parameters(),
-            "dual_branch": self.dual_branch.parameters(),
-            "layer3": (
-                parameter
-                for module in (self.encoder.layer3, self.encoder.layer4)
-                for parameter in module.parameters()
-            ),
-            "layer2": self.encoder.layer2.parameters(),
-            "early_encoder": (
-                parameter
-                for module in (self.encoder.stem, self.encoder.layer1)
-                for parameter in module.parameters()
-            ),
-        }
-
-    def switch_to_deploy(self) -> None:
-        for module in list(self.modules()):
-            if isinstance(module, (RepVGGBlock, RepDepthwiseBlock)):
-                module.switch_to_deploy()
+        with torch.autocast(
+            device_type=device.type, dtype=torch.float16, enabled=use_amp
+        ):
+            logits = model(tiles)
+        if isinstance(logits, tuple):
+            logits = logits[-1]
+        logits = logits.float()
+        for index, (y, x) in enumerate(batch_coordinates):
+            accumulator[:, :, y : y + tile_size, x : x + tile_size] += (
+                logits[index : index + 1] * weight
+            )
+            normalizer[:, :, y : y + tile_size, x : x + tile_size] += weight
+    return (accumulator / normalizer.clamp_min_(1e-6))[
+        :, :, :original_h, :original_w
+    ]
 
 
-def build_model(args) -> DualBranchRoadNet:
-    """Build from an argparse Namespace or compatible attribute container."""
-    return DualBranchRoadNet(
-        num_classes=2,
-        detail_channels=int(args.detail_channels),
-        semantic_channels=int(args.semantic_channels),
-        dappm_channels=int(args.dappm_channels),
-        dappm_pool_sizes=tuple(int(value) for value in args.dappm_pool_sizes),
-        detail_blocks=tuple(int(value) for value in args.detail_blocks),
-        semantic_blocks=int(args.semantic_blocks),
-        fusion_blocks=int(args.fusion_blocks),
-        bilateral_fusion=str(getattr(args, "bilateral_fusion", "static")),
-        decoder_s4_channels=int(args.decoder_s4_channels),
-        decoder_s2_channels=int(args.decoder_s2_channels),
-        full_channels=int(args.full_channels),
-        dropout=float(args.dropout),
-        imagenet_pretrained=bool(args.imagenet_pretrained),
-        encoder_weights_path=args.encoder_weights_path,
+def confusion_counts(prediction: Tensor, target: Tensor) -> Tuple[int, int, int, int]:
+    prediction, target = prediction.bool(), target.bool()
+    return (
+        int((prediction & target).sum()),
+        int((prediction & ~target).sum()),
+        int((~prediction & target).sum()),
+        int((~prediction & ~target).sum()),
     )
+
+
+def metrics_from_counts(tp: int, fp: int, fn: int, tn: int) -> Dict[str, float]:
+    road_iou = tp / max(tp + fp + fn, 1)
+    background_iou = tn / max(tn + fp + fn, 1)
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    f1 = 2.0 * precision * recall / max(precision + recall, 1e-12)
+    return {
+        "road_iou": road_iou,
+        "background_iou": background_iou,
+        "miou": 0.5 * (road_iou + background_iou),
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "accuracy": (tp + tn) / max(tp + fp + fn + tn, 1),
+    }
+
+
+def histogram_counts(
+    probability: Tensor, target: Tensor, bins: int
+) -> Tuple[Tensor, Tensor]:
+    indices = (probability.clamp(0, 1) * (bins - 1)).long().flatten()
+    labels = target.bool().flatten()
+    positive = torch.bincount(indices[labels], minlength=bins)
+    negative = torch.bincount(indices[~labels], minlength=bins)
+    return positive, negative
+
+
+def counts_at_threshold(
+    positive: Tensor, negative: Tensor, threshold: float
+) -> Tuple[int, int, int, int]:
+    boundary = int(math.ceil(threshold * (len(positive) - 1)))
+    tp = int(positive[boundary:].sum())
+    fp = int(negative[boundary:].sum())
+    fn = int(positive[:boundary].sum())
+    tn = int(negative[:boundary].sum())
+    return tp, fp, fn, tn
+
+
+def relaxed_components(
+    prediction: Tensor, target: Tensor, buffer_px: int
+) -> Tuple[float, float, float, float]:
+    pred = prediction.float().unsqueeze(0).unsqueeze(0)
+    truth = target.float().unsqueeze(0).unsqueeze(0)
+    kernel = 2 * buffer_px + 1
+    pred_dilated = F.max_pool2d(pred, kernel, stride=1, padding=buffer_px) > 0
+    truth_dilated = F.max_pool2d(truth, kernel, stride=1, padding=buffer_px) > 0
+    return (
+        float((prediction & truth_dilated[0, 0]).sum()),
+        float((target & pred_dilated[0, 0]).sum()),
+        float(prediction.sum()),
+        float(target.sum()),
+    )
+
+
+@torch.inference_mode()
+def validate(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    args: argparse.Namespace,
+) -> Dict[str, float]:
+    model.eval()
+    bins = args.threshold_bins
+    positive_hist = torch.zeros(bins, dtype=torch.int64, device=device)
+    negative_hist = torch.zeros(bins, dtype=torch.int64, device=device)
+    totals = torch.zeros(10, dtype=torch.float64, device=device)
+    progress = tqdm(
+        loader, desc="Native validation", leave=False, disable=not is_main_process()
+    )
+    for images, masks, _ in progress:
+        images = images.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
+        if args.channels_last:
+            images = images.contiguous(memory_format=torch.channels_last)
+        logits = sliding_window_logits(
+            model,
+            images,
+            args.val_tile_size,
+            args.val_overlap,
+            args.val_tile_batch_size,
+            device,
+            args.use_amp,
+        )
+        probability = logits.softmax(dim=1)[:, 1]
+        target = masks > 0
+        prediction = probability >= 0.5
+        tp, fp, fn, tn = confusion_counts(prediction, target)
+        per_image_iou = tp / max(tp + fp + fn, 1)
+        relaxed = relaxed_components(
+            prediction[0], target[0], args.relaxed_buffer_px
+        )
+        totals += totals.new_tensor(
+            [tp, fp, fn, tn, per_image_iou, 1.0, *relaxed]
+        )
+        positive, negative = histogram_counts(probability, target, bins)
+        positive_hist += positive
+        negative_hist += negative
+
+    if distributed_active():
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+        dist.all_reduce(positive_hist, op=dist.ReduceOp.SUM)
+        dist.all_reduce(negative_hist, op=dist.ReduceOp.SUM)
+    tp, fp, fn, tn = (int(value) for value in totals[:4].tolist())
+    metrics = {f"fixed_{key}": value for key, value in metrics_from_counts(tp, fp, fn, tn).items()}
+    metrics["fixed_road_iou_macro"] = float(totals[4] / max(float(totals[5]), 1.0))
+    relaxed_precision = float(totals[6] / max(float(totals[8]), 1.0))
+    relaxed_recall = float(totals[7] / max(float(totals[9]), 1.0))
+    metrics["fixed_relaxed_f1"] = 2.0 * relaxed_precision * relaxed_recall / max(
+        relaxed_precision + relaxed_recall, 1e-12
+    )
+
+    best_threshold, best_counts, best_iou = 0.5, (tp, fp, fn, tn), -1.0
+    threshold = args.threshold_min
+    while threshold <= args.threshold_max + 1e-9:
+        counts = counts_at_threshold(positive_hist, negative_hist, threshold)
+        candidate = metrics_from_counts(*counts)["road_iou"]
+        if candidate > best_iou:
+            best_threshold, best_counts, best_iou = threshold, counts, candidate
+        threshold += args.threshold_step
+    metrics.update(
+        {
+            f"calibrated_{key}": value
+            for key, value in metrics_from_counts(*best_counts).items()
+        }
+    )
+    metrics["calibrated_threshold"] = float(best_threshold)
+    return metrics
+
+
+# ---------------------------------------------------------------------------
+# Checkpoints and argument handling
+# ---------------------------------------------------------------------------
+
+
+def resolve_checkpoint_path(path: str | Path) -> Path:
+    path = Path(path)
+    if path.is_file():
+        return path
+    if path.is_dir():
+        preferred = (
+            "best_fixed_road_iou.pt",
+            "best_calibrated_road_iou.pt",
+            "last.pt",
+        )
+        for name in preferred:
+            candidate = path / name
+            if candidate.is_file():
+                return candidate
+        files = sorted(path.rglob("*.pt")) + sorted(path.rglob("*.pth"))
+        if len(files) == 1:
+            return files[0]
+    raise FileNotFoundError(f"Checkpoint not found or ambiguous: {path}")
+
+
+def safe_torch_load(path: str | Path, device: torch.device):
+    path = resolve_checkpoint_path(path)
+    try:
+        return path, torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        return path, torch.load(path, map_location=device)
+
+
+def clean_state_dict(state: Dict[str, Tensor]) -> Dict[str, Tensor]:
+    return {
+        (key[7:] if key.startswith("module.") else key): value
+        for key, value in state.items()
+    }
+
+
+def transfer_weights(
+    model: nn.Module,
+    path: str | Path,
+    weights: str,
+    device: torch.device,
+) -> Path:
+    checkpoint_path, checkpoint = safe_torch_load(path, device)
+    if not isinstance(checkpoint, dict):
+        raise TypeError("Transfer checkpoint must be a dictionary")
+    state = checkpoint.get(weights)
+    if not isinstance(state, dict):
+        fallback = "model" if weights == "ema" else "ema"
+        state = checkpoint.get(fallback, checkpoint.get("state_dict"))
+    if not isinstance(state, dict):
+        raise KeyError(f"No '{weights}', model, ema, or state_dict weights found")
+    cleaned = clean_state_dict(state)
+    result = model.load_state_dict(cleaned, strict=False)
+    allowed_missing = all(
+        "spatial_gate" in key for key in result.missing_keys
+    )
+    if result.unexpected_keys or not allowed_missing:
+        raise RuntimeError(
+            "Transfer checkpoint architecture does not match DualBranchRoadNet. "
+            f"Missing={result.missing_keys}, unexpected={result.unexpected_keys}. "
+            "Only newly introduced spatial-gate tensors may be absent."
+        )
+    return checkpoint_path
+
+
+def checkpoint_state(
+    model: nn.Module,
+    ema: ModelEMA,
+    optimizer: torch.optim.Optimizer,
+    scheduler: LambdaLR,
+    scaler,
+    epoch: int,
+    best_fixed: float,
+    best_calibrated: float,
+    metrics: Dict[str, float],
+    args: argparse.Namespace,
+) -> Dict:
+    return {
+        "epoch": epoch,
+        "model": unwrap_model(model).state_dict(),
+        "ema": ema.module.state_dict(),
+        "ema_updates": ema.updates,
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "scaler": scaler.state_dict(),
+        "best_fixed_road_iou": best_fixed,
+        "best_calibrated_road_iou": best_calibrated,
+        "validation": metrics,
+        "args": vars(args),
+    }
+
+
+def atomic_torch_save(state: Dict, path: str | Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(state, temporary)
+    os.replace(temporary, path)
+
+
+def resume_training(
+    model: nn.Module,
+    ema: ModelEMA,
+    optimizer: torch.optim.Optimizer,
+    scheduler: LambdaLR,
+    scaler,
+    path: str | Path,
+    device: torch.device,
+) -> Tuple[int, float, float, Path]:
+    checkpoint_path, checkpoint = safe_torch_load(path, device)
+    model.load_state_dict(clean_state_dict(checkpoint["model"]), strict=True)
+    ema.module.load_state_dict(clean_state_dict(checkpoint["ema"]), strict=True)
+    ema.updates = int(checkpoint.get("ema_updates", 0))
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    scheduler.load_state_dict(checkpoint["scheduler"])
+    scaler.load_state_dict(checkpoint["scaler"])
+    return (
+        int(checkpoint["epoch"]) + 1,
+        float(checkpoint.get("best_fixed_road_iou", -1.0)),
+        float(checkpoint.get("best_calibrated_road_iou", -1.0)),
+        checkpoint_path,
+    )
+
+
+def append_jsonl(path: str | Path, record: Dict) -> None:
+    with Path(path).open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument(
+        "--dataset", choices=("deepglobe", "massachusetts"), required=True
+    )
+    parser.add_argument("--data_root", default=None)
+    parser.add_argument("--train_image_dir", default=None)
+    parser.add_argument("--train_mask_dir", default=None)
+    parser.add_argument("--train_list", default=None)
+    parser.add_argument("--test_list", default=None)
+    parser.add_argument("--val_image_dir", default=None)
+    parser.add_argument("--val_mask_dir", default=None)
+    parser.add_argument("--val_ratio", type=float, default=0.10)
+    parser.add_argument(
+        "--test_ratio",
+        type=float,
+        default=0.10,
+        help="Held out and never evaluated during training when no labeled val exists",
+    )
+    parser.add_argument("--split_seed", type=int, default=3407)
+
+    parser.add_argument("--crop_size", type=int, default=1024)
+    parser.add_argument("--road_crop_probability", type=float, default=0.60)
+    parser.add_argument("--road_crop_min_fraction", type=float, default=0.002)
+    parser.add_argument("--road_crop_tries", type=int, default=8)
+    parser.add_argument(
+        "--road_occlusion_probability",
+        type=float,
+        default=0.0,
+        help="Probability of placing short synthetic occluders on road pixels",
+    )
+    parser.add_argument(
+        "--road_occlusion_max_patches",
+        type=int,
+        default=2,
+    )
+
+    parser.add_argument("--detail_channels", type=int, default=96)
+    parser.add_argument("--semantic_channels", type=int, default=192)
+    parser.add_argument("--dappm_channels", type=int, default=32)
+    parser.add_argument(
+        "--dappm_pool_sizes", nargs="+", type=int, default=(1, 2, 4, 8)
+    )
+    parser.add_argument(
+        "--detail_blocks", nargs=2, type=int, default=(2, 2)
+    )
+    parser.add_argument("--semantic_blocks", type=int, default=2)
+    parser.add_argument("--fusion_blocks", type=int, default=1)
+    parser.add_argument(
+        "--bilateral_fusion",
+        choices=("static", "spatial"),
+        default="spatial",
+        help=(
+            "static reproduces the original channel-scaled residual exchange; "
+            "spatial adds lightweight location-adaptive gates in both directions"
+        ),
+    )
+    parser.add_argument("--decoder_s4_channels", type=int, default=64)
+    parser.add_argument("--decoder_s2_channels", type=int, default=32)
+    parser.add_argument("--full_channels", type=int, default=24)
+    parser.add_argument("--dropout", type=float, default=0.05)
+    parser.add_argument(
+        "--imagenet_pretrained",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--encoder_weights_path",
+        default=None,
+        help="Local torchvision-format ResNet-34 weights; avoids downloading",
+    )
+
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=2, help="Per GPU")
+    parser.add_argument("--accumulation_steps", type=int, default=2)
+    parser.add_argument("--lr", type=float, default=2e-4, help="Decoder/head LR")
+    parser.add_argument(
+        "--dual_branch_lr_factor",
+        "--bottleneck_lr_factor",
+        dest="dual_branch_lr_factor",
+        type=float,
+        default=0.75,
+        help="LR factor for detail/semantic branches; old flag kept as alias",
+    )
+    parser.add_argument("--backbone_lr_factor", type=float, default=0.20)
+    parser.add_argument("--early_encoder_lr_factor", type=float, default=0.10)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--warmup_epochs", type=int, default=5)
+    parser.add_argument("--warmup_start_factor", type=float, default=0.10)
+    parser.add_argument("--min_lr_ratio", type=float, default=0.02)
+    parser.add_argument("--grad_clip", type=float, default=3.0)
+    parser.add_argument("--ema_decay", type=float, default=0.999)
+
+    parser.add_argument("--road_weight_cap", type=float, default=2.0)
+    parser.add_argument(
+        "--fixed_road_weight",
+        type=float,
+        default=None,
+        help="Positive value skips the startup mask scan and uses this CE weight",
+    )
+    parser.add_argument("--main_dice_weight", type=float, default=1.0)
+    parser.add_argument("--aux_weight", type=float, default=0.15)
+    parser.add_argument(
+        "--aux_start_epoch",
+        type=int,
+        default=5,
+        help="Keep centerline supervision off before this zero-based epoch",
+    )
+    parser.add_argument("--aux_warmup_epochs", type=int, default=5)
+    parser.add_argument("--centerline_alpha", type=float, default=0.30)
+    parser.add_argument("--centerline_beta", type=float, default=0.70)
+    parser.add_argument("--centerline_dilation", type=int, default=1)
+    parser.add_argument("--skeleton_iterations", type=int, default=8)
+    parser.add_argument(
+        "--fast_centerline_target",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use an S2 intermediate skeleton target instead of full resolution",
+    )
+
+    parser.add_argument(
+        "--progressive_unfreeze",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Default: enabled for transfer runs, disabled otherwise",
+    )
+    parser.add_argument(
+        "--unfreeze_dual_branch_epoch",
+        "--unfreeze_bottleneck_epoch",
+        dest="unfreeze_dual_branch_epoch",
+        type=int,
+        default=3,
+        help="Epoch index opening both detail and semantic branches",
+    )
+    parser.add_argument("--unfreeze_layer3_epoch", type=int, default=6)
+    parser.add_argument("--unfreeze_layer2_epoch", type=int, default=12)
+    parser.add_argument(
+        "--unfreeze_all_epoch",
+        type=int,
+        default=-1,
+        help="Negative keeps ResNet stem/layer1 frozen for the whole transfer run",
+    )
+    parser.add_argument(
+        "--freeze_encoder_bn", action=argparse.BooleanOptionalAction, default=True
+    )
+
+    parser.add_argument("--val_tile_size", type=int, default=1024)
+    parser.add_argument("--val_overlap", type=int, default=256)
+    parser.add_argument("--val_tile_batch_size", type=int, default=2)
+    parser.add_argument("--val_interval", type=int, default=1)
+    parser.add_argument(
+        "--test_eval_images",
+        type=int,
+        default=61,
+        help=(
+            "For the Massachusetts txt protocol, reserve the first N test.txt "
+            "entries for validation and keep the remainder for final testing"
+        ),
+    )
+    parser.add_argument("--threshold_min", type=float, default=0.20)
+    parser.add_argument("--threshold_max", type=float, default=0.80)
+    parser.add_argument("--threshold_step", type=float, default=0.02)
+    parser.add_argument("--threshold_bins", type=int, default=1001)
+    parser.add_argument("--relaxed_buffer_px", type=int, default=3)
+
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--prefetch_factor", type=int, default=2)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--use_amp", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument(
+        "--channels_last", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument("--pretrained_checkpoint", default=None)
+    parser.add_argument("--transfer_weights", choices=("ema", "model"), default="ema")
+    parser.add_argument("--resume", default=None)
+    parser.add_argument("--save_dir", default="./checkpoints/dual_branch_roadnet")
+    return parser.parse_args()
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if args.crop_size < 64 or args.crop_size % 16:
+        raise ValueError("crop_size must be >=64 and divisible by 16")
+    if args.val_overlap < 0 or args.val_overlap >= args.val_tile_size:
+        raise ValueError("val_overlap must satisfy 0 <= overlap < tile size")
+    if args.batch_size < 1 or args.accumulation_steps < 1:
+        raise ValueError("batch_size and accumulation_steps must be positive")
+    if args.dataset == "massachusetts":
+        if not args.train_list or not args.test_list:
+            raise ValueError("Massachusetts requires --train_list and --test_list")
+        if args.test_eval_images < 1:
+            raise ValueError("test_eval_images must be positive")
+    if args.fixed_road_weight is not None and args.fixed_road_weight <= 0.0:
+        raise ValueError("fixed_road_weight must be positive")
+    if not 0.0 < args.val_ratio < 1.0:
+        raise ValueError("val_ratio must be in (0, 1)")
+    if not 0.0 <= args.test_ratio < 1.0:
+        raise ValueError("test_ratio must be in [0, 1)")
+    if args.val_ratio + args.test_ratio >= 1.0:
+        raise ValueError("val_ratio + test_ratio must be smaller than 1")
+    if args.resume and args.pretrained_checkpoint:
+        raise ValueError("Use either --resume or --pretrained_checkpoint, not both")
+    if not args.dappm_pool_sizes or min(args.dappm_pool_sizes) < 1:
+        raise ValueError("dappm_pool_sizes must be positive")
+    if min(args.detail_blocks) < 1:
+        raise ValueError("detail_blocks must be positive")
+    channel_values = (
+        args.detail_channels,
+        args.semantic_channels,
+        args.dappm_channels,
+        args.decoder_s4_channels,
+        args.decoder_s2_channels,
+        args.full_channels,
+    )
+    if min(channel_values) < 1:
+        raise ValueError("All architecture channel counts must be positive")
+    if not 0.0 <= args.centerline_alpha <= 1.0:
+        raise ValueError("centerline_alpha must be in [0, 1]")
+    if not 0.0 <= args.centerline_beta <= 1.0:
+        raise ValueError("centerline_beta must be in [0, 1]")
+    if args.centerline_alpha + args.centerline_beta <= 0.0:
+        raise ValueError("centerline_alpha + centerline_beta must be positive")
+    if args.centerline_dilation < 0:
+        raise ValueError("centerline_dilation cannot be negative")
+    if not 0.0 <= args.road_occlusion_probability <= 1.0:
+        raise ValueError("road_occlusion_probability must be in [0, 1]")
+    if args.road_occlusion_max_patches < 1:
+        raise ValueError("road_occlusion_max_patches must be positive")
+    for name in ("aux_weight",):
+        if getattr(args, name) < 0.0:
+            raise ValueError(f"{name} cannot be negative")
+    if args.aux_start_epoch < 0 or args.aux_warmup_epochs < 0:
+        raise ValueError("Centerline start/warmup epochs cannot be negative")
+    if args.progressive_unfreeze:
+        epochs = (
+            args.unfreeze_dual_branch_epoch,
+            args.unfreeze_layer3_epoch,
+            args.unfreeze_layer2_epoch,
+        )
+        if min(epochs) < 0 or tuple(sorted(epochs)) != epochs:
+            raise ValueError("Unfreeze epochs must be non-negative and ordered")
+        if 0 <= args.unfreeze_all_epoch < args.unfreeze_layer2_epoch:
+            raise ValueError("unfreeze_all_epoch must follow unfreeze_layer2_epoch")
+
+
+def save_split_manifest(
+    save_dir: Path,
+    train_pairs: Sequence[Tuple[Path, Path]],
+    val_pairs: Sequence[Tuple[Path, Path]],
+    test_pairs: Sequence[Tuple[Path, Path]],
+    split_seed: int,
+) -> None:
+    manifest = {
+        "split_seed": int(split_seed),
+        "counts": {
+            "train": len(train_pairs),
+            "val": len(val_pairs),
+            "test": len(test_pairs),
+        },
+        "train": [[str(image), str(mask)] for image, mask in train_pairs],
+        "val": [[str(image), str(mask)] for image, mask in val_pairs],
+        "test": [[str(image), str(mask)] for image, mask in test_pairs],
+    }
+    with (save_dir / "split_manifest.json").open("w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2)
+
+
+def main() -> None:
+    args = parse_args()
+    distributed, rank, local_rank, world_size, device = init_distributed()
+    args.distributed, args.rank = distributed, rank
+    args.local_rank, args.world_size = local_rank, world_size
+    if args.progressive_unfreeze is None:
+        if args.resume:
+            _, resume_metadata = safe_torch_load(
+                args.resume, torch.device("cpu")
+            )
+            saved_args = (
+                resume_metadata.get("args", {})
+                if isinstance(resume_metadata, dict)
+                else {}
+            )
+            args.progressive_unfreeze = bool(
+                saved_args.get("progressive_unfreeze", False)
+            )
+        else:
+            args.progressive_unfreeze = args.pretrained_checkpoint is not None
+    configure_dataset_paths(args)
+    validate_args(args)
+    rank_zero_print(
+        f"[startup 1/5] DDP initialized: world_size={world_size}, device={device}"
+    )
+    seed_everything(args.seed + rank)
+    args.use_amp = bool(args.use_amp and device.type == "cuda")
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+    try:
+        torch.set_float32_matmul_precision("high")
+    except AttributeError:
+        pass
+
+    save_dir = Path(args.save_dir)
+    if is_main_process():
+        save_dir.mkdir(parents=True, exist_ok=True)
+    rank_zero_print("[startup 2/5] Resolving image/mask pairs and DataLoaders...")
+    (
+        train_loader,
+        val_loader,
+        train_pairs,
+        val_pairs,
+        test_pairs,
+        train_sampler,
+    ) = make_loaders(args)
+    if is_main_process():
+        save_split_manifest(
+            save_dir,
+            train_pairs,
+            val_pairs,
+            test_pairs,
+            args.split_seed,
+        )
+    if args.fixed_road_weight is None:
+        rank_zero_print(
+            f"[startup 3/5] Scanning {len(train_pairs)} training masks "
+            "to estimate the road class weight..."
+        )
+        imbalance, road_weight = distributed_road_weight(
+            train_pairs, args.road_weight_cap, device
+        )
+    else:
+        imbalance = float("nan")
+        road_weight = float(args.fixed_road_weight)
+        rank_zero_print(
+            f"[startup 3/5] Skipping mask scan; fixed road CE weight="
+            f"{road_weight:.3f}"
+        )
+
+    # A full road checkpoint replaces every weight, so do not require an
+    # unnecessary ImageNet download for transfer/resume runs.
+    build_args = copy.copy(args)
+    if args.pretrained_checkpoint or args.resume:
+        build_args.imagenet_pretrained = False
+
+    # Rank 0 populates the torchvision cache first, preventing two processes
+    # from racing while downloading ImageNet weights on a fresh Kaggle session.
+    needs_imagenet_cache = bool(
+        build_args.imagenet_pretrained and not build_args.encoder_weights_path
+    )
+    rank_zero_print(
+        "[startup 4/5] Building DualBranchRoadNet"
+        + (
+            " and loading/downloading ImageNet ResNet-34 weights..."
+            if needs_imagenet_cache
+            else "..."
+        )
+    )
+    if distributed and rank != 0 and needs_imagenet_cache:
+        dist.barrier(device_ids=[local_rank])
+    model = build_model(build_args).to(device)
+    if distributed and rank == 0 and needs_imagenet_cache:
+        dist.barrier(device_ids=[local_rank])
+    if args.channels_last:
+        model = model.to(memory_format=torch.channels_last)
+    if args.pretrained_checkpoint:
+        loaded = transfer_weights(
+            model, args.pretrained_checkpoint, args.transfer_weights, device
+        )
+        rank_zero_print(f"Transferred {args.transfer_weights} weights from {loaded}")
+    rank_zero_print("[startup 5/5] Building optimizer, EMA, loss, and DDP reducer...")
+
+    # Build the optimizer and DDP reducer while every parameter is trainable.
+    # Later phase changes therefore retain optimizer groups and DDP hooks.
+    model.set_trainable_phase(4)
+    optimizer = build_optimizer(model, args)
+    updates_per_epoch = math.ceil(len(train_loader) / args.accumulation_steps)
+    scheduler = build_scheduler(optimizer, updates_per_epoch, args)
+    scaler = make_grad_scaler(args.use_amp)
+    ema = ModelEMA(model, args.ema_decay)
+    criterion = RoadSegCenterlineTverskyLoss(
+        road_class_weight=road_weight,
+        main_dice_weight=args.main_dice_weight,
+        aux_weight=args.aux_weight,
+        centerline_alpha=args.centerline_alpha,
+        centerline_beta=args.centerline_beta,
+        skeleton_iterations=args.skeleton_iterations,
+        centerline_dilation=args.centerline_dilation,
+        fast_centerline_target=args.fast_centerline_target,
+    ).to(device)
+
+    start_epoch, best_fixed, best_calibrated = 0, -1.0, -1.0
+    if args.resume:
+        start_epoch, best_fixed, best_calibrated, loaded = resume_training(
+            model, ema, optimizer, scheduler, scaler, args.resume, device
+        )
+        rank_zero_print(f"Resumed exact training state from {loaded}")
+
+    total_parameters = sum(parameter.numel() for parameter in model.parameters())
+    if distributed:
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=bool(args.progressive_unfreeze),
+            gradient_as_bucket_view=True,
+            broadcast_buffers=True,
+        )
+
+    effective_batch = args.batch_size * world_size * args.accumulation_steps
+    rank_zero_print("=" * 78)
+    rank_zero_print("DualBranchRoadNet road training")
+    rank_zero_print(
+        f"dataset={args.dataset} | DDP={distributed} | GPUs={world_size} | "
+        f"AMP={args.use_amp} | channels_last={args.channels_last}"
+    )
+    rank_zero_print(
+        f"crop={args.crop_size} | batch/GPU={args.batch_size} | "
+        f"accumulation={args.accumulation_steps} | effective batch={effective_batch}"
+    )
+    rank_zero_print(
+        f"shared ResNet34 to S8 | detail={args.detail_channels}ch S8 | "
+        f"semantic anchor=256ch S16 | context={args.semantic_channels}ch S32 | DAPPM="
+        f"{args.dappm_channels}ch grids={tuple(args.dappm_pool_sizes)}"
+    )
+    rank_zero_print(
+        f"decoder S4/S2/S1={args.decoder_s4_channels}/"
+        f"{args.decoder_s2_channels}/{args.full_channels}ch | "
+        f"detail blocks={tuple(args.detail_blocks)}"
+    )
+    rank_zero_print(
+        f"bilateral fusion={args.bilateral_fusion} | "
+        "loss and directional decoder unchanged"
+    )
+    rank_zero_print(
+        f"parameters={total_parameters:,} | imbalance={imbalance:.3f} | "
+        f"road CE weight={road_weight:.3f}"
+    )
+    rank_zero_print(
+        "loss=weighted CE + Dice + centerline Tversky "
+        f"(centerline max={args.aux_weight:.2f}, starts epoch "
+        f"{args.aux_start_epoch + 1})"
+    )
+    rank_zero_print(
+        "centerline target="
+        + ("fast S2 morphology" if args.fast_centerline_target else "full resolution")
+    )
+    rank_zero_print(
+        f"progressive_unfreeze={args.progressive_unfreeze} | "
+        f"epochs={args.epochs} | head LR={args.lr:.2e}"
+    )
+    rank_zero_print("=" * 78)
+
+    log_path = save_dir / "metrics.jsonl"
+    for epoch in range(start_epoch, args.epochs):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        phase = phase_for_epoch(epoch, args)
+        phase_name = unwrap_model(model).set_trainable_phase(phase)
+        trainable, total = unwrap_model(model).trainable_parameter_counts()
+        rank_zero_print(
+            f"\nEpoch {epoch + 1}/{args.epochs} | phase={phase_name} | "
+            f"trainable={trainable:,}/{total:,}"
+        )
+        train_metrics = train_one_epoch(
+            model,
+            ema,
+            train_loader,
+            criterion,
+            optimizer,
+            scheduler,
+            scaler,
+            device,
+            epoch,
+            args,
+        )
+        gate_metrics = unwrap_model(model).dual_branch.gate_statistics()
+        validation_metrics: Dict[str, float] = {}
+        should_validate = (epoch + 1) % args.val_interval == 0 or epoch + 1 == args.epochs
+        if should_validate:
+            if distributed_active():
+                for tensor in ema.module.state_dict().values():
+                    dist.broadcast(tensor, src=0)
+            validation_metrics = validate(ema.module, val_loader, device, args)
+            fixed = validation_metrics["fixed_road_iou"]
+            calibrated = validation_metrics["calibrated_road_iou"]
+            fixed_improved, calibrated_improved = fixed > best_fixed, calibrated > best_calibrated
+            best_fixed, best_calibrated = max(best_fixed, fixed), max(best_calibrated, calibrated)
+            rank_zero_print(
+                f"train loss={train_metrics['total']:.5f} | "
+                f"throughput={train_metrics['images_per_second']:.1f} img/s | "
+                f"fixed@.50 road IoU={fixed:.5f} | "
+                f"calibrated road IoU={calibrated:.5f} "
+                f"@{validation_metrics['calibrated_threshold']:.2f} | "
+                f"F1={validation_metrics['fixed_f1']:.5f} | "
+                f"gates s2d/d2s/ctx/final="
+                f"{gate_metrics['semantic_to_detail_abs_mean']:.3f}/"
+                f"{gate_metrics['detail_to_semantic_abs_mean']:.3f}/"
+                f"{gate_metrics['s32_context_to_s16_abs_mean']:.3f}/"
+                f"{gate_metrics['semantic_to_final_abs_mean']:.3f}"
+                + (
+                    " | spatial mean s2d/d2s="
+                    f"{gate_metrics['semantic_to_detail_spatial_mean']:.3f}/"
+                    f"{gate_metrics['detail_to_semantic_spatial_mean']:.3f}"
+                    " std="
+                    f"{gate_metrics['semantic_to_detail_spatial_std']:.3f}/"
+                    f"{gate_metrics['detail_to_semantic_spatial_std']:.3f}"
+                    if args.bilateral_fusion == "spatial"
+                    else ""
+                )
+            )
+            if is_main_process():
+                state = checkpoint_state(
+                    model,
+                    ema,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    epoch,
+                    best_fixed,
+                    best_calibrated,
+                    validation_metrics,
+                    args,
+                )
+                if fixed_improved:
+                    atomic_torch_save(state, save_dir / "best_fixed_road_iou.pt")
+                if calibrated_improved:
+                    atomic_torch_save(
+                        state, save_dir / "best_calibrated_road_iou.pt"
+                    )
+                atomic_torch_save(state, save_dir / "last.pt")
+        elif is_main_process():
+            state = checkpoint_state(
+                model,
+                ema,
+                optimizer,
+                scheduler,
+                scaler,
+                epoch,
+                best_fixed,
+                best_calibrated,
+                validation_metrics,
+                args,
+            )
+            atomic_torch_save(state, save_dir / "last.pt")
+
+        if is_main_process():
+            append_jsonl(
+                log_path,
+                {
+                    "epoch": epoch + 1,
+                    "phase": phase_name,
+                    "trainable_parameters": trainable,
+                    "train": train_metrics,
+                    "fusion_gates": gate_metrics,
+                    "validation": validation_metrics,
+                },
+            )
+    rank_zero_print(f"Finished. Checkpoints: {save_dir.resolve()}")
+    cleanup_distributed()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    finally:
+        cleanup_distributed()
