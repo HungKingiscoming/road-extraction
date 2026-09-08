@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence, Tuple
 
@@ -653,20 +654,36 @@ class DualBranchRoadNet(nn.Module):
         )
         return trainable, total
 
-    def optimization_modules(self) -> Dict[str, Iterable[nn.Parameter]]:
+    def optimization_modules(self) -> Dict[str, Iterable[Tuple[str, nn.Parameter]]]:
+        """Named parameters per optimizer group.
+
+        Names (not just tensors) are needed so build_optimizer() can
+        correctly classify broadcast-shaped gate/scale parameters (e.g.
+        semantic_to_detail_scale_1, detail_to_semantic_scale_1,
+        context_scale, fusion_scale -- all stored as (1, C, 1, 1) for
+        broadcasting) as "no weight decay", the same treatment BatchNorm
+        weight/bias already get. A plain ndim<=1 check misses these: they
+        are semantically per-channel scales, not weight matrices, but their
+        broadcast shape has ndim==4.
+        """
+
+        def named(module: nn.Module, prefix: str) -> Iterable[Tuple[str, nn.Parameter]]:
+            return (
+                (f"{prefix}.{name}", parameter)
+                for name, parameter in module.named_parameters()
+            )
+
         return {
-            "head": self.decode_head.parameters(),
-            "dual_branch": self.dual_branch.parameters(),
-            "layer3": (
-                parameter
-                for module in (self.encoder.layer3, self.encoder.layer4)
-                for parameter in module.parameters()
+            "head": named(self.decode_head, "decode_head"),
+            "dual_branch": named(self.dual_branch, "dual_branch"),
+            "layer3": itertools.chain(
+                named(self.encoder.layer3, "encoder.layer3"),
+                named(self.encoder.layer4, "encoder.layer4"),
             ),
-            "layer2": self.encoder.layer2.parameters(),
-            "early_encoder": (
-                parameter
-                for module in (self.encoder.stem, self.encoder.layer1)
-                for parameter in module.parameters()
+            "layer2": named(self.encoder.layer2, "encoder.layer2"),
+            "early_encoder": itertools.chain(
+                named(self.encoder.stem, "encoder.stem"),
+                named(self.encoder.layer1, "encoder.layer1"),
             ),
         }
 
