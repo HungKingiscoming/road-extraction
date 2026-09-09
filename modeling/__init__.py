@@ -2,7 +2,8 @@ from .decoder import (
     RepDepthwiseBlock,
     RepVGGBlock,
     RoadReconstructionDecoder,
-    RoadSegCenterlineTverskyLoss,
+    RoadSegClDiceLoss,
+    StripPoolingModule,
 )
 from .model import DualBranchRoadNet, build_model
 
@@ -11,6 +12,7 @@ __all__ = (
     "RepDepthwiseBlock",
     "RepVGGBlock",
     "RoadReconstructionDecoder",
-    "RoadSegCenterlineTverskyLoss",
+    "RoadSegClDiceLoss",
+    "StripPoolingModule",
     "build_model",
 )
