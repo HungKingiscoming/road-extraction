@@ -341,8 +341,70 @@ class SeparableConvBNAct(nn.Sequential):
         )
 
 
+def _group_count(channels: int, maximum: int = 8) -> int:
+    """Largest small GroupNorm divisor, robust for small per-GPU batches."""
+    for groups in range(min(maximum, int(channels)), 0, -1):
+        if int(channels) % groups == 0:
+            return groups
+    return 1
+
+
+class StripPoolingModule(nn.Module):
+    """Long-range horizontal/vertical context via two 1-D global poolings.
+
+    Square poolings (as in ProgressiveDAPPM) blend context from a compact
+    neighborhood. Roads are the opposite of compact: thin, and often run the
+    full width or height of a tile. Pooling the feature map down to a single
+    column (H, 1) or a single row (1, W), convolving along that strip, and
+    broadcasting back lets every pixel see the full extent of its own row
+    and column in one pass -- exactly the two directions a road is likely to
+    continue in, and a shape square pooling cannot represent efficiently.
+    GroupNorm keeps the branch valid at the small per-GPU batch sizes crop
+    training uses, matching ProgressiveDAPPM. The block is residual and the
+    fuse projection is not zero-initialized (unlike the gates elsewhere in
+    this model) because strip pooling is a fixed, useful prior from the
+    first step rather than a correction that should start at zero.
+    """
+
+    def __init__(self, channels: int, reduction: int = 4) -> None:
+        super().__init__()
+        pooled_channels = max(16, channels // max(1, reduction))
+        self.reduce = ConvGNAct(channels, pooled_channels, 1, padding=0)
+        self.horizontal_conv = nn.Conv2d(
+            pooled_channels, pooled_channels, (3, 1), padding=(1, 0), bias=False
+        )
+        self.horizontal_norm = nn.GroupNorm(
+            _group_count(pooled_channels), pooled_channels
+        )
+        self.vertical_conv = nn.Conv2d(
+            pooled_channels, pooled_channels, (1, 3), padding=(0, 1), bias=False
+        )
+        self.vertical_norm = nn.GroupNorm(
+            _group_count(pooled_channels), pooled_channels
+        )
+        self.fuse = ConvGNAct(
+            pooled_channels, channels, 1, padding=0, activation=False
+        )
+        self.activation = nn.ReLU(inplace=True)
+
+    def forward(self, x: Tensor) -> Tensor:
+        height, width = x.shape[-2:]
+        reduced = self.reduce(x)
+
+        horizontal = F.adaptive_avg_pool2d(reduced, (height, 1))
+        horizontal = self.horizontal_norm(self.horizontal_conv(horizontal))
+        horizontal = self.activation(horizontal).expand(-1, -1, -1, width)
+
+        vertical = F.adaptive_avg_pool2d(reduced, (1, width))
+        vertical = self.vertical_norm(self.vertical_conv(vertical))
+        vertical = self.activation(vertical).expand(-1, -1, height, -1)
+
+        context = self.fuse(self.activation(horizontal + vertical))
+        return self.activation(x + context)
+
+
 class RoadReconstructionDecoder(nn.Module):
-    """S8-to-S1 decoder with one train-only S4 centerline head."""
+    """S8-to-S1 road reconstruction decoder."""
 
     def __init__(
         self,
@@ -393,12 +455,6 @@ class RoadReconstructionDecoder(nn.Module):
         self.dropout = nn.Dropout2d(dropout) if dropout > 0.0 else nn.Identity()
         self.classifier = nn.Conv2d(full_channels, num_classes, 1)
 
-        auxiliary_channels = max(24, s4_channels // 2)
-        self.centerline_head = nn.Sequential(
-            ConvBNAct(s4_channels, auxiliary_channels, 3),
-            nn.Conv2d(auxiliary_channels, 1, 1),
-        )
-
     @staticmethod
     def _resize(x: Tensor, size: Tuple[int, int]) -> Tensor:
         return F.interpolate(x, size=size, mode="bilinear", align_corners=False)
@@ -409,7 +465,7 @@ class RoadReconstructionDecoder(nn.Module):
         shallow_s4: Tensor,
         fused_s8: Tensor,
         output_size: Tuple[int, int],
-    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+    ) -> Tensor:
         p4 = self._resize(self.fused_proj(fused_s8), shallow_s4.shape[-2:])
         p4 = self.s4_fuse(torch.cat((p4, self.shallow_proj(shallow_s4)), dim=1))
         p4 = self.s4_refine(p4)
@@ -419,10 +475,7 @@ class RoadReconstructionDecoder(nn.Module):
         p2 = self.s2_refine(p2)
 
         full = self._resize(p2, output_size)
-        road_logits = self.classifier(self.dropout(self.full_refine(full)))
-        if self.training:
-            return self.centerline_head(p4), road_logits
-        return road_logits
+        return self.classifier(self.dropout(self.full_refine(full)))
 
     def switch_to_deploy(self) -> None:
         for module in list(self.modules()):
@@ -466,130 +519,166 @@ def binary_dice_loss(
     return (1.0 - (2.0 * intersection + eps) / (denominator + eps)).mean()
 
 
-def binary_tversky_loss(
+def soft_cldice_loss(
     probability: Tensor,
     target: Tensor,
-    alpha: float = 0.30,
-    beta: float = 0.70,
-    eps: float = 1e-6,
+    iterations: int = 8,
+    smooth: float = 1e-6,
+    downsample: int = 1,
 ) -> Tensor:
-    """One centerline loss; beta > alpha penalizes broken roads more."""
-    probability = probability.float().flatten(1)
-    target = target.float().flatten(1)
-    true_positive = (probability * target).sum(dim=1)
-    false_positive = (probability * (1.0 - target)).sum(dim=1)
-    false_negative = ((1.0 - probability) * target).sum(dim=1)
-    score = (true_positive + eps) / (
-        true_positive
-        + float(alpha) * false_positive
-        + float(beta) * false_negative
-        + eps
-    )
-    return (1.0 - score).mean()
+    """Soft clDice topology term (Shit et al., CVPR 2021, "clDice").
+
+    Skeletonizing the *prediction* and checking how much of it lies inside
+    the target mask gives a topological precision; skeletonizing the
+    *target* and checking how much of it lies inside the predicted mask
+    gives a topological sensitivity/recall. A single pixel gap that
+    disconnects a road is penalized here even when it barely changes total
+    area overlap -- exactly the failure mode plain Dice is blind to for
+    thin, elongated structures.
+
+    clDice by itself can be gamed by a prediction whose skeleton happens to
+    thread through the target mask without covering its true width or
+    shape, so this term is meant to be added on top of a region loss
+    (Dice/CE), never used alone -- see RoadSegClDiceLoss.
+
+    Unlike the old centerline-Tversky auxiliary, this term skeletonizes the
+    *prediction* too, and does so with gradients (the target's skeleton is
+    fixed and detached below). ``soft_skeletonize`` costs several max-pool
+    passes over the full tensor per iteration, so doing this at full
+    training resolution on every step is the single most expensive line in
+    the loss. ``downsample`` (an integer stride, e.g. 4) shrinks the map
+    with avg/max pooling before skeletonizing -- a road that survives to S4
+    is still recognizably connected or broken, and the corresponding compute
+    drops with the square of the factor. Set 1 to skip this and skeletonize
+    at the input resolution exactly as given.
+    """
+    probability = probability.float()
+    target = target.float()
+    if downsample > 1:
+        probability = F.avg_pool2d(probability, downsample)
+        with torch.no_grad():
+            target = F.max_pool2d(target, downsample)
+    skeleton_pred = soft_skeletonize(probability, iterations)
+    with torch.no_grad():
+        skeleton_true = soft_skeletonize(target, iterations)
+
+    skeleton_pred_flat = skeleton_pred.flatten(1)
+    skeleton_true_flat = skeleton_true.flatten(1)
+    probability_flat = probability.flatten(1)
+    target_flat = target.flatten(1)
+
+    precision = (skeleton_pred_flat * target_flat).sum(dim=1) + smooth
+    precision = precision / (skeleton_pred_flat.sum(dim=1) + smooth)
+    sensitivity = (skeleton_true_flat * probability_flat).sum(dim=1) + smooth
+    sensitivity = sensitivity / (skeleton_true_flat.sum(dim=1) + smooth)
+
+    cl_dice = 2.0 * precision * sensitivity / (precision + sensitivity + smooth)
+    return (1.0 - cl_dice).mean()
 
 
-class RoadSegCenterlineTverskyLoss(nn.Module):
-    """Compact road objective: weighted CE + Dice + centerline Tversky."""
+class RoadSegClDiceLoss(nn.Module):
+    """Road objective: weighted CE + clDice, plus S16 deep supervision.
+
+    The main term is exactly two losses: weighted CE for per-pixel class
+    balance, and soft-clDice (Shit et al., CVPR 2021) for road topology --
+    no separate area-based Dice term. This replaces the previous S4
+    centerline-Tversky auxiliary head: clDice already supervises topology
+    directly on the full-resolution prediction, so a separate
+    skeleton-prediction head is redundant and has been removed from the
+    decoder.
+
+    Caution carried over from the clDice paper: without a region/area term
+    like Dice, a prediction whose skeleton threads through the target mask
+    can score well on clDice while still being too thin, too thick, or
+    locally mis-shaped -- clDice constrains connectivity, not area. Watch
+    fixed@.50 IoU (an area metric) alongside F1/relaxed-F1 during training;
+    if IoU stalls or drops while topology-sensitive metrics keep improving,
+    that is the signature of this failure mode, and raising cldice_weight
+    won't fix it -- a Dice/Tversky term would need to come back.
+
+    A different auxiliary signal is unchanged from before: a lightweight
+    road head reading the *semantic* S16 feature inside DualResolutionContext
+    (after the DAPPM S32 context has been folded back in), supervised
+    against a max-pooled downsample of the target. This is deep supervision
+    for the semantic branch specifically -- the cross-branch gate statistics
+    logged during training showed the semantic->detail exchange staying an
+    order of magnitude stronger than the reverse detail->semantic direction,
+    i.e. the semantic stream had little direct incentive to become
+    road-discriminative on its own. A cheap, ungated CE+Dice loss on that
+    stream gives it a direct reason to; that internal Dice term is
+    unaffected by the change above since it supervises a different, much
+    coarser (S16) prediction, not the main output.
+    """
 
     def __init__(
         self,
         road_class_weight: float = 2.0,
-        main_dice_weight: float = 1.0,
-        aux_weight: float = 0.15,
-        centerline_alpha: float = 0.30,
-        centerline_beta: float = 0.70,
+        cldice_weight: float = 0.5,
         skeleton_iterations: int = 8,
-        centerline_dilation: int = 1,
-        fast_centerline_target: bool = False,
+        cldice_downsample: int = 4,
+        semantic_aux_weight: float = 0.15,
+        semantic_aux_dice_weight: float = 0.5,
     ) -> None:
         super().__init__()
         self.road_class_weight = float(road_class_weight)
-        self.main_dice_weight = float(main_dice_weight)
-        self.aux_weight = float(aux_weight)
-        self.centerline_alpha = float(centerline_alpha)
-        self.centerline_beta = float(centerline_beta)
+        self.cldice_weight = float(cldice_weight)
         self.skeleton_iterations = int(skeleton_iterations)
-        self.centerline_dilation = int(centerline_dilation)
-        self.fast_centerline_target = bool(fast_centerline_target)
+        self.cldice_downsample = int(cldice_downsample)
+        self.semantic_aux_weight = float(semantic_aux_weight)
+        self.semantic_aux_dice_weight = float(semantic_aux_dice_weight)
 
     def forward(
         self,
         outputs: Tuple[Tensor, Tensor],
         target: Tensor,
     ) -> Dict[str, Tensor]:
-        centerline_logits, road_logits = outputs
+        semantic_aux_logits, road_logits = outputs
         labels = (target > 0).long()
         road_mask = labels.unsqueeze(1).float()
         class_weights = road_logits.new_tensor([1.0, self.road_class_weight])
+
         loss_main_ce = F.cross_entropy(
             road_logits.float(), labels, weight=class_weights
         )
         road_probability = road_logits.float().softmax(dim=1)[:, 1:2]
-        loss_main_dice = binary_dice_loss(road_probability, road_mask)
+        loss_main_cldice = soft_cldice_loss(
+            road_probability,
+            road_mask,
+            self.skeleton_iterations,
+            downsample=self.cldice_downsample,
+        )
 
         with torch.no_grad():
-            # Skeletonize before reducing resolution.  This preserves narrow
-            # branches and intersections that can merge when the mask is
-            # max-pooled directly to S4.
-            if self.fast_centerline_target:
-                intermediate_size = tuple(
-                    min(source, target_size * 2)
-                    for source, target_size in zip(
-                        road_mask.shape[-2:], centerline_logits.shape[-2:]
-                    )
-                )
-                skeleton_input = F.adaptive_max_pool2d(
-                    road_mask.float(), intermediate_size
-                )
-                scale = max(
-                    road_mask.shape[-2] / max(intermediate_size[0], 1),
-                    road_mask.shape[-1] / max(intermediate_size[1], 1),
-                )
-                target_iterations = (
-                    max(1, math.ceil(self.skeleton_iterations / scale))
-                    if self.skeleton_iterations > 0
-                    else 0
-                )
-                target_dilation = max(
-                    0, int(math.floor(self.centerline_dilation / scale + 0.5))
-                )
-            else:
-                skeleton_input = road_mask.float()
-                target_iterations = self.skeleton_iterations
-                target_dilation = self.centerline_dilation
-
-            centerline_target = soft_skeletonize(
-                skeleton_input, target_iterations
+            # Max-pool, not average-pool: a thin road must survive being
+            # downsampled to S16 the same way it had to survive to S4 in the
+            # old centerline target -- averaging fades it below the
+            # rounding threshold in cells that are mostly background.
+            aux_target = F.adaptive_max_pool2d(
+                road_mask, semantic_aux_logits.shape[-2:]
             )
-            if target_dilation > 0:
-                kernel = 2 * target_dilation + 1
-                centerline_target = F.max_pool2d(
-                    centerline_target,
-                    kernel,
-                    stride=1,
-                    padding=target_dilation,
-                )
-            centerline_target = F.adaptive_max_pool2d(
-                centerline_target, centerline_logits.shape[-2:]
-            )
-
-        loss_centerline = binary_tversky_loss(
-            centerline_logits.float().sigmoid(),
-            centerline_target,
-            alpha=self.centerline_alpha,
-            beta=self.centerline_beta,
+        aux_labels = aux_target.squeeze(1).long()
+        aux_class_weights = semantic_aux_logits.new_tensor(
+            [1.0, self.road_class_weight]
         )
+        loss_aux_ce = F.cross_entropy(
+            semantic_aux_logits.float(), aux_labels, weight=aux_class_weights
+        )
+        aux_probability = semantic_aux_logits.float().softmax(dim=1)[:, 1:2]
+        loss_aux_dice = binary_dice_loss(aux_probability, aux_target)
+        loss_semantic_aux = (
+            loss_aux_ce + self.semantic_aux_dice_weight * loss_aux_dice
+        )
+
         total = (
             loss_main_ce
-            + self.main_dice_weight * loss_main_dice
-            + self.aux_weight * loss_centerline
+            + self.cldice_weight * loss_main_cldice
+            + self.semantic_aux_weight * loss_semantic_aux
         )
         return {
             "loss_total": total,
             "loss_main_ce": loss_main_ce.detach(),
-            "loss_main_dice": loss_main_dice.detach(),
-            "loss_aux_centerline": loss_centerline.detach(),
-            "loss_centerline_tversky": loss_centerline.detach(),
+            "loss_main_cldice": loss_main_cldice.detach(),
+            "loss_semantic_aux": loss_semantic_aux.detach(),
         }
 
 
