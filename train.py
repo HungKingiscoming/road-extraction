@@ -2048,18 +2048,20 @@ def main() -> None:
                 f"calibrated road IoU={calibrated:.5f} "
                 f"@{validation_metrics['calibrated_threshold']:.2f} | "
                 f"F1={validation_metrics['fixed_f1']:.5f} | "
-                f"gates s2d/d2s/ctx/final="
+                f"gates s2d/ctx/final="
                 f"{gate_metrics['semantic_to_detail_abs_mean']:.3f}/"
-                f"{gate_metrics['detail_to_semantic_abs_mean']:.3f}/"
                 f"{gate_metrics['s32_context_to_s16_abs_mean']:.3f}/"
-                f"{gate_metrics['semantic_to_final_abs_mean']:.3f}"
+                f"{gate_metrics['semantic_to_final_abs_mean']:.3f} | "
+                # d2s is now a multiplicative gate (identity = 1.0, not 0.0
+                # like the additive scales above) -- reported separately so
+                # "how far from 1" isn't confused with "how far from 0".
+                f"d2s_gate mean/std="
+                f"{gate_metrics['detail_to_semantic_gate_mean']:.3f}/"
+                f"{gate_metrics['detail_to_semantic_gate_std']:.3f}"
                 + (
-                    " | spatial mean s2d/d2s="
+                    " | s2d spatial mean/std="
                     f"{gate_metrics['semantic_to_detail_spatial_mean']:.3f}/"
-                    f"{gate_metrics['detail_to_semantic_spatial_mean']:.3f}"
-                    " std="
-                    f"{gate_metrics['semantic_to_detail_spatial_std']:.3f}/"
-                    f"{gate_metrics['detail_to_semantic_spatial_std']:.3f}"
+                    f"{gate_metrics['semantic_to_detail_spatial_std']:.3f}"
                     if args.bilateral_fusion == "spatial"
                     else ""
                 )
