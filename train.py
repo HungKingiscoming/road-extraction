@@ -821,17 +821,15 @@ def build_optimizer(model: DualBranchRoadNet, args: argparse.Namespace) -> AdamW
                 raise RuntimeError(f"Duplicate optimizer parameter in {group_name}")
             seen.add(id(parameter))
             # Per-channel gate/scale parameters (semantic_to_detail_scale_1,
-            # context_scale, fusion_scale) are stored with broadcast shape
-            # (1, C, 1, 1) -- ndim==4 -- but play the exact same role as
-            # BatchNorm weight/bias (ndim==1): a per-channel multiplicative
-            # scale, not a weight matrix. A plain ndim<=1 check puts them in
-            # the decay group by mistake. Matching by name fixes this.
-            # (Historical note: an earlier revision also had a
-            # detail_to_semantic_scale_1 zero-init residual scale here,
-            # which decayed a param whose gradient depended on itself --
-            # the dead-gradient bug this comment used to describe. It was
-            # replaced by a genuine multiplicative gate module, see
-            # DualResolutionContext's docstring.)
+            # detail_to_semantic_scale_1, context_scale, fusion_scale) are
+            # stored with broadcast shape (1, C, 1, 1) -- ndim==4 -- but play
+            # the exact same role as BatchNorm weight/bias (ndim==1): a
+            # per-channel multiplicative scale, not a weight matrix. A plain
+            # ndim<=1 check puts them in the decay group by mistake, pulling
+            # a zero-initialized gate (detail_to_semantic_scale_1) back
+            # toward 0 proportionally to its own value every step -- while a
+            # gate that starts away from 0 (semantic_to_detail_scale_1=0.10)
+            # is barely affected. Matching by name fixes this asymmetry.
             # Match only the parameter's own local name (last dotted
             # component), not the full path -- otherwise a *module* named
             # with "scale" in it (e.g. ProgressiveDAPPM.scale0, the first
@@ -1357,40 +1355,16 @@ def transfer_weights(
     result = model.load_state_dict(cleaned, strict=False)
     # missing_keys: present in the current model, absent from the old
     # checkpoint -- tolerated for tensors introduced after that checkpoint
-    # was trained. This now includes the entire reworked detail branch
-    # (detail_stem, detail_refine, detail_geometry_to_semantic,
-    # detail_to_semantic_gate replace the old detail_projection/
-    # detail_stages/detail_to_semantic_1/_scale_1/_spatial_gate_1) -- a
-    # checkpoint transfer across that redesign only meaningfully carries
-    # over the ResNet encoder and decode_head; dual_branch initializes
-    # fresh, which is expected, not a bug.
-    allowed_missing_tokens = (
-        "spatial_gate",
-        "strip_pooling",
-        "semantic_aux_head",
-        "detail_stem",
-        "detail_refine",
-        "detail_geometry_to_semantic",
-        "detail_to_semantic_gate",
-    )
+    # was trained (spatial gates, strip pooling, the S16 semantic aux head).
+    allowed_missing_tokens = ("spatial_gate", "strip_pooling", "semantic_aux_head")
     allowed_missing = all(
         any(token in key for token in allowed_missing_tokens)
         for key in result.missing_keys
     )
     # unexpected_keys: present in the old checkpoint, absent from the
-    # current model -- tolerated for the removed S4 centerline head and
-    # the old symmetric-residual detail branch this replaces.
-    allowed_unexpected_tokens = (
-        "centerline_head",
-        "detail_projection",
-        "detail_stages",
-        "detail_to_semantic_1",
-        "detail_to_semantic_scale_1",
-        "detail_to_semantic_spatial_gate_1",
-    )
+    # current model -- tolerated only for the removed S4 centerline head.
     allowed_unexpected = all(
-        any(token in key for token in allowed_unexpected_tokens)
-        for key in result.unexpected_keys
+        "centerline_head" in key for key in result.unexpected_keys
     )
     if not allowed_missing or not allowed_unexpected:
         raise RuntimeError(
@@ -1520,31 +1494,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--detail_channels", type=int, default=96)
-    parser.add_argument(
-        "--detail_stem_channels",
-        type=int,
-        default=48,
-        help=(
-            "Bottleneck width of the S4 directional-geometry stem that "
-            "builds the detail branch (DetailGeometryStem), before it is "
-            "downsampled to S8 and summed with a ResNet-S8 projection"
-        ),
-    )
     parser.add_argument("--semantic_channels", type=int, default=192)
     parser.add_argument("--dappm_channels", type=int, default=32)
     parser.add_argument(
         "--dappm_pool_sizes", nargs="+", type=int, default=(1, 2, 4, 8)
     )
     parser.add_argument(
-        "--detail_blocks",
-        nargs=2,
-        type=int,
-        default=(2, 2),
-        help=(
-            "Two depths: [0] RepDepthwiseBlock count in the S4 geometry "
-            "stem, [1] RepDepthwiseBlock count in the post-exchange detail "
-            "refine stage"
-        ),
+        "--detail_blocks", nargs=2, type=int, default=(2, 2)
     )
     parser.add_argument("--semantic_blocks", type=int, default=2)
     parser.add_argument("--fusion_blocks", type=int, default=1)
@@ -1705,7 +1661,7 @@ def parse_args() -> argparse.Namespace:
             "Exact model.named_parameters() names to permanently freeze "
             "(requires_grad=False) after loading weights, before the "
             "optimizer is built -- e.g. "
-            "dual_branch.semantic_to_detail_scale_1. Unlike resetting a "
+            "dual_branch.detail_to_semantic_scale_1. Unlike resetting a "
             "value alone, this stops gradient from moving it back."
         ),
     )
@@ -1743,7 +1699,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("detail_blocks must be positive")
     channel_values = (
         args.detail_channels,
-        args.detail_stem_channels,
         args.semantic_channels,
         args.dappm_channels,
         args.decoder_s4_channels,
@@ -2048,20 +2003,18 @@ def main() -> None:
                 f"calibrated road IoU={calibrated:.5f} "
                 f"@{validation_metrics['calibrated_threshold']:.2f} | "
                 f"F1={validation_metrics['fixed_f1']:.5f} | "
-                f"gates s2d/ctx/final="
+                f"gates s2d/d2s/ctx/final="
                 f"{gate_metrics['semantic_to_detail_abs_mean']:.3f}/"
+                f"{gate_metrics['detail_to_semantic_abs_mean']:.3f}/"
                 f"{gate_metrics['s32_context_to_s16_abs_mean']:.3f}/"
-                f"{gate_metrics['semantic_to_final_abs_mean']:.3f} | "
-                # d2s is now a multiplicative gate (identity = 1.0, not 0.0
-                # like the additive scales above) -- reported separately so
-                # "how far from 1" isn't confused with "how far from 0".
-                f"d2s_gate mean/std="
-                f"{gate_metrics['detail_to_semantic_gate_mean']:.3f}/"
-                f"{gate_metrics['detail_to_semantic_gate_std']:.3f}"
+                f"{gate_metrics['semantic_to_final_abs_mean']:.3f}"
                 + (
-                    " | s2d spatial mean/std="
+                    " | spatial mean s2d/d2s="
                     f"{gate_metrics['semantic_to_detail_spatial_mean']:.3f}/"
-                    f"{gate_metrics['semantic_to_detail_spatial_std']:.3f}"
+                    f"{gate_metrics['detail_to_semantic_spatial_mean']:.3f}"
+                    " std="
+                    f"{gate_metrics['semantic_to_detail_spatial_std']:.3f}/"
+                    f"{gate_metrics['detail_to_semantic_spatial_std']:.3f}"
                     if args.bilateral_fusion == "spatial"
                     else ""
                 )
