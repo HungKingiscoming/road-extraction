@@ -821,15 +821,14 @@ def build_optimizer(model: DualBranchRoadNet, args: argparse.Namespace) -> AdamW
                 raise RuntimeError(f"Duplicate optimizer parameter in {group_name}")
             seen.add(id(parameter))
             # Per-channel gate/scale parameters (semantic_to_detail_scale_1,
-            # detail_to_semantic_scale_1, context_scale, fusion_scale) are
+            # detail_guided_semantic.residual_scale, context_scale, fusion_scale) are
             # stored with broadcast shape (1, C, 1, 1) -- ndim==4 -- but play
             # the exact same role as BatchNorm weight/bias (ndim==1): a
             # per-channel multiplicative scale, not a weight matrix. A plain
             # ndim<=1 check puts them in the decay group by mistake, pulling
-            # a zero-initialized gate (detail_to_semantic_scale_1) back
-            # toward 0 proportionally to its own value every step -- while a
-            # gate that starts away from 0 (semantic_to_detail_scale_1=0.10)
-            # is barely affected. Matching by name fixes this asymmetry.
+            # these learned amplitudes toward zero via weight decay. Matching
+            # by local parameter name keeps broadcast residual scales in the
+            # no-decay group, consistent with BatchNorm scale parameters.
             # Match only the parameter's own local name (last dotted
             # component), not the full path -- otherwise a *module* named
             # with "scale" in it (e.g. ProgressiveDAPPM.scale0, the first
@@ -1353,25 +1352,37 @@ def transfer_weights(
         raise KeyError(f"No '{weights}', model, ema, or state_dict weights found")
     cleaned = clean_state_dict(state)
     result = model.load_state_dict(cleaned, strict=False)
-    # missing_keys: present in the current model, absent from the old
-    # checkpoint -- tolerated for tensors introduced after that checkpoint
-    # was trained (spatial gates, strip pooling, the S16 semantic aux head).
-    allowed_missing_tokens = ("spatial_gate", "strip_pooling", "semantic_aux_head")
+    # missing_keys: tensors introduced after the source checkpoint was
+    # trained are allowed.  V3 adds one DetailGuidedSemanticBlock.
+    allowed_missing_tokens = (
+        "spatial_gate",
+        "strip_pooling",
+        "semantic_aux_head",
+        "detail_guided_semantic",
+    )
     allowed_missing = all(
         any(token in key for token in allowed_missing_tokens)
         for key in result.missing_keys
     )
-    # unexpected_keys: present in the old checkpoint, absent from the
-    # current model -- tolerated only for the removed S4 centerline head.
+
+    # unexpected_keys: old checkpoints can contain the removed additive D->S
+    # projection/scale/spatial gate and, in older runs, the S4 centerline head.
+    allowed_unexpected_tokens = (
+        "centerline_head",
+        "detail_to_semantic_1",
+        "detail_to_semantic_scale_1",
+        "detail_to_semantic_spatial_gate_1",
+    )
     allowed_unexpected = all(
-        "centerline_head" in key for key in result.unexpected_keys
+        any(token in key for token in allowed_unexpected_tokens)
+        for key in result.unexpected_keys
     )
     if not allowed_missing or not allowed_unexpected:
         raise RuntimeError(
-            "Transfer checkpoint architecture does not match DualBranchRoadNet. "
+            "Transfer checkpoint architecture does not match DualBranchRoadNet V3. "
             f"Missing={result.missing_keys}, unexpected={result.unexpected_keys}. "
-            "Only spatial-gate/strip-pooling/semantic-aux-head tensors may be "
-            "missing, and only the old centerline_head tensors may be unexpected."
+            "Only known V3/new-module tensors may be missing, and only the removed "
+            "legacy D->S or centerline-head tensors may be unexpected."
         )
     return checkpoint_path
 
@@ -1661,7 +1672,7 @@ def parse_args() -> argparse.Namespace:
             "Exact model.named_parameters() names to permanently freeze "
             "(requires_grad=False) after loading weights, before the "
             "optimizer is built -- e.g. "
-            "dual_branch.detail_to_semantic_scale_1. Unlike resetting a "
+            "dual_branch.detail_guided_semantic.residual_scale. Unlike resetting a "
             "value alone, this stops gradient from moving it back."
         ),
     )
@@ -2003,18 +2014,16 @@ def main() -> None:
                 f"calibrated road IoU={calibrated:.5f} "
                 f"@{validation_metrics['calibrated_threshold']:.2f} | "
                 f"F1={validation_metrics['fixed_f1']:.5f} | "
-                f"gates s2d/d2s/ctx/final="
+                f"routes s2d/sem/ctx/final="
                 f"{gate_metrics['semantic_to_detail_abs_mean']:.3f}/"
-                f"{gate_metrics['detail_to_semantic_abs_mean']:.3f}/"
+                f"{gate_metrics['semantic_guidance_abs_mean']:.3f}/"
                 f"{gate_metrics['s32_context_to_s16_abs_mean']:.3f}/"
-                f"{gate_metrics['semantic_to_final_abs_mean']:.3f}"
+                f"{gate_metrics['semantic_to_final_abs_mean']:.3f} | "
+                f"semantic_delta_ratio={gate_metrics['semantic_guidance_delta_ratio']:.4f}"
                 + (
-                    " | spatial mean s2d/d2s="
+                    " | s2d spatial mean/std="
                     f"{gate_metrics['semantic_to_detail_spatial_mean']:.3f}/"
-                    f"{gate_metrics['detail_to_semantic_spatial_mean']:.3f}"
-                    " std="
-                    f"{gate_metrics['semantic_to_detail_spatial_std']:.3f}/"
-                    f"{gate_metrics['detail_to_semantic_spatial_std']:.3f}"
+                    f"{gate_metrics['semantic_to_detail_spatial_std']:.3f}"
                     if args.bilateral_fusion == "spatial"
                     else ""
                 )
