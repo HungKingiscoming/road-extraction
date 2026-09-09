@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import itertools
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -15,6 +15,8 @@ from .decoder import (
     RepDepthwiseBlock,
     RepVGGBlock,
     RoadReconstructionDecoder,
+    StripPoolingModule,
+    _group_count,
 )
 
 
@@ -260,14 +262,6 @@ class ControlledRoadFusion(nn.Module):
         return self.refinement(fused)
 
 
-def _group_count(channels: int, maximum: int = 8) -> int:
-    """Largest small GroupNorm divisor, robust for small per-GPU batches."""
-    for groups in range(min(maximum, int(channels)), 0, -1):
-        if int(channels) % groups == 0:
-            return groups
-    return 1
-
-
 class ResidualSpatialGate(nn.Module):
     """Predict one spatial modulation map for a residual exchange.
 
@@ -342,6 +336,23 @@ class DualResolutionContext(nn.Module):
     only to gather broad DAPPM context; it returns to the saved S16 feature as
     a gated residual before the final S8 fusion.  This avoids asking the S32
     map to preserve thin roads and avoids a second heavy bilateral module.
+
+    Two additions on top of that base design:
+
+    * ``strip_pooling`` -- applied to the detail stream right before final
+      fusion.  Roads are elongated, often running the full width or height
+      of a tile; a full-row/full-column pooling context is a much cheaper
+      and more direct way to bridge a long straight road (or recover a
+      short occluded segment from its far-apart neighbors) than deepening
+      the square DAPPM pooling used for the semantic branch.
+    * ``semantic_aux_head`` -- a train-only deep-supervision head reading
+      the finished S16 semantic feature (after the S32 DAPPM context has
+      been folded back in).  It replaces the previous S4 centerline-Tversky
+      auxiliary head: that head lived in the decoder and mainly supervised
+      the *detail* path, while the semantic branch's own cross-branch gate
+      (``detail_to_semantic_scale_1``) stayed close to zero throughout
+      training, i.e. semantic had little direct incentive to become
+      road-discriminative. This head gives it one.
     """
 
     def __init__(
@@ -434,6 +445,17 @@ class DualResolutionContext(nn.Module):
             activation=False,
         )
         self.context_scale = nn.Parameter(torch.full((1, 256, 1, 1), 0.10))
+
+        # Train-only deep supervision on the finished S16 semantic feature.
+        semantic_aux_hidden = max(32, 256 // 4)
+        self.semantic_aux_head = nn.Sequential(
+            ConvBNAct(256, semantic_aux_hidden, 3),
+            nn.Conv2d(semantic_aux_hidden, 2, 1),
+        )
+
+        # Full-row/full-column context for the persistent detail stream.
+        self.strip_pooling = StripPoolingModule(detail_channels)
+
         self.semantic_to_fusion = ConvBNAct(
             256,
             detail_channels,
@@ -457,7 +479,7 @@ class DualResolutionContext(nn.Module):
         shared_s8: Tensor,
         semantic_s16: Tensor,
         semantic_s32: Tensor,
-    ) -> Tensor:
+    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
         detail = self.detail_stages[0](self.detail_projection(shared_s8))
         semantic = semantic_s16
 
@@ -494,8 +516,11 @@ class DualResolutionContext(nn.Module):
             * detail_delta
         )
 
-        # The detail stream continues at S8 after receiving semantic evidence.
+        # The detail stream continues at S8 after receiving semantic
+        # evidence, then gathers full-row/column road context via strip
+        # pooling right before the final gated fusion.
         detail = self.detail_stages[1](detail)
+        detail = self.strip_pooling(detail)
 
         # S32 gathers context, then returns to the saved S16 representation.
         context_s32 = self.dappm(
@@ -506,10 +531,17 @@ class DualResolutionContext(nn.Module):
         )
         semantic = self.activation(semantic + self.context_scale * context_s16)
 
+        semantic_aux_logits: Optional[Tensor] = None
+        if self.training:
+            semantic_aux_logits = self.semantic_aux_head(semantic)
+
         semantic_s8 = self._resize(
             self.semantic_to_fusion(semantic), detail.shape[-2:]
         )
-        return self.final_fusion(detail, semantic_s8)
+        fused = self.final_fusion(detail, semantic_s8)
+        if self.training:
+            return fused, semantic_aux_logits
+        return fused
 
     @torch.no_grad()
     def gate_statistics(self) -> Dict[str, float]:
@@ -624,10 +656,19 @@ class DualBranchRoadNet(nn.Module):
 
         if self.training and self.current_phase == 0:
             with torch.no_grad():
-                fused = self.dual_branch(shared, semantic, context)
+                dual_branch_output = self.dual_branch(shared, semantic, context)
         else:
-            fused = self.dual_branch(shared, semantic, context)
-        return self.decode_head(stem, shallow, fused, output_size)
+            dual_branch_output = self.dual_branch(shared, semantic, context)
+
+        if self.training:
+            fused, semantic_aux_logits = dual_branch_output
+        else:
+            fused = dual_branch_output
+
+        road_logits = self.decode_head(stem, shallow, fused, output_size)
+        if self.training:
+            return semantic_aux_logits, road_logits
+        return road_logits
 
     def set_trainable_phase(self, phase: int) -> str:
         phase = int(phase)
