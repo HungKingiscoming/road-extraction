@@ -28,7 +28,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
-from modeling.decoder import RoadSegCenterlineTverskyLoss
+from modeling.decoder import RoadSegClDiceLoss
 from modeling.model import DualBranchRoadNet, build_model
 
 
@@ -957,7 +957,7 @@ def train_one_epoch(
     model: nn.Module,
     ema: ModelEMA,
     loader: DataLoader,
-    criterion: RoadSegCenterlineTverskyLoss,
+    criterion: RoadSegClDiceLoss,
     optimizer: torch.optim.Optimizer,
     scheduler: LambdaLR,
     scaler,
@@ -978,15 +978,15 @@ def train_one_epoch(
         )
     else:
         aux_scale = 1.0
-    criterion.aux_weight = args.aux_weight * aux_scale
+    criterion.semantic_aux_weight = args.aux_weight * aux_scale
 
     meters = {
         name: RunningAverage()
         for name in (
             "total",
             "main_ce",
-            "main_dice",
-            "centerline",
+            "main_cldice",
+            "semantic_aux",
             "road_fraction",
         )
     }
@@ -1047,8 +1047,8 @@ def train_one_epoch(
             (
                 losses["loss_total"].detach(),
                 losses["loss_main_ce"],
-                losses["loss_main_dice"],
-                losses["loss_aux_centerline"],
+                losses["loss_main_cldice"],
+                losses["loss_semantic_aux"],
                 (masks > 0).float().mean(),
             )
         ).float().cpu().tolist()
@@ -1057,7 +1057,7 @@ def train_one_epoch(
         progress.set_postfix(
             loss=f"{meters['total'].mean:.4f}",
             lr=f"{head_lr(optimizer):.2e}",
-            aux=f"{criterion.aux_weight:.3f}",
+            aux=f"{criterion.semantic_aux_weight:.3f}",
         )
 
     if distributed_active():
@@ -1077,7 +1077,7 @@ def train_one_epoch(
     elapsed = max(perf_counter() - epoch_start, 1e-6)
     return {name: meter.mean for name, meter in meters.items()} | {
         "lr": head_lr(optimizer),
-        "aux_weight": criterion.aux_weight,
+        "aux_weight": criterion.semantic_aux_weight,
         "successful_updates": float(successful_updates),
         "skipped_nonfinite": float(skipped_nonfinite),
         "seconds": elapsed,
@@ -1353,14 +1353,25 @@ def transfer_weights(
         raise KeyError(f"No '{weights}', model, ema, or state_dict weights found")
     cleaned = clean_state_dict(state)
     result = model.load_state_dict(cleaned, strict=False)
+    # missing_keys: present in the current model, absent from the old
+    # checkpoint -- tolerated for tensors introduced after that checkpoint
+    # was trained (spatial gates, strip pooling, the S16 semantic aux head).
+    allowed_missing_tokens = ("spatial_gate", "strip_pooling", "semantic_aux_head")
     allowed_missing = all(
-        "spatial_gate" in key for key in result.missing_keys
+        any(token in key for token in allowed_missing_tokens)
+        for key in result.missing_keys
     )
-    if result.unexpected_keys or not allowed_missing:
+    # unexpected_keys: present in the old checkpoint, absent from the
+    # current model -- tolerated only for the removed S4 centerline head.
+    allowed_unexpected = all(
+        "centerline_head" in key for key in result.unexpected_keys
+    )
+    if not allowed_missing or not allowed_unexpected:
         raise RuntimeError(
             "Transfer checkpoint architecture does not match DualBranchRoadNet. "
             f"Missing={result.missing_keys}, unexpected={result.unexpected_keys}. "
-            "Only newly introduced spatial-gate tensors may be absent."
+            "Only spatial-gate/strip-pooling/semantic-aux-head tensors may be "
+            "missing, and only the old centerline_head tensors may be unexpected."
         )
     return checkpoint_path
 
@@ -1545,24 +1556,46 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Positive value skips the startup mask scan and uses this CE weight",
     )
-    parser.add_argument("--main_dice_weight", type=float, default=1.0)
+    parser.add_argument(
+        "--cldice_weight",
+        type=float,
+        default=0.5,
+        help=(
+            "Weight of the soft-clDice term against weighted CE for the "
+            "main output -- the main loss is exactly CE + cldice_weight * "
+            "clDice, no separate Dice term. clDice constrains topology, "
+            "not area, so watch fixed@.50 road IoU during training; if it "
+            "stalls while F1/relaxed-F1 keep improving, that's thin/mis-"
+            "shaped-but-connected predictions, and a Dice/Tversky term "
+            "would need to come back to fix it."
+        ),
+    )
+    parser.add_argument("--skeleton_iterations", type=int, default=8)
+    parser.add_argument(
+        "--cldice_downsample",
+        type=int,
+        default=4,
+        help=(
+            "Shrink factor applied before skeletonizing for the clDice term "
+            "(1 = full training resolution, exact but the most expensive; "
+            "the prediction's skeleton needs gradients on every step, "
+            "unlike the old centerline target which only skeletonized the "
+            "fixed ground truth)"
+        ),
+    )
     parser.add_argument("--aux_weight", type=float, default=0.15)
     parser.add_argument(
         "--aux_start_epoch",
         type=int,
         default=5,
-        help="Keep centerline supervision off before this zero-based epoch",
+        help="Keep S16 semantic deep-supervision off before this zero-based epoch",
     )
     parser.add_argument("--aux_warmup_epochs", type=int, default=5)
-    parser.add_argument("--centerline_alpha", type=float, default=0.30)
-    parser.add_argument("--centerline_beta", type=float, default=0.70)
-    parser.add_argument("--centerline_dilation", type=int, default=1)
-    parser.add_argument("--skeleton_iterations", type=int, default=8)
     parser.add_argument(
-        "--fast_centerline_target",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Use an S2 intermediate skeleton target instead of full resolution",
+        "--semantic_aux_dice_weight",
+        type=float,
+        default=0.5,
+        help="Dice weight inside the S16 semantic deep-supervision auxiliary loss",
     )
 
     parser.add_argument(
@@ -1674,14 +1707,14 @@ def validate_args(args: argparse.Namespace) -> None:
     )
     if min(channel_values) < 1:
         raise ValueError("All architecture channel counts must be positive")
-    if not 0.0 <= args.centerline_alpha <= 1.0:
-        raise ValueError("centerline_alpha must be in [0, 1]")
-    if not 0.0 <= args.centerline_beta <= 1.0:
-        raise ValueError("centerline_beta must be in [0, 1]")
-    if args.centerline_alpha + args.centerline_beta <= 0.0:
-        raise ValueError("centerline_alpha + centerline_beta must be positive")
-    if args.centerline_dilation < 0:
-        raise ValueError("centerline_dilation cannot be negative")
+    if args.cldice_weight < 0.0:
+        raise ValueError("cldice_weight cannot be negative")
+    if args.semantic_aux_dice_weight < 0.0:
+        raise ValueError("semantic_aux_dice_weight cannot be negative")
+    if args.skeleton_iterations < 0:
+        raise ValueError("skeleton_iterations cannot be negative")
+    if args.cldice_downsample < 1:
+        raise ValueError("cldice_downsample must be >= 1")
     if not 0.0 <= args.road_occlusion_probability <= 1.0:
         raise ValueError("road_occlusion_probability must be in [0, 1]")
     if args.road_occlusion_max_patches < 1:
@@ -1690,7 +1723,7 @@ def validate_args(args: argparse.Namespace) -> None:
         if getattr(args, name) < 0.0:
             raise ValueError(f"{name} cannot be negative")
     if args.aux_start_epoch < 0 or args.aux_warmup_epochs < 0:
-        raise ValueError("Centerline start/warmup epochs cannot be negative")
+        raise ValueError("Semantic aux start/warmup epochs cannot be negative")
     if args.progressive_unfreeze:
         epochs = (
             args.unfreeze_dual_branch_epoch,
@@ -1852,15 +1885,13 @@ def main() -> None:
     scheduler = build_scheduler(optimizer, updates_per_epoch, args)
     scaler = make_grad_scaler(args.use_amp)
     ema = ModelEMA(model, args.ema_decay)
-    criterion = RoadSegCenterlineTverskyLoss(
+    criterion = RoadSegClDiceLoss(
         road_class_weight=road_weight,
-        main_dice_weight=args.main_dice_weight,
-        aux_weight=args.aux_weight,
-        centerline_alpha=args.centerline_alpha,
-        centerline_beta=args.centerline_beta,
+        cldice_weight=args.cldice_weight,
         skeleton_iterations=args.skeleton_iterations,
-        centerline_dilation=args.centerline_dilation,
-        fast_centerline_target=args.fast_centerline_target,
+        cldice_downsample=args.cldice_downsample,
+        semantic_aux_weight=args.aux_weight,
+        semantic_aux_dice_weight=args.semantic_aux_dice_weight,
     ).to(device)
 
     start_epoch, best_fixed, best_calibrated = 0, -1.0, -1.0
@@ -1919,13 +1950,10 @@ def main() -> None:
         f"road CE weight={road_weight:.3f}"
     )
     rank_zero_print(
-        "loss=weighted CE + Dice + centerline Tversky "
-        f"(centerline max={args.aux_weight:.2f}, starts epoch "
-        f"{args.aux_start_epoch + 1})"
-    )
-    rank_zero_print(
-        "centerline target="
-        + ("fast S2 morphology" if args.fast_centerline_target else "full resolution")
+        f"loss=weighted CE + clDice (w={args.cldice_weight:.2f}, "
+        f"skeletonized at 1/{args.cldice_downsample} res, no Dice term) "
+        f"+ S16 semantic deep supervision (max={args.aux_weight:.2f}, "
+        f"starts epoch {args.aux_start_epoch + 1})"
     )
     rank_zero_print(
         f"progressive_unfreeze={args.progressive_unfreeze} | "
