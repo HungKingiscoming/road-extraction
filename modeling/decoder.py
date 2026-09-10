@@ -416,6 +416,7 @@ class RoadReconstructionDecoder(nn.Module):
         full_channels: int = 24,
         num_classes: int = 2,
         dropout: float = 0.05,
+        semantic_context_channels: int = 256,
         deploy: bool = False,
     ) -> None:
         super().__init__()
@@ -437,6 +438,20 @@ class RoadReconstructionDecoder(nn.Module):
             RepDepthwiseBlock(s4_channels, deploy=deploy),
         )
 
+        # V4.3: broadcast the final S16 semantic/context representation into
+        # the reconstruction path.  The projection is normally initialized,
+        # while the per-channel residual scale starts at exactly zero.
+        # Therefore, after loading a V4 checkpoint, the decoder starts as the
+        # exact V4 baseline and learns whether/how much context to inject.
+        self.context_s4_projection = ConvBNAct(
+            semantic_context_channels,
+            s4_channels,
+            1,
+            padding=0,
+            activation=False,
+        )
+        self.context_s4_scale = nn.Parameter(torch.zeros(s4_channels))
+
         self.stem_proj = ConvBNAct(
             stem_channels, stem_skip_channels, 1, padding=0
         )
@@ -451,6 +466,15 @@ class RoadReconstructionDecoder(nn.Module):
             RepDepthwiseBlock(s2_channels, deploy=deploy),
         )
 
+        self.context_s2_projection = ConvBNAct(
+            semantic_context_channels,
+            s2_channels,
+            1,
+            padding=0,
+            activation=False,
+        )
+        self.context_s2_scale = nn.Parameter(torch.zeros(s2_channels))
+
         self.full_refine = SeparableConvBNAct(s2_channels, full_channels)
         self.dropout = nn.Dropout2d(dropout) if dropout > 0.0 else nn.Identity()
         self.classifier = nn.Conv2d(full_channels, num_classes, 1)
@@ -464,18 +488,48 @@ class RoadReconstructionDecoder(nn.Module):
         stem_s2: Tensor,
         shallow_s4: Tensor,
         fused_s8: Tensor,
+        semantic_context_s16: Tensor,
         output_size: Tuple[int, int],
     ) -> Tensor:
         p4 = self._resize(self.fused_proj(fused_s8), shallow_s4.shape[-2:])
         p4 = self.s4_fuse(torch.cat((p4, self.shallow_proj(shallow_s4)), dim=1))
+
+        context_s4 = self._resize(
+            self.context_s4_projection(semantic_context_s16),
+            p4.shape[-2:],
+        )
+        p4 = p4 + self.context_s4_scale.view(1, -1, 1, 1) * context_s4
         p4 = self.s4_refine(p4)
 
         p2 = self._resize(p4, stem_s2.shape[-2:])
         p2 = self.s2_fuse(torch.cat((p2, self.stem_proj(stem_s2)), dim=1))
+
+        context_s2 = self._resize(
+            self.context_s2_projection(semantic_context_s16),
+            p2.shape[-2:],
+        )
+        p2 = p2 + self.context_s2_scale.view(1, -1, 1, 1) * context_s2
         p2 = self.s2_refine(p2)
 
         full = self._resize(p2, output_size)
         return self.classifier(self.dropout(self.full_refine(full)))
+
+    @torch.no_grad()
+    def context_gate_statistics(self) -> Dict[str, float]:
+        return {
+            "decoder_context_s4_abs_mean": float(
+                self.context_s4_scale.detach().float().abs().mean().cpu()
+            ),
+            "decoder_context_s2_abs_mean": float(
+                self.context_s2_scale.detach().float().abs().mean().cpu()
+            ),
+            "decoder_context_s4_abs_max": float(
+                self.context_s4_scale.detach().float().abs().max().cpu()
+            ),
+            "decoder_context_s2_abs_max": float(
+                self.context_s2_scale.detach().float().abs().max().cpu()
+            ),
+        }
 
     def switch_to_deploy(self) -> None:
         for module in list(self.modules()):
