@@ -1,11 +1,10 @@
-"""RoadFusion V4.2 modeling package."""
+"""RoadFusion V4.3 modeling package."""
 
 from .model import (
     TruncatedResNet34,
     ProgressiveDAPPM,
     ControlledRoadFusion,
     ResidualSpatialGate,
-    SemanticPreservationBlock,
     DualResolutionContext,
     DualBranchRoadNet,
     build_model,
@@ -32,7 +31,6 @@ __all__ = [
     "ProgressiveDAPPM",
     "ControlledRoadFusion",
     "ResidualSpatialGate",
-    "SemanticPreservationBlock",
     "DualResolutionContext",
     "DualBranchRoadNet",
     "build_model",
