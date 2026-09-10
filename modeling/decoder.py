@@ -494,21 +494,30 @@ class RoadReconstructionDecoder(nn.Module):
         p4 = self._resize(self.fused_proj(fused_s8), shallow_s4.shape[-2:])
         p4 = self.s4_fuse(torch.cat((p4, self.shallow_proj(shallow_s4)), dim=1))
 
-        context_s4 = self._resize(
-            self.context_s4_projection(semantic_context_s16),
-            p4.shape[-2:],
+        # Memory-efficient but mathematically identical:
+        # channel scale is spatially constant, so
+        #   alpha * upsample(x) == upsample(alpha * x)
+        # Apply alpha BEFORE upsampling so autograd only needs to retain the
+        # small S16 tensor for dL/dalpha, instead of the large S4 tensor.
+        context_s4 = self.context_s4_projection(semantic_context_s16)
+        context_s4 = (
+            self.context_s4_scale.view(1, -1, 1, 1) * context_s4
         )
-        p4 = p4 + self.context_s4_scale.view(1, -1, 1, 1) * context_s4
+        context_s4 = self._resize(context_s4, p4.shape[-2:])
+        p4 = p4 + context_s4
         p4 = self.s4_refine(p4)
 
         p2 = self._resize(p4, stem_s2.shape[-2:])
         p2 = self.s2_fuse(torch.cat((p2, self.stem_proj(stem_s2)), dim=1))
 
-        context_s2 = self._resize(
-            self.context_s2_projection(semantic_context_s16),
-            p2.shape[-2:],
+        # Same linearity trick at S2. This avoids retaining a
+        # [B, C, 512, 512] context tensor just to compute dL/dalpha.
+        context_s2 = self.context_s2_projection(semantic_context_s16)
+        context_s2 = (
+            self.context_s2_scale.view(1, -1, 1, 1) * context_s2
         )
-        p2 = p2 + self.context_s2_scale.view(1, -1, 1, 1) * context_s2
+        context_s2 = self._resize(context_s2, p2.shape[-2:])
+        p2 = p2 + context_s2
         p2 = self.s2_refine(p2)
 
         full = self._resize(p2, output_size)
