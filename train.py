@@ -1351,16 +1351,37 @@ def transfer_weights(
     if not isinstance(state, dict):
         raise KeyError(f"No '{weights}', model, ema, or state_dict weights found")
     cleaned = clean_state_dict(state)
-    result = model.load_state_dict(cleaned, strict=False)
+
+    # V4.2 may change semantic_channels (e.g. 192 -> 256), so strict=False
+    # alone is not enough: PyTorch still raises on same-name shape mismatch.
+    # Transfer only tensors whose names AND shapes match, and initialize the
+    # new Semantic Preservation / resized semantic-context tensors normally.
+    target_state = model.state_dict()
+    compatible = {
+        key: value
+        for key, value in cleaned.items()
+        if key in target_state and tuple(value.shape) == tuple(target_state[key].shape)
+    }
+    skipped_shape = [
+        key
+        for key, value in cleaned.items()
+        if key in target_state and tuple(value.shape) != tuple(target_state[key].shape)
+    ]
+    result = model.load_state_dict(compatible, strict=False)
     # missing_keys: tensors introduced after the source checkpoint was
     # trained are allowed. V4 adds no new D->S module.
     allowed_missing_tokens = (
         "spatial_gate",
         "strip_pooling",
         "semantic_aux_head",
+        "semantic_preservation",
+        "semantic_projection",
+        "dappm",
+        "context_to_s16",
     )
     allowed_missing = all(
         any(token in key for token in allowed_missing_tokens)
+        or key in skipped_shape
         for key in result.missing_keys
     )
 
@@ -1505,23 +1526,23 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--detail_channels", type=int, default=96)
-    parser.add_argument("--semantic_channels", type=int, default=192)
+    parser.add_argument("--semantic_channels", type=int, default=256)
     parser.add_argument("--dappm_channels", type=int, default=32)
     parser.add_argument(
         "--dappm_pool_sizes", nargs="+", type=int, default=(1, 2, 4, 8)
     )
     parser.add_argument(
-        "--detail_blocks", nargs=2, type=int, default=(2, 2)
+        "--detail_blocks", nargs=2, type=int, default=(3, 2)
     )
-    parser.add_argument("--semantic_blocks", type=int, default=2)
+    parser.add_argument("--semantic_blocks", type=int, default=1)
     parser.add_argument("--fusion_blocks", type=int, default=1)
     parser.add_argument(
         "--bilateral_fusion",
         choices=("static", "spatial"),
         default="spatial",
         help=(
-            "static reproduces the original channel-scaled residual exchange; "
-            "spatial adds lightweight location-adaptive gates in both directions"
+            "static uses the channel-scaled Semantic->Detail residual; "
+            "spatial adds a lightweight location-adaptive S->D gate"
         ),
     )
     parser.add_argument("--decoder_s4_channels", type=int, default=64)
@@ -1542,7 +1563,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=2, help="Per GPU")
     parser.add_argument("--accumulation_steps", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=2e-4, help="Decoder/head LR")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Decoder/head LR")
     parser.add_argument(
         "--dual_branch_lr_factor",
         "--bottleneck_lr_factor",
@@ -1944,8 +1965,11 @@ def main() -> None:
         )
     rank_zero_print(
         f"shared ResNet34 to S8 | detail={args.detail_channels}ch S8 | "
-        f"semantic anchor=256ch S16 | context={args.semantic_channels}ch S32 | DAPPM="
-        f"{args.dappm_channels}ch grids={tuple(args.dappm_pool_sizes)}"
+        f"semantic anchor=256ch S16 | Layer4=512ch S32 | "
+        f"semantic preservation blocks={args.semantic_blocks} | "
+        f"projection 512->{args.semantic_channels} | "
+        f"DAPPM outer={args.semantic_channels}ch, internal={args.dappm_channels}ch "
+        f"grids={tuple(args.dappm_pool_sizes)}"
     )
     rank_zero_print(
         f"decoder S4/S2/S1={args.decoder_s4_channels}/"
