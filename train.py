@@ -1353,25 +1353,25 @@ def transfer_weights(
     cleaned = clean_state_dict(state)
     result = model.load_state_dict(cleaned, strict=False)
     # missing_keys: tensors introduced after the source checkpoint was
-    # trained are allowed.  V3 adds one DetailGuidedSemanticBlock.
+    # trained are allowed. V4 adds no new D->S module.
     allowed_missing_tokens = (
         "spatial_gate",
         "strip_pooling",
         "semantic_aux_head",
-        "detail_guided_semantic",
     )
     allowed_missing = all(
         any(token in key for token in allowed_missing_tokens)
         for key in result.missing_keys
     )
 
-    # unexpected_keys: old checkpoints can contain the removed additive D->S
-    # projection/scale/spatial gate and, in older runs, the S4 centerline head.
+    # unexpected_keys: source checkpoints can contain either the legacy
+    # additive D->S route or the V3 DetailGuidedSemanticBlock. V4 removes both.
     allowed_unexpected_tokens = (
         "centerline_head",
         "detail_to_semantic_1",
         "detail_to_semantic_scale_1",
         "detail_to_semantic_spatial_gate_1",
+        "detail_guided_semantic",
     )
     allowed_unexpected = all(
         any(token in key for token in allowed_unexpected_tokens)
@@ -1379,10 +1379,10 @@ def transfer_weights(
     )
     if not allowed_missing or not allowed_unexpected:
         raise RuntimeError(
-            "Transfer checkpoint architecture does not match DualBranchRoadNet V3. "
+            "Transfer checkpoint architecture does not match DualBranchRoadNet V4. "
             f"Missing={result.missing_keys}, unexpected={result.unexpected_keys}. "
-            "Only known V3/new-module tensors may be missing, and only the removed "
-            "legacy D->S or centerline-head tensors may be unexpected."
+            "Only known optional V4 tensors may be missing, and only removed "
+            "D->S/SemanticBlock or centerline-head tensors may be unexpected."
         )
     return checkpoint_path
 
@@ -1953,8 +1953,9 @@ def main() -> None:
         f"detail blocks={tuple(args.detail_blocks)}"
     )
     rank_zero_print(
-        f"bilateral fusion={args.bilateral_fusion} | "
-        "loss and directional decoder unchanged"
+        f"S->D fusion={args.bilateral_fusion} | no D->S | "
+        "detail+semantic meet only at final road-aware fusion | "
+        "loss and decoder unchanged"
     )
     rank_zero_print(
         f"parameters={total_parameters:,} | imbalance={imbalance:.3f} | "
@@ -2014,16 +2015,17 @@ def main() -> None:
                 f"calibrated road IoU={calibrated:.5f} "
                 f"@{validation_metrics['calibrated_threshold']:.2f} | "
                 f"F1={validation_metrics['fixed_f1']:.5f} | "
-                f"routes s2d/sem/ctx/final="
+                f"routes s2d/ctx/final="
                 f"{gate_metrics['semantic_to_detail_abs_mean']:.3f}/"
-                f"{gate_metrics['semantic_guidance_abs_mean']:.3f}/"
                 f"{gate_metrics['s32_context_to_s16_abs_mean']:.3f}/"
-                f"{gate_metrics['semantic_to_final_abs_mean']:.3f} | "
-                f"semantic_delta_ratio={gate_metrics['semantic_guidance_delta_ratio']:.4f}"
+                f"{gate_metrics['semantic_to_final_abs_mean']:.3f}"
                 + (
-                    " | s2d spatial mean/std="
+                    " | spatial s2d mean/std="
                     f"{gate_metrics['semantic_to_detail_spatial_mean']:.3f}/"
                     f"{gate_metrics['semantic_to_detail_spatial_std']:.3f}"
+                    " | final mean/std="
+                    f"{gate_metrics['final_fusion_spatial_mean']:.3f}/"
+                    f"{gate_metrics['final_fusion_spatial_std']:.3f}"
                     if args.bilateral_fusion == "spatial"
                     else ""
                 )
