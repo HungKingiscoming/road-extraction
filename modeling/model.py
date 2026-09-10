@@ -329,90 +329,6 @@ class ResidualSpatialGate(nn.Module):
         return gate
 
 
-
-class SemanticPreservationBlock(nn.Module):
-    """Preserve and refine Layer4 semantics before channel compression.
-
-    Input/output stay at 512 channels.  The residual identity path carries the
-    original Layer4 feature unchanged, while a lightweight bottleneck branch
-    learns a local + dilated semantic correction:
-
-        X(512)
-          |------------------------------|
-          v                              |
-        1x1 512->256                     |
-          |                              |
-          +--> DW 3x3 --------+          |
-          |                   |          |
-          +--> DW 3x3 d=2 ----+          |
-                              |          |
-                           concat        |
-                              |          |
-                           1x1 512->512  |
-                              |          |
-                              +---- (+) <-+
-                                    |
-                                   ReLU
-
-    The final BN is zero-initialized, so the block starts as an identity
-    mapping and does not disturb ImageNet-pretrained Layer4 features.
-    """
-
-    def __init__(
-        self,
-        channels: int = 512,
-        bottleneck_channels: int = 256,
-    ) -> None:
-        super().__init__()
-        channels = int(channels)
-        bottleneck_channels = int(bottleneck_channels)
-        if channels < 1 or bottleneck_channels < 1:
-            raise ValueError("Semantic preservation channels must be positive")
-
-        self.reduce = ConvBNAct(
-            channels,
-            bottleneck_channels,
-            1,
-            padding=0,
-        )
-        self.local = ConvBNAct(
-            bottleneck_channels,
-            bottleneck_channels,
-            3,
-            groups=bottleneck_channels,
-        )
-        self.context = nn.Sequential(
-            nn.Conv2d(
-                bottleneck_channels,
-                bottleneck_channels,
-                3,
-                padding=2,
-                dilation=2,
-                groups=bottleneck_channels,
-                bias=False,
-            ),
-            nn.BatchNorm2d(bottleneck_channels),
-            nn.ReLU(inplace=True),
-        )
-        self.expand = ConvBNAct(
-            bottleneck_channels * 2,
-            channels,
-            1,
-            padding=0,
-            activation=False,
-            zero_init_bn=True,
-        )
-        self.activation = nn.ReLU(inplace=True)
-
-    def forward(self, x: Tensor) -> Tensor:
-        z = self.reduce(x)
-        local = self.local(z)
-        context = self.context(z)
-        correction = self.expand(torch.cat((local, context), dim=1))
-        return self.activation(x + correction)
-
-
-
 class DualResolutionContext(nn.Module):
     """Road-specific separation of detail and semantic responsibilities.
 
@@ -422,8 +338,7 @@ class DualResolutionContext(nn.Module):
     * Detail S8 preserves road geometry and receives the already-useful
       Semantic->Detail guidance from Layer3 S16.
     * Semantic S16 stays independent, proceeds through pretrained ResNet
-      layer4, is refined at full 512-channel width by a residual Semantic
-      Preservation Block, then gathers broad S32 context through DAPPM.
+      layer4, and gathers broad S32 context through DAPPM.
     * Detail and semantic/context meet only in the final gated road fusion.
 
     This follows the common road-extraction pattern of keeping edge/detail and
@@ -438,11 +353,11 @@ class DualResolutionContext(nn.Module):
     def __init__(
         self,
         detail_channels: int = 96,
-        semantic_channels: int = 256,
+        semantic_channels: int = 192,
         dappm_channels: int = 32,
         dappm_pool_sizes: Sequence[int] = (1, 2, 4, 8),
-        detail_blocks: Sequence[int] = (3, 2),
-        semantic_blocks: int = 1,
+        detail_blocks: Sequence[int] = (2, 2),
+        semantic_blocks: int = 2,
         fusion_blocks: int = 1,
         bilateral_fusion: str = "spatial",
         deploy: bool = False,
@@ -464,21 +379,9 @@ class DualResolutionContext(nn.Module):
             for depth in detail_blocks
         )
 
-        # Preserve/refine the full 512-channel Layer4 representation BEFORE
-        # compressing it for DAPPM.  semantic_blocks now controls the number
-        # of SemanticPreservationBlock instances (1 is the recommended ablation).
-        self.semantic_preservation = nn.Sequential(
-            *[
-                SemanticPreservationBlock(
-                    channels=512,
-                    bottleneck_channels=256,
-                )
-                for _ in range(max(0, int(semantic_blocks)))
-            ]
-        )
-
-        # Channel compression happens only after semantic preservation.
-        # Recommended V4.2 setting: 512 -> 256, then DAPPM outer width=256.
+        # Pretrained ResNet layer4 supplies S32 semantic context.  Keep the
+        # historical key name for checkpoint compatibility.
+        _ = semantic_blocks
         self.semantic_projection = ConvBNAct(
             512, semantic_channels, 1, padding=0
         )
@@ -593,11 +496,11 @@ class DualResolutionContext(nn.Module):
         detail_s8: Tensor,
         semantic_s16: Tensor,
         semantic_s32: Tensor,
-    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+        return_semantic: bool = False,
+    ):
         """Gather S32 context and fuse it with the independent detail stream."""
-        preserved_s32 = self.semantic_preservation(semantic_s32)
         context_s32 = self.dappm(
-            self.semantic_projection(preserved_s32)
+            self.semantic_projection(semantic_s32)
         )
         context_s16 = self._resize(
             self.context_to_s16(context_s32),
@@ -618,7 +521,11 @@ class DualResolutionContext(nn.Module):
         fused = self.final_fusion(detail_s8, semantic_s8)
 
         if self.training:
+            if return_semantic:
+                return fused, semantic_aux_logits, semantic
             return fused, semantic_aux_logits
+        if return_semantic:
+            return fused, semantic
         return fused
 
     def forward(
@@ -683,11 +590,11 @@ class DualBranchRoadNet(nn.Module):
         self,
         num_classes: int = 2,
         detail_channels: int = 96,
-        semantic_channels: int = 256,
+        semantic_channels: int = 192,
         dappm_channels: int = 32,
         dappm_pool_sizes: Sequence[int] = (1, 2, 4, 8),
-        detail_blocks: Sequence[int] = (3, 2),
-        semantic_blocks: int = 1,
+        detail_blocks: Sequence[int] = (2, 2),
+        semantic_blocks: int = 2,
         fusion_blocks: int = 1,
         bilateral_fusion: str = "spatial",
         decoder_s4_channels: int = 64,
@@ -723,12 +630,13 @@ class DualBranchRoadNet(nn.Module):
             full_channels=full_channels,
             num_classes=num_classes,
             dropout=dropout,
+            semantic_context_channels=256,
             deploy=deploy,
         )
         self.current_phase = 4
 
     def forward(self, image: Tensor):
-        """V4: separate Detail and Semantic branches until final road fusion."""
+        """V4.3: V4 baseline plus zero-start S16 context injection at decoder S4/S2."""
         output_size = image.shape[-2:]
 
         # Eval or phase 4: everything runs normally.
@@ -745,6 +653,7 @@ class DualBranchRoadNet(nn.Module):
                 detail,
                 semantic,
                 context,
+                return_semantic=True,
             )
 
         # Phase 0: decoder/head only. Encoder + dual branch frozen.
@@ -760,6 +669,7 @@ class DualBranchRoadNet(nn.Module):
                     detail,
                     semantic,
                     context,
+                    return_semantic=True,
                 )
 
         # Phase 1: dual branch trainable; entire ResNet frozen.
@@ -776,6 +686,7 @@ class DualBranchRoadNet(nn.Module):
                 detail,
                 semantic,
                 context,
+                return_semantic=True,
             )
 
         # Phase 2: layer3 + layer4 + dual branch trainable.
@@ -792,6 +703,7 @@ class DualBranchRoadNet(nn.Module):
                 detail,
                 semantic,
                 context,
+                return_semantic=True,
             )
 
         # Phase 3: layer2 + layer3 + layer4 + dual branch trainable.
@@ -808,17 +720,19 @@ class DualBranchRoadNet(nn.Module):
                 detail,
                 semantic,
                 context,
+                return_semantic=True,
             )
 
         if self.training:
-            fused, semantic_aux_logits = dual_branch_output
+            fused, semantic_aux_logits, semantic_context_s16 = dual_branch_output
         else:
-            fused = dual_branch_output
+            fused, semantic_context_s16 = dual_branch_output
 
         road_logits = self.decode_head(
             stem,
             shallow,
             fused,
+            semantic_context_s16,
             output_size,
         )
         if self.training:
