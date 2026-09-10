@@ -1,18 +1,52 @@
+"""RoadFusion V4.2 modeling package."""
+
+from .model import (
+    TruncatedResNet34,
+    ProgressiveDAPPM,
+    ControlledRoadFusion,
+    ResidualSpatialGate,
+    SemanticPreservationBlock,
+    DualResolutionContext,
+    DualBranchRoadNet,
+    build_model,
+)
+
 from .decoder import (
-    RepDepthwiseBlock,
+    ConvBNAct,
+    ConvGNAct,
+    ConvBN,
     RepVGGBlock,
+    RepDepthwiseBlock,
+    SeparableConvBNAct,
+    StripPoolingModule,
     RoadReconstructionDecoder,
     RoadSegClDiceLoss,
-    StripPoolingModule,
+    soft_skeletonize,
+    binary_dice_loss,
+    soft_cldice_loss,
+    verify_reparameterization,
 )
-from .model import DualBranchRoadNet, build_model
 
-__all__ = (
+__all__ = [
+    "TruncatedResNet34",
+    "ProgressiveDAPPM",
+    "ControlledRoadFusion",
+    "ResidualSpatialGate",
+    "SemanticPreservationBlock",
+    "DualResolutionContext",
     "DualBranchRoadNet",
-    "RepDepthwiseBlock",
+    "build_model",
+    "ConvBNAct",
+    "ConvGNAct",
+    "ConvBN",
     "RepVGGBlock",
+    "RepDepthwiseBlock",
+    "SeparableConvBNAct",
+    "StripPoolingModule",
     "RoadReconstructionDecoder",
     "RoadSegClDiceLoss",
-    "StripPoolingModule",
-    "build_model",
-)
+    "soft_skeletonize",
+    "binary_dice_loss",
+    "soft_cldice_loss",
+    "verify_reparameterization",
+]
