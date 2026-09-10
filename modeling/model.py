@@ -329,171 +329,25 @@ class ResidualSpatialGate(nn.Module):
         return gate
 
 
-class DetailGuidedSemanticBlock(nn.Module):
-    """Fuse refined S8 road geometry into pretrained S16 semantics.
-
-    This replaces the old additive Detail->Semantic route::
-
-        S' = S + alpha * P(D)
-
-    with a learned joint residual::
-
-        S' = S + gamma * F(S, D)
-
-    where ``F`` processes semantic context and detail geometry together.
-    The block is deliberately lightweight:
-
-    * detail S8 is depthwise-downsampled to S16 before projection;
-    * semantic and detail are projected to a compact hidden width;
-    * local DW 3x3 and dilated DW 3x3 (d=2) branches model local road
-      structure and slightly broader continuity respectively;
-    * the output projection is zero-initialized, so the whole block starts
-      exactly as an identity mapping for the pretrained semantic stream.
-
-    ``residual_scale`` is a per-channel residual amplitude, not a spatial
-    attention gate.  It starts at 0.10 but has no effect at initialization
-    because the output BN is zero-initialized.
-    """
-
-    def __init__(
-        self,
-        detail_channels: int,
-        semantic_channels: int = 256,
-        hidden_channels: int = 128,
-    ) -> None:
-        super().__init__()
-        hidden_channels = max(32, int(hidden_channels))
-
-        # Preserve detail geometry while moving S8 -> S16.
-        self.detail_downsample = ConvBNAct(
-            detail_channels,
-            detail_channels,
-            3,
-            stride=2,
-            groups=detail_channels,
-        )
-        self.detail_projection = ConvBNAct(
-            detail_channels,
-            hidden_channels,
-            1,
-            padding=0,
-        )
-        self.semantic_projection = ConvBNAct(
-            semantic_channels,
-            hidden_channels,
-            1,
-            padding=0,
-        )
-
-        # Joint semantic/detail mixing before spatial refinement.
-        self.joint_projection = ConvBNAct(
-            hidden_channels * 2,
-            hidden_channels,
-            1,
-            padding=0,
-        )
-
-        # Local geometry branch.
-        self.local_branch = ConvBNAct(
-            hidden_channels,
-            hidden_channels,
-            3,
-            groups=hidden_channels,
-            activation=False,
-        )
-
-        # Slightly broader road-continuity branch (effective 5x5 RF).
-        self.context_branch = nn.Sequential(
-            nn.Conv2d(
-                hidden_channels,
-                hidden_channels,
-                3,
-                padding=2,
-                dilation=2,
-                groups=hidden_channels,
-                bias=False,
-            ),
-            nn.BatchNorm2d(hidden_channels),
-        )
-
-        # Zero-init keeps pretrained Layer3 -> Layer4 behavior intact at step 0.
-        self.output_projection = ConvBNAct(
-            hidden_channels,
-            semantic_channels,
-            1,
-            padding=0,
-            activation=False,
-            zero_init_bn=True,
-        )
-        self.residual_scale = nn.Parameter(
-            torch.full((1, semantic_channels, 1, 1), 0.10)
-        )
-        self.activation = nn.ReLU(inplace=True)
-
-        # Diagnostics: how large is the learned semantic correction relative
-        # to the incoming pretrained semantic activation?
-        self.register_buffer(
-            "last_delta_ratio", torch.zeros((), dtype=torch.float32), persistent=False
-        )
-        self.register_buffer(
-            "last_delta_abs_mean", torch.zeros((), dtype=torch.float32), persistent=False
-        )
-
-    def forward(self, detail_s8: Tensor, semantic_s16: Tensor) -> Tensor:
-        detail_s16 = self.detail_downsample(detail_s8)
-        if detail_s16.shape[-2:] != semantic_s16.shape[-2:]:
-            detail_s16 = F.interpolate(
-                detail_s16,
-                size=semantic_s16.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            )
-
-        detail_hidden = self.detail_projection(detail_s16)
-        semantic_hidden = self.semantic_projection(semantic_s16)
-        joint = self.joint_projection(
-            torch.cat((semantic_hidden, detail_hidden), dim=1)
-        )
-
-        mixed = self.activation(
-            self.local_branch(joint) + self.context_branch(joint)
-        )
-        delta = self.output_projection(mixed)
-        scaled_delta = self.residual_scale * delta
-
-        with torch.no_grad():
-            delta_abs = scaled_delta.detach().float().abs().mean()
-            semantic_abs = semantic_s16.detach().float().abs().mean().clamp_min(1e-6)
-            self.last_delta_abs_mean.copy_(delta_abs)
-            self.last_delta_ratio.copy_(delta_abs / semantic_abs)
-
-        return self.activation(semantic_s16 + scaled_delta)
-
-
 class DualResolutionContext(nn.Module):
-    """Persistent detail S8 stream plus semantic S16/S32 context stream.
+    """Road-specific separation of detail and semantic responsibilities.
 
-    V3 keeps the well-used Semantic->Detail residual route, but replaces the
-    weak additive Detail->Semantic injection with one DetailGuidedSemanticBlock.
-    The semantic block jointly processes refined detail geometry and Layer3 S16
-    semantics before the result is passed into pretrained ResNet layer4.
+    V4 removes Detail->Semantic injection completely.  The two branches now
+    have deliberately different jobs:
 
-    There is one genuine bilateral interaction at S8 <-> S16.  S32 is used
-    only to gather broad DAPPM context; it returns to the saved S16 feature as
-    a gated residual before the final S8 fusion.  This avoids asking the S32
-    map to preserve thin roads and avoids a second heavy bilateral module.
+    * Detail S8 preserves road geometry and receives the already-useful
+      Semantic->Detail guidance from Layer3 S16.
+    * Semantic S16 stays independent, proceeds through pretrained ResNet
+      layer4, and gathers broad S32 context through DAPPM.
+    * Detail and semantic/context meet only in the final gated road fusion.
 
-    Two additions on top of that base design:
+    This follows the common road-extraction pattern of keeping edge/detail and
+    semantic/context representations separate until a dedicated fusion stage,
+    rather than forcing detail texture into the semantic representation.
 
-    * ``strip_pooling`` -- applied to the detail stream right before final
-      fusion.  Roads are elongated, often running the full width or height
-      of a tile; a full-row/full-column pooling context is a much cheaper
-      and more direct way to bridge a long straight road (or recover a
-      short occluded segment from its far-apart neighbors) than deepening
-      the square DAPPM pooling used for the semantic branch.
-    * ``semantic_aux_head`` -- a train-only deep-supervision head reading
-      the finished S16 semantic feature (after the S32 DAPPM context has
-      been folded back in), giving the semantic stream direct road supervision.
+    The loss, semantic auxiliary head, strip pooling, decoder, and final fusion
+    implementation are intentionally unchanged from V3 so this is a clean
+    architectural ablation of the D->S route.
     """
 
     def __init__(
@@ -517,25 +371,22 @@ class DualResolutionContext(nn.Module):
                 "bilateral_fusion must be either 'static' or 'spatial'"
             )
         self.bilateral_fusion = bilateral_fusion
+
+        # Persistent S8 road-detail stream.
         self.detail_projection = ConvBNAct(128, detail_channels, 1, padding=0)
         self.detail_stages = nn.ModuleList(
             _rep_stage(detail_channels, depth, deploy)
             for depth in detail_blocks
         )
 
-        # Pretrained ResNet layer4 now supplies S32 semantics.  A 1x1 adapter
-        # replaces the previous randomly initialized stride-2 semantic stage;
-        # ``semantic_blocks`` is retained in the public signature so old
-        # experiment commands remain valid, but no extra S32 blocks are added.
+        # Pretrained ResNet layer4 supplies S32 semantic context.  Keep the
+        # historical key name for checkpoint compatibility.
         _ = semantic_blocks
-        # Keep the original checkpoint key name.  The epoch-230 baseline stores
-        # these tensors under ``dual_branch.semantic_projection.*``.
         self.semantic_projection = ConvBNAct(
             512, semantic_channels, 1, padding=0
         )
 
-        # Semantic -> Detail stays unchanged because every logged run used
-        # this route strongly.
+        # Keep Semantic -> Detail exactly as in the successful runs.
         self.semantic_to_detail_1 = ConvBNAct(
             256, detail_channels, 1, padding=0, activation=False
         )
@@ -549,15 +400,7 @@ class DualResolutionContext(nn.Module):
                 hidden_channels=max(16, min(64, detail_channels // 2)),
             )
 
-        # Detail -> Semantic V3: one joint semantic fusion/refinement block.
-        # It replaces the old projected additive residual and its nearly-dead
-        # per-channel scale.  Hidden width 128 keeps the block lightweight.
-        self.detail_guided_semantic = DetailGuidedSemanticBlock(
-            detail_channels=detail_channels,
-            semantic_channels=256,
-            hidden_channels=128,
-        )
-
+        # Independent semantic/context route.
         self.dappm = ProgressiveDAPPM(
             semantic_channels,
             dappm_channels,
@@ -571,18 +414,24 @@ class DualResolutionContext(nn.Module):
             padding=0,
             activation=False,
         )
-        self.context_scale = nn.Parameter(torch.full((1, 256, 1, 1), 0.10))
+        self.context_scale = nn.Parameter(
+            torch.full((1, 256, 1, 1), 0.10)
+        )
 
-        # Train-only deep supervision on the finished S16 semantic feature.
+        # Train-only semantic deep supervision is kept unchanged.
         semantic_aux_hidden = max(32, 256 // 4)
         self.semantic_aux_head = nn.Sequential(
             ConvBNAct(256, semantic_aux_hidden, 3),
             nn.Conv2d(semantic_aux_hidden, 2, 1),
         )
 
-        # Full-row/full-column context for the persistent detail stream.
+        # Road geometry context remains detail-only.
         self.strip_pooling = StripPoolingModule(detail_channels)
 
+        # Dedicated final road-aware fusion.  This is the same proven module
+        # from V3: independently normalize both branches, concatenate them,
+        # spatially gate the residual when requested, and keep Detail as the
+        # high-resolution anchor before directional refinement.
         self.semantic_to_fusion = ConvBNAct(
             256,
             detail_channels,
@@ -599,32 +448,30 @@ class DualResolutionContext(nn.Module):
 
     @staticmethod
     def _resize(x: Tensor, size: Tuple[int, int]) -> Tensor:
-        return F.interpolate(x, size=size, mode="bilinear", align_corners=False)
+        return F.interpolate(
+            x,
+            size=size,
+            mode="bilinear",
+            align_corners=False,
+        )
 
-    def bilateral_exchange(
+    def detail_enrichment(
         self,
         shared_s8: Tensor,
         semantic_s16: Tensor,
-    ) -> Tuple[Tensor, Tensor]:
-        """S->D residual followed by one joint Detail-Guided Semantic block.
+    ) -> Tensor:
+        """Build the persistent S8 road-detail feature.
 
-        Flow:
-            Layer2 S8 -> Detail Stage 1
-            Layer3 S16 -> S->D residual -> Detail Stage 2
-            refined Detail S8 + original Semantic S16
-                -> DetailGuidedSemanticBlock -> Enhanced S16
-            Enhanced S16 is then passed into ResNet layer4 by DualBranchRoadNet.
+        Semantic information may guide Detail because this route consistently
+        learned a meaningful scale in prior runs.  There is intentionally no
+        reverse Detail->Semantic path in V4.
         """
         detail_before = self.detail_stages[0](
             self.detail_projection(shared_s8)
         )
-        semantic_before = semantic_s16
 
-        # --------------------------------------------------------------
-        # Semantic -> Detail: keep the proven route exactly as before.
-        # --------------------------------------------------------------
         semantic_delta = self._resize(
-            self.semantic_to_detail_1(semantic_before),
+            self.semantic_to_detail_1(semantic_s16),
             detail_before.shape[-2:],
         )
         if self.bilateral_fusion == "spatial":
@@ -640,24 +487,9 @@ class DualResolutionContext(nn.Module):
             detail_before
             + self.semantic_to_detail_scale_1 * semantic_delta
         )
-
-        # Refine the persistent detail geometry first.  This refined road
-        # geometry, rather than raw Layer2 texture, guides the semantic block.
         detail = self.detail_stages[1](detail)
-
-        # --------------------------------------------------------------
-        # Detail -> Semantic V3:
-        # one learned joint residual block F(S, D), no additive P(D) route.
-        # --------------------------------------------------------------
-        semantic = self.detail_guided_semantic(
-            detail,
-            semantic_before,
-        )
-
-        # Strip pooling remains a detail-only pre-fusion context module.
         detail = self.strip_pooling(detail)
-
-        return detail, semantic
+        return detail
 
     def context_fusion(
         self,
@@ -665,7 +497,7 @@ class DualResolutionContext(nn.Module):
         semantic_s16: Tensor,
         semantic_s32: Tensor,
     ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
-        """Fold DAPPM S32 context back into enhanced S16, then fuse at S8."""
+        """Gather S32 context and fuse it with the independent detail stream."""
         context_s32 = self.dappm(
             self.semantic_projection(semantic_s32)
         )
@@ -697,43 +529,30 @@ class DualResolutionContext(nn.Module):
         semantic_s16: Tensor,
         semantic_s32: Tensor,
     ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
-        """Legacy-compatible direct call.
-
-        The V3 DualBranchRoadNet does not use this route because layer4 must
-        run after bilateral_exchange().  This method remains for external code
-        that directly calls DualResolutionContext.
-        """
-        detail, semantic = self.bilateral_exchange(
-            shared_s8,
-            semantic_s16,
-        )
+        detail = self.detail_enrichment(shared_s8, semantic_s16)
         return self.context_fusion(
             detail,
-            semantic,
+            semantic_s16,
             semantic_s32,
         )
 
     @torch.no_grad()
     def gate_statistics(self) -> Dict[str, float]:
-        """Diagnostics for the retained S->D route and new semantic block."""
+        """Diagnostics for S->D, S32 context, and final road fusion."""
         gates = {
             "semantic_to_detail": self.semantic_to_detail_scale_1,
-            "semantic_guidance": self.detail_guided_semantic.residual_scale,
             "s32_context_to_s16": self.context_scale,
             "semantic_to_final": self.final_fusion.fusion_scale,
         }
         statistics: Dict[str, float] = {}
         for name, gate in gates.items():
             detached = gate.detach().float()
-            statistics[f"{name}_abs_mean"] = float(detached.abs().mean().cpu())
-            statistics[f"{name}_abs_max"] = float(detached.abs().max().cpu())
-
-        statistics["semantic_guidance_delta_ratio"] = float(
-            self.detail_guided_semantic.last_delta_ratio.cpu()
-        )
-        statistics["semantic_guidance_delta_abs_mean"] = float(
-            self.detail_guided_semantic.last_delta_abs_mean.cpu()
-        )
+            statistics[f"{name}_abs_mean"] = float(
+                detached.abs().mean().cpu()
+            )
+            statistics[f"{name}_abs_max"] = float(
+                detached.abs().max().cpu()
+            )
 
         if self.bilateral_fusion == "spatial":
             statistics["semantic_to_detail_spatial_mean"] = float(
@@ -741,6 +560,12 @@ class DualResolutionContext(nn.Module):
             )
             statistics["semantic_to_detail_spatial_std"] = float(
                 self.semantic_to_detail_spatial_gate_1.last_std.cpu()
+            )
+            statistics["final_fusion_spatial_mean"] = float(
+                self.final_fusion.fusion_spatial_gate.last_mean.cpu()
+            )
+            statistics["final_fusion_spatial_std"] = float(
+                self.final_fusion.fusion_spatial_gate.last_std.cpu()
             )
         return statistics
 
@@ -805,24 +630,19 @@ class DualBranchRoadNet(nn.Module):
         self.current_phase = 4
 
     def forward(self, image: Tensor):
-        """V3 forward: Detail-Guided Semantic refinement precedes layer4/DAPPM."""
+        """V4: separate Detail and Semantic branches until final road fusion."""
         output_size = image.shape[-2:]
 
-        # Eval or phase 4: all stages run normally.
+        # Eval or phase 4: everything runs normally.
         if not self.training or self.current_phase >= 4:
             stem = self.encoder.stem(image)
             shallow = self.encoder.layer1(self.encoder.maxpool(stem))
             shared = self.encoder.layer2(shallow)
             semantic = self.encoder.layer3(shared)
 
-            detail, semantic = self.dual_branch.bilateral_exchange(
-                shared,
-                semantic,
-            )
-
-            # V3: pretrained layer4 sees the Detail-Guided enhanced S16.
+            # Semantic remains independent: no Detail -> Semantic injection.
+            detail = self.dual_branch.detail_enrichment(shared, semantic)
             context = self.encoder.layer4(semantic)
-
             dual_branch_output = self.dual_branch.context_fusion(
                 detail,
                 semantic,
@@ -836,38 +656,24 @@ class DualBranchRoadNet(nn.Module):
                 shallow = self.encoder.layer1(self.encoder.maxpool(stem))
                 shared = self.encoder.layer2(shallow)
                 semantic = self.encoder.layer3(shared)
-
-                detail, semantic = self.dual_branch.bilateral_exchange(
-                    shared,
-                    semantic,
-                )
+                detail = self.dual_branch.detail_enrichment(shared, semantic)
                 context = self.encoder.layer4(semantic)
-
                 dual_branch_output = self.dual_branch.context_fusion(
                     detail,
                     semantic,
                     context,
                 )
 
-        # Phase 1: dual branch trainable; ResNet remains frozen.
+        # Phase 1: dual branch trainable; entire ResNet frozen.
         elif self.current_phase == 1:
             with torch.no_grad():
                 stem = self.encoder.stem(image)
                 shallow = self.encoder.layer1(self.encoder.maxpool(stem))
                 shared = self.encoder.layer2(shallow)
                 semantic = self.encoder.layer3(shared)
-
-            detail, semantic = self.dual_branch.bilateral_exchange(
-                shared,
-                semantic,
-            )
-
-            # Frozen layer4 gets the enhanced feature numerically.  Its route is
-            # detached until phase 2; the direct enhanced-S16 route still trains
-            # the bilateral branch and semantic auxiliary head.
-            with torch.no_grad():
                 context = self.encoder.layer4(semantic)
 
+            detail = self.dual_branch.detail_enrichment(shared, semantic)
             dual_branch_output = self.dual_branch.context_fusion(
                 detail,
                 semantic,
@@ -882,14 +688,8 @@ class DualBranchRoadNet(nn.Module):
                 shared = self.encoder.layer2(shallow)
 
             semantic = self.encoder.layer3(shared)
-
-            detail, semantic = self.dual_branch.bilateral_exchange(
-                shared,
-                semantic,
-            )
-
+            detail = self.dual_branch.detail_enrichment(shared, semantic)
             context = self.encoder.layer4(semantic)
-
             dual_branch_output = self.dual_branch.context_fusion(
                 detail,
                 semantic,
@@ -904,14 +704,8 @@ class DualBranchRoadNet(nn.Module):
 
             shared = self.encoder.layer2(shallow)
             semantic = self.encoder.layer3(shared)
-
-            detail, semantic = self.dual_branch.bilateral_exchange(
-                shared,
-                semantic,
-            )
-
+            detail = self.dual_branch.detail_enrichment(shared, semantic)
             context = self.encoder.layer4(semantic)
-
             dual_branch_output = self.dual_branch.context_fusion(
                 detail,
                 semantic,
@@ -982,8 +776,8 @@ class DualBranchRoadNet(nn.Module):
 
         Names (not just tensors) are needed so build_optimizer() can
         correctly classify broadcast-shaped gate/scale parameters (e.g.
-        semantic_to_detail_scale_1, detail_guided_semantic.residual_scale,
-        context_scale, fusion_scale -- all stored as (1, C, 1, 1) for
+        semantic_to_detail_scale_1, context_scale, fusion_scale -- all stored
+        as (1, C, 1, 1) for
         broadcasting) as "no weight decay", the same treatment BatchNorm
         weight/bias already get. A plain ndim<=1 check misses these: they
         are semantically per-channel scales, not weight matrices, but their
