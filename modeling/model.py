@@ -496,8 +496,7 @@ class DualResolutionContext(nn.Module):
         detail_s8: Tensor,
         semantic_s16: Tensor,
         semantic_s32: Tensor,
-        return_semantic: bool = False,
-    ):
+    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
         """Gather S32 context and fuse it with the independent detail stream."""
         context_s32 = self.dappm(
             self.semantic_projection(semantic_s32)
@@ -521,11 +520,7 @@ class DualResolutionContext(nn.Module):
         fused = self.final_fusion(detail_s8, semantic_s8)
 
         if self.training:
-            if return_semantic:
-                return fused, semantic_aux_logits, semantic
             return fused, semantic_aux_logits
-        if return_semantic:
-            return fused, semantic
         return fused
 
     def forward(
@@ -630,13 +625,12 @@ class DualBranchRoadNet(nn.Module):
             full_channels=full_channels,
             num_classes=num_classes,
             dropout=dropout,
-            semantic_context_channels=256,
             deploy=deploy,
         )
         self.current_phase = 4
 
     def forward(self, image: Tensor):
-        """V4.3: V4 baseline plus zero-start S16 context injection at decoder S4/S2."""
+        """V4: separate Detail and Semantic branches until final road fusion."""
         output_size = image.shape[-2:]
 
         # Eval or phase 4: everything runs normally.
@@ -653,7 +647,6 @@ class DualBranchRoadNet(nn.Module):
                 detail,
                 semantic,
                 context,
-                return_semantic=True,
             )
 
         # Phase 0: decoder/head only. Encoder + dual branch frozen.
@@ -669,7 +662,6 @@ class DualBranchRoadNet(nn.Module):
                     detail,
                     semantic,
                     context,
-                    return_semantic=True,
                 )
 
         # Phase 1: dual branch trainable; entire ResNet frozen.
@@ -686,7 +678,6 @@ class DualBranchRoadNet(nn.Module):
                 detail,
                 semantic,
                 context,
-                return_semantic=True,
             )
 
         # Phase 2: layer3 + layer4 + dual branch trainable.
@@ -703,7 +694,6 @@ class DualBranchRoadNet(nn.Module):
                 detail,
                 semantic,
                 context,
-                return_semantic=True,
             )
 
         # Phase 3: layer2 + layer3 + layer4 + dual branch trainable.
@@ -720,19 +710,17 @@ class DualBranchRoadNet(nn.Module):
                 detail,
                 semantic,
                 context,
-                return_semantic=True,
             )
 
         if self.training:
-            fused, semantic_aux_logits, semantic_context_s16 = dual_branch_output
+            fused, semantic_aux_logits = dual_branch_output
         else:
-            fused, semantic_context_s16 = dual_branch_output
+            fused = dual_branch_output
 
         road_logits = self.decode_head(
             stem,
             shallow,
             fused,
-            semantic_context_s16,
             output_size,
         )
         if self.training:
