@@ -1358,11 +1358,6 @@ def transfer_weights(
         "spatial_gate",
         "strip_pooling",
         "semantic_aux_head",
-        # V4.3 decoder context-broadcast parameters are new relative to V4.
-        "context_s4_projection",
-        "context_s4_scale",
-        "context_s2_projection",
-        "context_s2_scale",
     )
     allowed_missing = all(
         any(token in key for token in allowed_missing_tokens)
@@ -2002,9 +1997,6 @@ def main() -> None:
             args,
         )
         gate_metrics = unwrap_model(model).dual_branch.gate_statistics()
-        gate_metrics.update(
-            unwrap_model(model).decode_head.context_gate_statistics()
-        )
         validation_metrics: Dict[str, float] = {}
         should_validate = (epoch + 1) % args.val_interval == 0 or epoch + 1 == args.epochs
         if should_validate:
@@ -2027,9 +2019,6 @@ def main() -> None:
                 f"{gate_metrics['semantic_to_detail_abs_mean']:.3f}/"
                 f"{gate_metrics['s32_context_to_s16_abs_mean']:.3f}/"
                 f"{gate_metrics['semantic_to_final_abs_mean']:.3f}"
-                f" | decoder ctx s4/s2="
-                f"{gate_metrics['decoder_context_s4_abs_mean']:.3f}/"
-                f"{gate_metrics['decoder_context_s2_abs_mean']:.3f}"
                 + (
                     " | spatial s2d mean/std="
                     f"{gate_metrics['semantic_to_detail_spatial_mean']:.3f}/"
