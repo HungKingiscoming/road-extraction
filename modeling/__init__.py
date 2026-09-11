@@ -1,4 +1,4 @@
-"""RoadFusion V4.3 modeling package."""
+"""RoadFusion V4 - Road-Aware Fusion modeling package."""
 
 from .model import (
     TruncatedResNet34,
@@ -19,10 +19,10 @@ from .decoder import (
     SeparableConvBNAct,
     StripPoolingModule,
     RoadReconstructionDecoder,
-    RoadSegClDiceLoss,
     soft_skeletonize,
     binary_dice_loss,
     soft_cldice_loss,
+    RoadSegClDiceLoss,
     verify_reparameterization,
 )
 
@@ -42,9 +42,9 @@ __all__ = [
     "SeparableConvBNAct",
     "StripPoolingModule",
     "RoadReconstructionDecoder",
-    "RoadSegClDiceLoss",
     "soft_skeletonize",
     "binary_dice_loss",
     "soft_cldice_loss",
+    "RoadSegClDiceLoss",
     "verify_reparameterization",
 ]
