@@ -291,12 +291,18 @@ def configure_dataset_paths(args: argparse.Namespace) -> None:
         args.val_mask_dir = None
         return
 
+    # k4nngg/datadg source: ROAD/training/{images,masks} (fully labeled,
+    # used entirely for training) and ROAD/eval/{images,masks} (fully
+    # labeled pool of 1452 pairs, split by resolve_splits() into
+    # deepglobe_eval_val_count val images + the remainder as test).
     root = Path(
         args.data_root
-        or "/kaggle/input/datasets/balraj98/deepglobe-road-extraction-dataset"
+        or "/kaggle/input/datasets/k4nngg/datadg/datasetdg/ROAD"
     )
     train_images, train_masks = _first_existing_pair(
         (
+            (root / "training" / "images", root / "training" / "masks"),
+            # Fallbacks for the older balraj98 DeepGlobe layout.
             (root / "train" / "images", root / "train" / "gt"),
             (root / "train" / "images", root / "train" / "masks"),
             (root / "images", root / "gt"),
@@ -309,6 +315,9 @@ def configure_dataset_paths(args: argparse.Namespace) -> None:
     if args.val_image_dir is None and args.val_mask_dir is None:
         labeled_validation = _first_labeled_pair(
             (
+                (root / "eval" / "images", root / "eval" / "masks"),
+                # Fallbacks for the older balraj98 DeepGlobe layout, which
+                # commonly ships an unlabeled "valid" directory.
                 (root / "valid" / "images", root / "valid" / "gt"),
                 (root / "val" / "images", root / "val" / "gt"),
                 (root / "valid", root / "valid"),
@@ -652,7 +661,7 @@ def resolve_splits(
         val_images, val_masks = Path(args.val_image_dir), Path(args.val_mask_dir)
         if val_images.is_dir() and val_masks.is_dir():
             try:
-                val_pairs = build_pairs(val_images, val_masks)
+                eval_pairs = build_pairs(val_images, val_masks)
             except RuntimeError:
                 if args.dataset != "deepglobe":
                     raise
@@ -661,11 +670,38 @@ def resolve_splits(
                     "using a labeled deterministic holdout from train instead."
                 )
             else:
+                if args.dataset == "deepglobe" and args.deepglobe_eval_split:
+                    # ROAD/eval is one labeled pool (1452 pairs in the
+                    # k4nngg source). Split it deterministically into a
+                    # small val slice and the full remainder as test.
+                    # Training keeps every pair under ROAD/training
+                    # untouched -- no holdout is carved out of train.
+                    eval_generator = np.random.default_rng(args.split_seed)
+                    eval_indices = eval_generator.permutation(len(eval_pairs))
+                    eval_val_count = int(args.deepglobe_eval_val_count)
+                    if eval_val_count >= len(eval_pairs):
+                        raise ValueError(
+                            "deepglobe_eval_val_count "
+                            f"({eval_val_count}) must be smaller than the "
+                            f"labeled eval pool ({len(eval_pairs)})"
+                        )
+                    val_indices = eval_indices[:eval_val_count]
+                    test_indices = eval_indices[eval_val_count:]
+                    val_pairs = [eval_pairs[int(i)] for i in val_indices]
+                    test_pairs = [eval_pairs[int(i)] for i in test_indices]
+                    rank_zero_print(
+                        "DeepGlobe eval-pool split: "
+                        f"train={len(all_pairs)} (full training/ dir, no "
+                        f"holdout), eval pool={len(eval_pairs)} -> "
+                        f"val={len(val_pairs)}, test={len(test_pairs)}, "
+                        f"seed={args.split_seed}"
+                    )
+                    return all_pairs, val_pairs, test_pairs
                 rank_zero_print(
                     f"Official/provided split: train={len(all_pairs)}, "
-                    f"val={len(val_pairs)}"
+                    f"val={len(eval_pairs)}"
                 )
-                return all_pairs, val_pairs, []
+                return all_pairs, eval_pairs, []
 
     generator = np.random.default_rng(args.split_seed)
     indices = generator.permutation(len(all_pairs))
@@ -688,11 +724,14 @@ def resolve_splits(
                 f"got {val_count}"
             )
 
-        # Requested protocol:
-        #   1) Randomly choose exactly 5000 samples for train.
-        #   2) The remaining 1226 samples are the FULL test holdout.
-        #   3) Take 300 samples from those 1226 for validation.
-        #   4) Keep those same 300 inside test_pairs, so final test still has 1226.
+        # Legacy protocol, used only as a fallback when no separate labeled
+        # eval/ directory is found (see configure_dataset_paths):
+        #   1) Randomly choose exactly deepglobe_train_count samples for
+        #      train from the single combined pool.
+        #   2) The remaining samples are the FULL test holdout.
+        #   3) Take deepglobe_val_count samples from that holdout for val.
+        #   4) Keep those same samples inside test_pairs too, so the final
+        #      test split still covers the entire holdout.
         train_indices = indices[:train_count]
         holdout_indices = indices[train_count:]
         val_indices = holdout_indices[:val_count]
@@ -711,7 +750,8 @@ def resolve_splits(
             raise RuntimeError("DeepGlobe validation must be a subset of test holdout")
 
         rank_zero_print(
-            "DeepGlobe 5000/300/1226 overlap protocol: "
+            "DeepGlobe single-pool random-split protocol (no labeled eval/ "
+            "dir found): "
             f"train={len(train_pairs)}, val={len(val_pairs)} "
             f"(subset of test), test={len(test_pairs)}, "
             f"seed={args.split_seed}"
@@ -1527,8 +1567,10 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=5000,
         help=(
-            "DeepGlobe protocol: randomly select exactly this many labeled pairs "
-            "for training; the remaining pairs form the full test holdout."
+            "Legacy single-pool protocol fallback (only used when no "
+            "labeled eval/ directory is found): randomly select exactly "
+            "this many labeled pairs for training; the remaining pairs "
+            "form the full test holdout."
         ),
     )
     parser.add_argument(
@@ -1536,9 +1578,36 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=300,
         help=(
-            "DeepGlobe protocol: select this many samples from the full holdout "
-            "for validation. These validation samples remain inside the final "
-            "test holdout by design."
+            "Legacy single-pool protocol fallback (only used when no "
+            "labeled eval/ directory is found): select this many samples "
+            "from the full holdout for validation. These validation "
+            "samples remain inside the final test holdout by design."
+        ),
+    )
+    parser.add_argument(
+        "--deepglobe_eval_split",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When a labeled eval/ directory is found (e.g. ROAD/eval with "
+            "images+masks), split that pool deterministically into val/test "
+            "by count instead of using the whole pool as val. Training "
+            "always uses every pair under the training/ directory, "
+            "untouched. --no-deepglobe_eval_split restores the old "
+            "behaviour: the entire labeled eval/ dir is used as val and "
+            "test is left empty."
+        ),
+    )
+    parser.add_argument(
+        "--deepglobe_eval_val_count",
+        type=int,
+        default=226,
+        help=(
+            "Number of pairs from the labeled eval/ pool (e.g. ROAD/eval, "
+            "1452 pairs total) reserved for validation; the remainder "
+            "(e.g. 1226) becomes the test holdout. Ignored unless "
+            "deepglobe_eval_split is enabled and a labeled eval directory "
+            "is found."
         ),
     )
 
@@ -1774,6 +1843,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("deepglobe_train_count must be positive")
     if args.deepglobe_val_count < 1:
         raise ValueError("deepglobe_val_count must be positive")
+    if args.deepglobe_eval_val_count < 1:
+        raise ValueError("deepglobe_eval_val_count must be positive")
     if args.resume and args.pretrained_checkpoint:
         raise ValueError("Use either --resume or --pretrained_checkpoint, not both")
     if not args.dappm_pool_sizes or min(args.dappm_pool_sizes) < 1:
@@ -2013,6 +2084,16 @@ def main() -> None:
             f"{args.crop_size}x{args.crop_size}; validate()/sliding-window "
             "inference still runs at native resolution unresized -- this is "
             "a real train/inference scale mismatch, not a bug."
+        )
+    if args.dataset == "deepglobe":
+        rank_zero_print(
+            f"deepglobe data source: train_dir={args.train_image_dir} | "
+            f"eval_dir={args.val_image_dir} | "
+            f"eval_split={args.deepglobe_eval_split} "
+            f"(val_count={args.deepglobe_eval_val_count} if a labeled eval/ "
+            "dir was found; otherwise falls back to the legacy single-pool "
+            f"protocol with train_count={args.deepglobe_train_count}, "
+            f"val_count={args.deepglobe_val_count})"
         )
     rank_zero_print(
         f"shared ResNet34 to S8 | detail={args.detail_channels}ch S8 | "
