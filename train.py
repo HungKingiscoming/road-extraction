@@ -669,6 +669,55 @@ def resolve_splits(
 
     generator = np.random.default_rng(args.split_seed)
     indices = generator.permutation(len(all_pairs))
+
+    if args.dataset == "deepglobe":
+        train_count = int(args.deepglobe_train_count)
+        val_count = int(args.deepglobe_val_count)
+        total_count = len(all_pairs)
+
+        if train_count <= 0 or train_count >= total_count:
+            raise ValueError(
+                f"deepglobe_train_count must be in [1, {total_count - 1}], "
+                f"got {train_count}"
+            )
+
+        holdout_count = total_count - train_count
+        if val_count <= 0 or val_count > holdout_count:
+            raise ValueError(
+                f"deepglobe_val_count must be in [1, {holdout_count}], "
+                f"got {val_count}"
+            )
+
+        # Requested protocol:
+        #   1) Randomly choose exactly 5000 samples for train.
+        #   2) The remaining 1226 samples are the FULL test holdout.
+        #   3) Take 300 samples from those 1226 for validation.
+        #   4) Keep those same 300 inside test_pairs, so final test still has 1226.
+        train_indices = indices[:train_count]
+        holdout_indices = indices[train_count:]
+        val_indices = holdout_indices[:val_count]
+
+        train_pairs = [all_pairs[int(i)] for i in train_indices]
+        val_pairs = [all_pairs[int(i)] for i in val_indices]
+        test_pairs = [all_pairs[int(i)] for i in holdout_indices]
+
+        train_keys = {sample_key(image) for image, _ in train_pairs}
+        val_keys = {sample_key(image) for image, _ in val_pairs}
+        test_keys = {sample_key(image) for image, _ in test_pairs}
+
+        if train_keys & test_keys:
+            raise RuntimeError("DeepGlobe train/test overlap detected unexpectedly")
+        if not val_keys.issubset(test_keys):
+            raise RuntimeError("DeepGlobe validation must be a subset of test holdout")
+
+        rank_zero_print(
+            "DeepGlobe 5000/300/1226 overlap protocol: "
+            f"train={len(train_pairs)}, val={len(val_pairs)} "
+            f"(subset of test), test={len(test_pairs)}, "
+            f"seed={args.split_seed}"
+        )
+        return train_pairs, val_pairs, test_pairs
+
     val_count = max(1, round(len(all_pairs) * args.val_ratio))
     test_count = (
         max(1, round(len(all_pairs) * args.test_ratio))
@@ -1473,6 +1522,25 @@ def parse_args() -> argparse.Namespace:
         help="Held out and never evaluated during training when no labeled val exists",
     )
     parser.add_argument("--split_seed", type=int, default=3407)
+    parser.add_argument(
+        "--deepglobe_train_count",
+        type=int,
+        default=5000,
+        help=(
+            "DeepGlobe protocol: randomly select exactly this many labeled pairs "
+            "for training; the remaining pairs form the full test holdout."
+        ),
+    )
+    parser.add_argument(
+        "--deepglobe_val_count",
+        type=int,
+        default=300,
+        help=(
+            "DeepGlobe protocol: select this many samples from the full holdout "
+            "for validation. These validation samples remain inside the final "
+            "test holdout by design."
+        ),
+    )
 
     parser.add_argument("--crop_size", type=int, default=1024)
     parser.add_argument(
@@ -1702,6 +1770,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("test_ratio must be in [0, 1)")
     if args.val_ratio + args.test_ratio >= 1.0:
         raise ValueError("val_ratio + test_ratio must be smaller than 1")
+    if args.deepglobe_train_count < 1:
+        raise ValueError("deepglobe_train_count must be positive")
+    if args.deepglobe_val_count < 1:
+        raise ValueError("deepglobe_val_count must be positive")
     if args.resume and args.pretrained_checkpoint:
         raise ValueError("Use either --resume or --pretrained_checkpoint, not both")
     if not args.dappm_pool_sizes or min(args.dappm_pool_sizes) < 1:
