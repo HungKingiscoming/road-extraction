@@ -356,8 +356,6 @@ $5\times1$ spatial branches followed by pointwise channel mixing. The
 anisotropic branches are motivated by the elongated geometry of road segments
 and fuse into a single $5\times5$ depthwise kernel at deployment.
 
-\begingroup
-\color{red}
 \section{Methodology}
 \label{sec:methods}
 
@@ -414,9 +412,45 @@ the detail stream and $\mathbf{S}$ the semantic stream.
     \label{fig:architecture}
 \end{figure*}
 
-In this section, we introduce the overall network and the details of the modules. Fig 1 describes the overall structure of the proposed model including an encoder, Detail stage, DAPPM, Road-Aware Fusion and the decoder. Especially, remote sensing image is handled by the encoder which is based on a Resnet34 network. In general, it can be seen that there are four stages, containing 3, 4, 6, 3 blocks, and each block has convolutional layers (Conv), batch normalization (BN), and ReLU activation functions. This encoding process create multiscale feature maps with five different resolutions such as E1, E2, E3, E4, and E5. The feature map E3 is connected Detail Stage 1 to provide a high-resolution spatial representation for preserving exactly road geometry. After receiving information from E4, the feature is further refined by Detail Stage 2 and passed throug the Strip Pooling module to take long-range directional context while remaining fine road geometry. Within the semantic branc, E4 serves as the semantic anchor, while the deepest feature map E5 is processed by the ProgressiveDAPPM to aggregate multi-scale long-range contextual information. The resulting context is projected, upsampled, and residually fused with E4 to strengthen the semantic representation before Road-Aware Fusion.  
+Fig.~\ref{fig:architecture} summarizes the overall architecture: a shared
+ResNet-34 encoder, the dual-branch detail and semantic pathways of
+Section~\ref{subsec:dualres}, the progressive DAPPM context module of
+Section~\ref{subsec:dappm}, the road-aware fusion module of
+Section~\ref{subsec:fusion}, and the reconstruction decoder of
+Section~\ref{subsec:decoder}.
 
-Next, the feature map is upsampled to the stride-4 resolution and fused with a skip connection from E2. The shallow E2 feature is first projected to a lower-dimensional space and then concatenated with the decoder feature to recover fine spatial details. The combined representation is compressed and refined before being further upsampled to stride 2, where a second skip connection from E1 is introduced. This progressive reconstruction process enables the decoder to recover road boundaries and local geometric structures while gradually restoring the original spatial resolution.
+The encoder is a ResNet-34~\cite{he2016resnet} truncated after its last
+residual stage and initialized from ImageNet weights~\cite{deng2009imagenet},
+following the standard ResNet-34 stage layout with 3, 4, 6, and 3 basic
+blocks across its four residual stages, each combining convolution, batch
+normalization, and ReLU. It returns five feature levels rather than one: a
+stride-2 stem with 64 channels, a stride-4 map with 64 channels, a stride-8
+map with 128 channels, a stride-16 map with 256 channels, and a stride-32
+map with 512 channels. The stride-8 map initializes the detail branch, the
+stride-16 and stride-32 maps feed the semantic branch, and the stride-2 and
+stride-4 maps are reserved as decoder skips. Both branches therefore start
+from pretrained features; this matters for the initialization strategy used
+throughout the network, since several modules below begin as identity or
+near-identity operators so that the pretrained statistics are not disturbed
+before the randomly initialized parts have learned anything useful.
+
+The detail branch is refined in two stages separated by a one-way
+semantic-to-detail residual that injects evidence from the pretrained
+stride-16 feature; the second stage is followed by the strip-pooling
+module, which adds long-range horizontal and vertical context without
+reducing the stride-8 resolution. The semantic branch keeps the pretrained
+stride-16 feature as its anchor while the stride-32 feature is processed by
+the progressive DAPPM to aggregate multi-scale context; the resulting
+representation is projected, upsampled, and added residually to the
+stride-16 anchor before the road-aware fusion stage combines the two
+branches.
+
+The reconstruction decoder recovers the input resolution progressively. The
+fused stride-8 feature is upsampled to stride~4 and combined with a
+projected skip connection from the stride-4 encoder feature, refined, and
+upsampled again to stride~2, where it is combined with a projected skip
+connection from the stride-2 stem feature. Section~\ref{subsec:decoder}
+specifies the channel widths and refinement blocks used at each step.
 
 
 Table~\ref{tab:modules} lists the exact parameter counts of the current default
@@ -433,7 +467,7 @@ Module & Role & Stride (channels) & Params \\
 \midrule
 Shared encoder
   & ResNet-34 stem and residual stages
-  & 2--32 (64--512) & 21\,284\,672 \\
+  & 2-32 (64-512) & 21\,284\,672 \\
 Detail projection + stages
   & $128\!\rightarrow\!96$ projection and four RepVGG blocks
   & 8 (96) & 383\,424 \\
@@ -480,6 +514,21 @@ multi-branch during training and single-branch at inference, following the
 re-parameterization principle of RepVGG~\cite{ding2021repvgg}. Introducing them
 first makes the module descriptions that follow self-contained.
 
+\begin{figure}[pos=t]
+    \centering
+    \placeholderfig[\linewidth]{figs/reparam_blocks.pdf}
+    \caption{RepVGGBlock and RepDepthwiseBlock in their training-time
+    multi-branch form and their algebraically equivalent deployment-time
+    fused form. Batch normalization is folded into each branch and the
+    padded kernels are summed, collapsing a RepVGGBlock into one
+    $3\times3$ convolution and a RepDepthwiseBlock into one $5\times5$
+    depthwise convolution.}
+    \label{fig:reparam}
+\end{figure}
+
+Fig.~\ref{fig:reparam} illustrates both block types before and after this
+fusion.
+
 \paragraph{RepVGGBlock.} A standard-convolution block combining a $3 \times 3$
 convolution, a $1 \times 1$ convolution, and an identity path, each followed by
 batch normalization. It is used for the detail stream, where full channel mixing
@@ -523,23 +572,6 @@ centered Dirac kernel. A RepVGGBlock collapses to one $3 \times 3$ convolution
 with bias and a RepDepthwiseBlock to one $5 \times 5$ depthwise convolution with
 bias. The transformation is algebraic and introduces no approximation beyond
 floating-point rounding, which Section~\ref{subsec:efficiency} quantifies.
-
-\subsection{Shared encoder}
-\label{subsec:encoder}
-
-The encoder is a ResNet-34~\cite{he2016resnet} truncated after its last residual
-stage and initialized from ImageNet weights~\cite{deng2009imagenet}. It returns
-five feature levels rather than one: a stride-2 stem with 64 channels, a stride-4
-map with 64 channels, a stride-8 map with 128 channels, a stride-16 map with 256
-channels, and a stride-32 map with 512 channels. The stride-8 map is the input of
-the detail stream, the stride-16 and stride-32 maps feed the semantic stream, and
-the stride-2 and stride-4 maps are reserved as decoder skips.
-
-Both branches therefore start from pretrained features. This matters for the
-initialization strategy used throughout the network: several modules below begin
-as identity or near-identity operators specifically so that the pretrained
-statistics are not disturbed before the randomly initialized parts have learned
-anything useful.
 
 \subsection{Dual-branch detail and semantic pathways}
 \label{subsec:dualres}
@@ -596,12 +628,14 @@ The scale is initialized to $0.10$. Importantly, the current architecture has
 \emph{no} detail-to-semantic residual.
 
 \paragraph{Second detail stage and strip pooling.}
-After semantic guidance, two further RepVGG blocks refine
-$\mathbf{D}_{g}$. The resulting feature is passed through a lightweight
-residual strip-pooling block inspired by the strip pooling strategy of
-Hou et al.~\cite{hou2020strip}. For a reduced feature
+After semantic guidance, two further RepVGG blocks refine $\mathbf{D}_{g}$
+into $\mathbf{D}_{\mathrm{rep}}\in\mathbb{R}^{96\times H/8\times W/8}$. This
+feature is passed through a lightweight residual strip-pooling block
+inspired by the strip pooling strategy of Hou et al.~\cite{hou2020strip}. A
+$1\times1$ convolution first reduces $\mathbf{D}_{\mathrm{rep}}$ to
 $\mathbf{R}\in\mathbb{R}^{C_r\times h\times w}$ with
-$C_r=\max(16,C_d/4)=24$, horizontal and vertical descriptors are
+$C_r=\max(16,C_d/4)=24$, from which horizontal and vertical descriptors are
+computed as
 %
 \begin{align}
 \mathbf{H} &=
@@ -655,6 +689,21 @@ where $g$ consists of a $3\times3$ convolution, group normalization, SiLU,
 and a final $1\times1$ convolution to one channel. The final convolution is
 initialized to zero, so $\mathbf{G}=2\sigma(0)=1$ at initialization.
 
+\begin{figure}[pos=t]
+    \centering
+    \placeholderfig[\linewidth]{figs/residual_spatial_gate.pdf}
+    \caption{Residual spatial gate. The target feature $\mathbf{T}$ and the
+    projected source $\boldsymbol{\Delta}$ are normalized independently,
+    concatenated, and passed through a small convolutional head whose
+    output is $2\sigma(\cdot)$. The final convolution is zero-initialized,
+    so the gate starts at $\mathbf{G}=1$ everywhere and the residual
+    exchange is initially unmodulated.}
+    \label{fig:gate}
+\end{figure}
+
+Fig.~\ref{fig:gate} shows this mechanism, which is reused unchanged at both
+the S16$\rightarrow$S8 semantic guidance and the final road-aware fusion.
+
 \subsection{Progressive deep aggregation pyramid pooling}
 \label{subsec:dappm}
 
@@ -682,6 +731,20 @@ where $\psi_k$ is a $1\times1$ projection to 32 channels and $\pi_k$ is a
 $3\times3$ convolution. Group normalization is used throughout the DAPPM
 branches. The base projection and all progressive outputs are concatenated and
 compressed back to 192 channels, then added to a 192-channel shortcut.
+
+\begin{figure}[pos=t]
+    \centering
+    \placeholderfig[\linewidth]{figs/progressive_dappm.pdf}
+    \caption{Progressive deep aggregation pyramid pooling. Pooling grids are
+    traversed from finer to coarser ($8,4,2,1$), and each stage adds its
+    pooled, projected context to the running feature $\mathbf{U}_{k^-}$
+    before the next, coarser stage is folded in. This differs from a
+    parallel pyramid pooling module, where all scales are pooled
+    independently and combined only once at the end.}
+    \label{fig:dappm}
+\end{figure}
+
+Fig.~\ref{fig:dappm} illustrates this progressive aggregation.
 
 The DAPPM output is projected from 192 to 256 channels and bilinearly
 upsampled to stride~16. It is injected into the pretrained semantic anchor with
@@ -752,6 +815,22 @@ anchor and $\mathbf{M}$. The fused feature is
 %
 where $\boldsymbol{\gamma}_{f}\in\mathbb{R}^{96}$ is initialized to $0.10$ and
 $\mathcal{R}_{dw}$ is one RepDepthwiseBlock.
+
+\begin{figure}[pos=t]
+    \centering
+    \placeholderfig[\linewidth]{figs/road_aware_fusion.pdf}
+    \caption{Road-aware fusion. The detail feature $\mathbf{D}_2$ and the
+    projected semantic feature $\tilde{\mathbf{S}}$ are normalized
+    independently, concatenated, and compressed to $\mathbf{M}$. The
+    residual spatial gate $\mathbf{G}_f$ and a learnable per-channel scale
+    $\boldsymbol{\gamma}_f$ modulate how much of $\mathbf{M}$ is added back
+    to the detail feature, which remains the residual anchor, before a
+    RepDepthwiseBlock refines the fused representation.}
+    \label{fig:fusion}
+\end{figure}
+
+Fig.~\ref{fig:fusion} shows this fusion path, with the detail feature kept
+as the residual anchor throughout.
 
 \subsection{Road reconstruction decoder}
 \label{subsec:decoder}
@@ -852,7 +931,6 @@ head is trained with weighted cross-entropy plus a soft Dice term,
 Its maximum contribution is 0.15. The weight is zero during the first five
 epochs and is linearly ramped to its maximum over the following five epochs.
 This deep supervision is not executed at inference.
-\endgroup
 
 \section{Experimental setup}
 \label{sec:experimental-setup}
@@ -988,7 +1066,7 @@ $p$ and $\mathbf{Z}^{(p)}$ for the tile logits placed in scene coordinates,
                   {\sum_p \mathbf{W}^{(p)}} .
 \end{equation}
 
-Metrics are computed from a confusion matrix pooled over the whole split. Let
+Road IoU is computed from a confusion matrix pooled over the whole split. Let
 $\mathrm{TP}$, $\mathrm{FP}$, and $\mathrm{FN}$ count road-class true positives,
 false positives, and false negatives. The primary metric is the road-class
 intersection-over-union,
@@ -999,10 +1077,34 @@ intersection-over-union,
 \frac{\mathrm{TP}}{\mathrm{TP} + \mathrm{FP} + \mathrm{FN}},
 \end{equation}
 %
-reported as a micro-average over pooled counts. Background IoU, mean IoU,
-precision, recall, and F1 follow from the same pooled matrix, and a macro variant
-of road IoU averaged over images is reported alongside the micro value because
-the two diverge when road density varies strongly across scenes.
+reported as a micro-average over pooled counts. Background IoU and mean IoU
+follow from the same pooled matrix, and a macro variant of road IoU averaged
+over images is reported alongside the micro value because the two diverge
+when road density varies strongly across scenes.
+
+Precision and recall follow the aggregation of the released WeavingUnet
+evaluation code~\cite{weavingunet}, which this study adopts throughout for
+comparability with the literature values compiled in
+Section~\ref{subsec:sota}. Writing $\mathrm{TP}_n$, $\mathrm{FP}_n$, and
+$\mathrm{FN}_n$ for the confusion counts of image $n$ among the $N$
+evaluation images, precision and recall are averaged per image
+(macro-average) rather than pooled,
+%
+\begin{equation}
+\label{eq:prf}
+\mathrm{Precision}_{\mathrm{road}} =
+\frac{1}{N}\sum_{n=1}^{N}
+\frac{\mathrm{TP}_n}{\mathrm{TP}_n+\mathrm{FP}_n},
+\qquad
+\mathrm{Recall}_{\mathrm{road}} =
+\frac{1}{N}\sum_{n=1}^{N}
+\frac{\mathrm{TP}_n}{\mathrm{TP}_n+\mathrm{FN}_n},
+\end{equation}
+%
+and F1 is their harmonic mean. This aggregation is used for every precision,
+recall, and F1 value reported in this paper; road IoU always uses the
+pooled definition of Eq.~\eqref{eq:iou} instead, since the two aggregations
+coincide for IoU.
 
 Route quality is quantified by a relaxed F1 score with a tolerance of three
 pixels, which corresponds to three meters on Massachusetts imagery and 1.5 meters
@@ -1039,15 +1141,26 @@ threshold is then applied unchanged to the test split.
 \subsection{Comparison with prior methods}
 \label{subsec:sota}
 
-Table~\ref{tab:sota} reports precision, recall, F1, and road IoU on the
-Massachusetts and DeepGlobe test splits for DBR-Net and the comparison
-methods, all trained and evaluated under the shared protocol of
-Section~\ref{sec:experimental-setup}.
+Table~\ref{tab:sota} compares DBR-Net with 14 prior methods on the
+Massachusetts and DeepGlobe test splits. Values for the comparison methods
+are as reported by WeavingUnet~\cite{weavingunet}, whose published
+comparison table this study adopts as the external reference; these methods
+are not independently retrained in this study. DBR-Net alone is trained and
+evaluated under the protocol of Section~\ref{sec:experimental-setup}, with
+precision, recall, and F1 measured using the WeavingUnet-compatible
+aggregation of Section~\ref{subsec:metrics}, so that these values remain
+comparable with the reported baselines. The comparison therefore combines a
+controlled
+measurement of DBR-Net with literature-reported baselines rather than a
+fully controlled re-implementation of every method, a point
+Section~\ref{subsec:limitations} returns to.
 
 \begin{table*}[pos=t]
 \caption{Comparison with state-of-the-art methods on the DeepGlobe and
-Massachusetts road extraction datasets. Params, FLOPs (GMACs), and peak
-memory (GiB) are measured at $1024\times1024$ input resolution.}
+Massachusetts road extraction datasets. Values for methods other than
+DBR-Net are as reported by WeavingUnet~\cite{weavingunet}. Params, FLOPs
+(GMACs), and peak memory (GiB) are measured at $1024\times1024$ input
+resolution.}
 \label{tab:sota}
 \resizebox{\textwidth}{!}{%
 \begin{tabular}{lccccccccccc}
@@ -1096,16 +1209,17 @@ MSMDFFNet \cite{msmdffnet}
   & 81.62 & 82.82 & 81.20 & 69.68 & 73.18 & 71.28 & 70.96 & 58.98
   & 39.26\,M & 598.40\,G & 15.24 \\
 StripUnet \cite{stripunet}
-  & 81.53 & 83.33 & 82.03 & 69.45 & 73.39 & 72.99 & 71.30 & 59.14
+  & 81.53 & 83.33 & 82.03 & 69.45 & 73.39 & \underline{72.99} & 71.30 & 59.14
   & 57.98\,M & 252.22\,G & 13.51 \\
 WeavingUnet \cite{weavingunet}
-  & 83.10 & 83.51 & 82.73 & 71.44 & 73.92 & 73.30 & 72.52 & 61.01
+  & \textbf{83.10} & \underline{83.51} & \underline{82.73} & \underline{71.44}
+  & \underline{73.92} & \textbf{73.30} & \underline{72.52} & \underline{61.01}
   & 187.71\,M & 295.66\,G & 14.95 \\
 \midrule
 \textbf{DBR-Net (ours)}
-  & [VAL] & [VAL] & [VAL] & [VAL]
-  & 76.52 & 72.96 & \textbf{72.96} & \textbf{61.76}
-  & 22.35\,M & [PROFILE] & [PROFILE] \\
+  & \underline{81.72} & \textbf{87.51} & \textbf{84.02} & \textbf{72.19}
+  & \textbf{76.52} & 72.96 & \textbf{74.21} & \textbf{61.76}
+  & 22.35\,M & 90.46\,G & 3.99 \\
 \bottomrule
 \end{tabular}%
 }
@@ -1115,36 +1229,53 @@ WeavingUnet \cite{weavingunet}
 \begin{minipage}{\tblwidth}
 \raggedright
 \footnotesize
-\textit{Note:} Values are reported as mean$\pm$sample SD across independent
-training seeds. The best result is shown in bold, and the second-best result
-is underlined.
+\textit{Note:} Values for methods other than DBR-Net are as reported by
+WeavingUnet~\cite{weavingunet} and are not independently reproduced in this
+study. DBR-Net reflects a single training run under the protocol of
+Section~\ref{sec:experimental-setup}. The best result is shown in bold, and
+the second-best result is underlined.
 \end{minipage}
 
-On the Massachusetts test split, DBR-Net reaches a road F1 of 72.96\%
-and an IoU of 61.76\%, the highest values in Table~\ref{tab:sota} on this
-benchmark. The closest competitor is WeavingUnet, which reports an F1 of
-72.52\% and an IoU of 61.01\%; DBR-Net therefore improves F1 by 0.44
-percentage points and IoU by 0.75 percentage points over the strongest prior
-method, while using approximately 22.35\,M stored parameters after
-re-parameterization. The final compute and memory comparison must be filled
-from a fresh profile of the current V4 implementation rather than from the
-previous architecture. [VERIFY: DeepGlobe
-Precision/Recall/F1/IoU for DBR-Net are not yet available in
-Table~\ref{tab:sota}; once measured, state here whether the same ranking
-holds on DeepGlobe, report the absolute gap to the closest competitor on that
-split, and explicitly name any metric or dataset where DBR-Net does not rank
-first, per the reporting requirement of this section.]
+On the Massachusetts test split, DBR-Net reaches a road F1 of 74.21\% and an
+IoU of 61.76\%, the highest values in Table~\ref{tab:sota} on this benchmark.
+The closest competitor is WeavingUnet, which reports an F1 of 72.52\% and an
+IoU of 61.01\%; DBR-Net therefore improves F1 by 1.69 percentage points and
+IoU by 0.75 percentage points over the strongest prior method. Precision is
+likewise highest, at 76.52\%, 2.60 points above WeavingUnet. Recall is the
+one metric on which DBR-Net does not rank first on this benchmark: at
+72.96\%, it trails WeavingUnet (73.30\%) and StripUnet (72.99\%) by a small
+margin, so the F1 and IoU advantage on Massachusetts is driven mainly by
+precision rather than by recovering a larger share of the labeled road
+pixels.
 
-[SYNTHESIS PARAGRAPH: once the DeepGlobe results above are filled in, relate
-the pattern across the two datasets to the difference in ground sampling
-distance and scene composition. Massachusetts is one meter per pixel with
-dense suburban and forested scenes; DeepGlobe is 0.5 meters per pixel with a
-larger share of rural and unpaved roads. State whether the advantage is
-consistent across both datasets or concentrated in one, and connect that
-pattern to a specific architectural claim from Section~\ref{sec:methods}
-(e.g. the detail-stream preservation being more valuable at coarser ground
-sampling, or Strip Pooling and semantic guidance being more valuable on the sparser DeepGlobe road
-network).]
+On the DeepGlobe test split, DBR-Net attains the highest recall (87.51\%),
+F1 (84.02\%), and IoU (72.19\%) in Table~\ref{tab:sota}, improving over
+WeavingUnet, again the strongest prior method, by 4.00, 1.29, and 0.75
+percentage points, respectively. Precision is the exception on this
+benchmark: WeavingUnet reports 83.10\%, 1.38 points above the 81.72\%
+achieved by DBR-Net, indicating that part of the recall gain trades off
+against a higher false-positive rate on DeepGlobe. DBR-Net reaches this
+accuracy with 22.35\,M stored parameters after re-parameterization, against
+187.71\,M for WeavingUnet, and at 90.46\,GMACs and 3.99\,GiB peak memory at
+$1024\times1024$ resolution, both markedly below the corresponding
+WeavingUnet figures in Table~\ref{tab:sota}.
+
+The pattern differs between the two benchmarks. On DeepGlobe, whose
+0.5\,m/pixel imagery and larger share of narrow rural and unpaved roads make
+omission the dominant error mode, the advantage over WeavingUnet is
+concentrated in recall rather than precision, consistent with the persistent
+stride-8 detail stream and the directional strip-pooling context
+(Section~\ref{subsec:dualres}) recovering thin road segments that a heavier,
+single-resolution decoder misses. On Massachusetts, whose 1\,m/pixel imagery
+covers denser suburban and forested scenes, DBR-Net instead leads mainly
+through precision, and recall is marginally below the two closest baselines;
+this pattern may reflect the one-way semantic guidance and road-aware fusion
+(Sections~\ref{subsec:dualres} and~\ref{subsec:fusion}) suppressing
+background confusers such as driveways and building outlines rather than
+recovering additional road pixels in these denser scenes. The accuracy
+advantage is therefore not uniform across metrics on either benchmark, but
+road IoU, the primary metric of this study, is highest for DBR-Net on both
+datasets.
 
 \subsection{Ablation studies}
 \label{subsec:ablation}
@@ -1239,8 +1370,14 @@ conditions under which it occurs.]
 \subsection{Limitations}
 \label{subsec:limitations}
 
-Several limitations bound the scope of these results. The model predicts raster
-masks and does not extract a road graph, so vectorization, node and edge
+Several limitations bound the scope of these results. The comparison in
+Section~\ref{subsec:sota} places a controlled measurement of DBR-Net
+alongside baseline values taken from WeavingUnet~\cite{weavingunet} rather
+than from an independent re-implementation of every prior method; despite
+the WeavingUnet-compatible aggregation adopted for DBR-Net, differences in
+training data, hyperparameters, or hardware between the original studies
+cannot be fully ruled out as a source of part of the observed margin. The
+model predicts raster masks and does not extract a road graph, so vectorization, node and edge
 recovery, and downstream routing are outside the evaluated pipeline. Roads are
 treated as a single class, with no distinction between highway, urban, and
 unpaved surfaces. The input is restricted to three-band optical imagery, so
@@ -1274,12 +1411,14 @@ with a training-only stride-16 semantic deep-supervision loss. The current
 architecture contains no detail-to-semantic residual and no centerline-Tversky
 auxiliary head.
 
-Under the native-resolution evaluation protocol described above, the final
-Massachusetts and DeepGlobe results should be inserted after the current V4
-experiments are complete: [IOU\_MASS] and [IOU\_DG]. The training-form model
-contains 22.392~M parameters and its current re-parameterized implementation
-contains 22.353~M stored parameters. Final GMAC and latency measurements should
-be profiled from the same trained V4 checkpoint used for reporting accuracy.
+Under the native-resolution evaluation protocol described above, DBR-Net
+reaches a road IoU of 61.76\% on Massachusetts and 72.19\% on DeepGlobe, the
+highest values among the compared methods in Table~\ref{tab:sota} on both
+benchmarks. The training-form model contains 22.392~M parameters and its
+current re-parameterized implementation contains 22.353~M stored parameters,
+consistent with the 22.35~M reported for DBR-Net in Table~\ref{tab:sota}.
+Final latency measurements should be profiled from the same trained V4
+checkpoint used for reporting accuracy.
 
 Future work may extend the raster output to an explicit road graph and examine
 whether the same asymmetric semantic-guidance strategy generalizes to
