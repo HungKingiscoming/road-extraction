@@ -1160,66 +1160,70 @@ Section~\ref{subsec:limitations} returns to.
 Massachusetts road extraction datasets. Values for methods other than
 DBR-Net are as reported by WeavingUnet~\cite{weavingunet}. Params, FLOPs
 (GMACs), and peak memory (GiB) are measured at $1024\times1024$ input
-resolution.}
+resolution; the hardware used for the inference time of methods other than
+DBR-Net is not stated in that source. DBR-Net inference time is the
+single-image FP32 deploy-form latency of Section~\ref{subsec:efficiency},
+measured on a Tesla T4 GPU, and is not necessarily measured on the same
+hardware as the other methods.}
 \label{tab:sota}
 \resizebox{\textwidth}{!}{%
-\begin{tabular}{lccccccccccc}
+\begin{tabular}{lcccccccccccc}
 \toprule
 & \multicolumn{4}{c}{DeepGlobe Road Extraction (test1226)}
-& \multicolumn{4}{c}{Massachusetts (test117)} & & & \\
+& \multicolumn{4}{c}{Massachusetts (test117)} & & & & \\
 \cmidrule(lr){2-5} \cmidrule(lr){6-9}
 Method & Precision (\%) & Recall (\%) & F1 (\%) & IoU (\%)
        & Precision (\%) & Recall (\%) & F1 (\%) & IoU (\%)
-       & Params & FLOPs & Mems (GiB) \\
+       & Params & FLOPs & Mems (GiB) & Inference (s) \\
 \midrule
 U-Net \cite{ronneberger2015unet}
   & 79.90 & 80.56 & 79.05 & 66.83 & 72.62 & 67.80 & 69.14 & 56.61
-  & 39.50\,M & 34.96\,G & 3.12 \\
+  & 39.50\,M & 34.96\,G & 3.12 & 0.19 \\
 Deeplabv3+ \cite{chen2018deeplabv3plus}
   & 80.68 & 83.15 & 80.85 & 68.66 & 70.31 & 72.76 & 70.33 & 57.48
-  & 26.71\,M & 165.88\,G & 4.28 \\
+  & 26.71\,M & 165.88\,G & 4.28 & 0.21 \\
 D-LinkNet \cite{zhou2018dlinknet}
   & 80.14 & 82.54 & 80.20 & 67.82 & 72.56 & 70.08 & 70.06 & 56.87
-  & 31.10\,M & 134.34\,G & 4.73 \\
+  & 31.10\,M & 134.34\,G & 4.73 & 0.22 \\
 UPerNet+Swin-T \cite{liu2021swin}
   & 81.46 & 82.10 & 80.62 & 68.81 & 73.40 & 70.54 & 70.67 & 58.42
-  & 21.82\,M & 125.97\,G & 5.53 \\
+  & 121.22\,M & 1194.64\,G & 20.54 & 1.87 \\
 UPerNet+ConvNeXt \cite{liu2022convnext}
   & 81.52 & 82.65 & 80.79 & 68.93 & 73.38 & 70.62 & 70.70 & 58.40
-  & 121.22\,M & 1194.64\,G & 20.54 \\
+  & 122.04\,M & 1174.83\,G & 20.60 & 1.95 \\
 NL-LinkNet \cite{wang2021nllinknet}
   & 80.31 & 82.65 & 80.46 & 68.59 & 73.09 & 71.59 & 70.99 & 58.18
-  & 122.04\,M & 1174.83\,G & 20.60 \\
+  & 21.82\,M & 125.97\,G & 5.53 & 0.34 \\
 MACU-Net \cite{li2021macunet}
   & 79.68 & 80.94 & 79.28 & 67.46 & 73.04 & 70.33 & 70.51 & 58.18
-  & 5.15\,M & 134.34\,G & 8.43 \\
+  & 5.15\,M & 134.34\,G & 8.43 & 0.66 \\
 DBRANet \cite{dbranet}
   & 81.52 & 82.30 & 80.99 & 68.95 & 73.41 & 70.60 & 70.89 & 58.34
-  & 47.67\,M & 212.70\,G & 7.57 \\
+  & 47.67\,M & 212.70\,G & 7.57 & 0.41 \\
 SGCN \cite{sgcn}
   & 81.61 & 82.30 & 81.04 & 68.99 & 73.50 & 70.49 & 70.91 & 58.45
-  & 43.91\,M & 411.45\,G & 21.68 \\
+  & 43.91\,M & 411.45\,G & 21.68 & 4.45 \\
 RCFSNet \cite{rcfsnet}
   & 80.93 & 83.42 & 81.12 & 69.27 & 73.09 & 71.14 & 71.03 & 58.46
-  & 58.23\,M & 729.17\,G & 11.95 \\
+  & 58.23\,M & 729.17\,G & 11.95 & 0.45 \\
 CARNet \cite{carnet}
   & 80.93 & 83.42 & 81.12 & 69.27 & 72.40 & 72.23 & 71.15 & 58.46
-  & 56.85\,M & 236.77\,G & 7.44 \\
+  & 56.85\,M & 236.77\,G & 7.44 & 0.32 \\
 MSMDFFNet \cite{msmdffnet}
   & 81.62 & 82.82 & 81.20 & 69.68 & 73.18 & 71.28 & 70.96 & 58.98
-  & 39.26\,M & 598.40\,G & 15.24 \\
+  & 39.26\,M & 598.40\,G & 15.24 & 0.47 \\
 StripUnet \cite{stripunet}
   & 81.53 & 83.33 & 82.03 & 69.45 & 73.39 & \underline{72.99} & 71.30 & 59.14
-  & 57.98\,M & 252.22\,G & 13.51 \\
+  & 57.98\,M & 252.22\,G & 13.51 & 0.62 \\
 WeavingUnet \cite{weavingunet}
   & \textbf{83.10} & \underline{83.51} & \underline{82.73} & \underline{71.44}
   & \underline{73.92} & \textbf{73.30} & \underline{72.52} & \underline{61.01}
-  & 187.71\,M & 295.66\,G & 14.95 \\
+  & 182.71\,M & 295.66\,G & 14.95 & 0.68 \\
 \midrule
 \textbf{DBR-Net (ours)}
   & \underline{81.72} & \textbf{87.51} & \textbf{84.02} & \textbf{72.19}
   & \textbf{76.52} & 72.96 & \textbf{74.21} & \textbf{61.76}
-  & 22.35\,M & 90.38\,G & 4.04 \\
+  & 22.35\,M & 90.38\,G & 4.04 & 0.06 \\
 \bottomrule
 \end{tabular}%
 }
@@ -1256,9 +1260,11 @@ benchmark: WeavingUnet reports 83.10\%, 1.38 points above the 81.72\%
 achieved by DBR-Net, indicating that part of the recall gain trades off
 against a higher false-positive rate on DeepGlobe. DBR-Net reaches this
 accuracy with 22.35\,M stored parameters after re-parameterization, against
-187.71\,M for WeavingUnet, and at 90.38\,GMACs and 4.04\,GiB peak memory at
+182.71\,M for WeavingUnet, and at 90.38\,GMACs and 4.04\,GiB peak memory at
 $1024\times1024$ resolution, both markedly below the corresponding
-WeavingUnet figures in Table~\ref{tab:sota}.
+WeavingUnet figures in Table~\ref{tab:sota}. The reported inference time is
+likewise lower, 0.06\,s against 0.68\,s for WeavingUnet, although the two
+values are not confirmed to have been measured on the same hardware.
 
 The pattern differs between the two benchmarks. On DeepGlobe, whose
 0.5\,m/pixel imagery and larger share of narrow rural and unpaved roads make
