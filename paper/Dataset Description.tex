@@ -1,0 +1,245 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage[hidelinks]{hyperref}
+\usepackage{xurl}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{5pt}
+\setlist[itemize]{leftmargin=1.6em,itemsep=2pt,topsep=3pt}
+
+\begin{document}
+
+\begin{center}
+{\Large\bfseries DATASET DESCRIPTION}
+\end{center}
+
+This document describes the two public road-extraction datasets used to train
+and evaluate DBR-Net: the Massachusetts Roads Dataset and the DeepGlobe Road
+Extraction Dataset. Both datasets formulate road extraction as binary semantic
+segmentation, but they differ in spatial resolution, geographical coverage,
+scene composition, and annotation characteristics.
+
+\section{Massachusetts Roads Dataset}
+
+\textbf{Dataset source:} A public aerial-image dataset introduced by Volodymyr
+Mnih in 2013 and distributed through the University of Toronto. The copy used
+in this study was obtained from the Kaggle mirror listed in Section~\ref{sec:data-availability}.
+
+\subsection{Overview of the Dataset}
+
+The Massachusetts Roads Dataset is a widely used benchmark for extracting road
+networks from high-resolution aerial imagery. It covers urban, suburban, and
+rural areas across Massachusetts, USA. Each input image is paired with a binary
+target map in which road pixels form the foreground class and all remaining
+pixels form the background class. The large native images and the mixture of
+dense street networks, major roads, and narrow local roads make the dataset
+suitable for evaluating both regional road coverage and fine-structure recovery.
+
+\subsection{Dataset Composition}
+
+\begin{itemize}
+  \item \textbf{Total size:} 1,171 aerial image--mask pairs.
+  \item \textbf{Official training split:} 1,108 image--mask pairs.
+  \item \textbf{Official validation split:} 14 image--mask pairs.
+  \item \textbf{Official test split:} 49 image--mask pairs.
+  \item \textbf{Image size:} $1500\times1500$ pixels.
+  \item \textbf{Spatial resolution:} approximately 1~m/pixel.
+  \item \textbf{Geographical coverage:} more than 2,600~km$^2$.
+  \item \textbf{Data type:} three-channel optical aerial imagery with binary
+        road target maps generated from vector road data.
+  \item \textbf{Task:} pixel-level binary semantic segmentation of roads and
+        background.
+\end{itemize}
+
+\subsection{Image and Annotation Characteristics}
+
+\begin{itemize}
+  \item \textbf{Scene diversity:} The images include dense residential areas,
+        suburban neighbourhoods, highways, intersections, vegetation, water
+        bodies, and sparsely developed regions.
+  \item \textbf{Road morphology:} Road networks contain long linear segments,
+        curved streets, junctions, loops, and narrow branches at multiple
+        orientations and scales.
+  \item \textbf{Occlusion and ambiguity:} Trees, buildings, shadows, and vehicles
+        can obscure road surfaces, while rivers, roofs, and other elongated
+        structures may resemble roads locally.
+  \item \textbf{Class imbalance:} Road pixels occupy a substantially smaller
+        image area than background pixels.
+  \item \textbf{Native-image challenge:} The $1500\times1500$ resolution requires
+        a model to preserve fine details while retaining sufficient contextual
+        information over a large field of view.
+\end{itemize}
+
+\subsection{Use in the Present Study}
+
+\begin{itemize}
+  \item \textbf{Benchmark role:} Massachusetts Roads serves as the first
+        benchmark for training and evaluating DBR-Net and the comparison models.
+  \item \textbf{Training input:} Training uses random $1024\times1024$ crops from
+        the native images.
+  \item \textbf{Data augmentation:} Random horizontal and vertical flips,
+        rotations by $90^{\circ}$, $180^{\circ}$, or $270^{\circ}$, and random
+        scaling with a factor sampled from $[0.75,1.0]$ are applied.
+  \item \textbf{Centerline supervision:} Auxiliary centerline targets are
+        generated from the binary masks by tensor-based morphological thinning
+        before downsampling; they are not separate annotations supplied by the
+        dataset.
+  \item \textbf{Evaluation:} Predictions are binarised at a threshold of 0.5.
+        Precision, recall, F1-score, and road-class intersection over union (IoU)
+        are computed from pixel-level confusion statistics.
+\end{itemize}
+
+\subsection{Dataset Strengths and Limitations}
+
+\begin{itemize}
+  \item \textbf{Strengths:} The dataset provides public pixel-level targets,
+        large native images, varied road layouts, and a standard split that
+        supports comparison with previous road-extraction studies.
+  \item \textbf{Limitations:} Its geographical coverage is restricted to one US
+        state, and the rasterized road labels may not represent the exact visible
+        width of every road surface. Results on this dataset alone therefore do
+        not establish generalisation to other countries, sensors, or annotation
+        conventions.
+\end{itemize}
+
+\section{DeepGlobe Road Extraction Dataset}
+
+\textbf{Dataset source:} The road-extraction track of the DeepGlobe 2018
+Satellite Image Understanding Challenge. The copy used in this study was
+obtained from the Kaggle mirror listed in Section~\ref{sec:data-availability}.
+
+\subsection{Overview of the Dataset}
+
+The DeepGlobe Road Extraction Dataset was developed for large-scale road
+segmentation from satellite imagery. It contains geographically diverse scenes
+from Thailand, Indonesia, and India and includes urban, suburban, rural, and
+agricultural environments. Unlike centerline-only annotations, its binary masks
+label the visible road area at the pixel level. The variation in road material,
+density, surrounding land cover, and illumination makes DeepGlobe a challenging
+benchmark for testing model robustness across heterogeneous scenes.
+
+\subsection{Dataset Composition}
+
+\begin{itemize}
+  \item \textbf{Total size:} 8,570 RGB satellite images.
+  \item \textbf{Original challenge split:} 6,226 training images, 1,243
+        validation images, and 1,101 test images.
+  \item \textbf{Publicly labelled subset:} 6,226 training image--mask pairs in
+        the commonly distributed release; the original validation and test
+        labels are not included in that release.
+  \item \textbf{Image size:} $1024\times1024$ pixels.
+  \item \textbf{Spatial resolution:} approximately 0.5~m/pixel.
+  \item \textbf{Geographical coverage:} approximately 2,220~km$^2$.
+  \item \textbf{Data type:} three-channel RGB satellite imagery with binary
+        pixel-level road masks.
+  \item \textbf{Class distribution:} Road pixels account for approximately
+        4.5\% of the original training split, illustrating the strong foreground
+        imbalance of the task.
+\end{itemize}
+
+\subsection{Image and Annotation Characteristics}
+
+\begin{itemize}
+  \item \textbf{Geographical diversity:} Samples cover multiple countries and
+        include urban, suburban, rural, agricultural, forested, and coastal
+        environments.
+  \item \textbf{Road diversity:} The dataset contains paved and unpaved roads,
+        highways, local streets, intersections, and road networks with widely
+        varying density and width.
+  \item \textbf{Pixel-level road areas:} The masks delineate road surfaces rather
+        than only their centerlines, enabling direct road-area segmentation.
+  \item \textbf{Challenging appearance:} Illumination changes, vegetation,
+        shadows, low-contrast unpaved roads, and visually similar non-road
+        structures increase ambiguity.
+  \item \textbf{Foreground imbalance:} Most pixels belong to the background,
+        making foreground-sensitive metrics such as road IoU and F1-score more
+        informative than overall pixel accuracy alone.
+\end{itemize}
+
+\subsection{Use in the Present Study}
+
+\begin{itemize}
+  \item \textbf{Benchmark role:} DeepGlobe serves as the second benchmark for
+        evaluating DBR-Net under broader geographical and scene variation.
+  \item \textbf{Reproducible labelled split:} The 6,226 labelled pairs are
+        shuffled with seed 3407. Exactly 5,000 samples are used for training and
+        the remaining 1,226 samples form the full test holdout. The first 300
+        samples of this holdout are also used for validation and remain within
+        the reported 1,226-image test set.
+  \item \textbf{Model-selection dependency:} Because the 300-image validation
+        subset is contained in the test holdout, the DeepGlobe test score is not
+        fully independent of model selection. This dependency must be considered
+        when interpreting the result.
+  \item \textbf{Training input:} The native image size is
+        $1024\times1024$ pixels, matching the training crop size used in the main
+        experiments.
+  \item \textbf{Training and evaluation:} The same augmentation operations,
+        optimisation policy, decision threshold, and pixel-level metrics are
+        applied to DBR-Net and all comparison models.
+\end{itemize}
+
+\subsection{Dataset Strengths and Limitations}
+
+\begin{itemize}
+  \item \textbf{Strengths:} DeepGlobe offers large-scale, geographically varied
+        satellite imagery and pixel-level road-area annotations covering diverse
+        road surfaces and scene types.
+  \item \textbf{Limitations:} Public labels are concentrated in the original
+        training portion, which requires a custom split for reproducible local
+        evaluation. The present study's overlapping validation and test protocol
+        also introduces a model-selection dependency.
+\end{itemize}
+
+\section{Comparative Summary}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}lXX@{}}
+\toprule
+\textbf{Property} & \textbf{Massachusetts Roads} & \textbf{DeepGlobe Roads} \\
+\midrule
+Image modality & RGB aerial imagery & RGB satellite imagery \\
+Native size & $1500\times1500$ pixels & $1024\times1024$ pixels \\
+Spatial resolution & Approximately 1~m/pixel & Approximately 0.5~m/pixel \\
+Total images & 1,171 & 8,570 \\
+Geographical scope & Massachusetts, USA & Thailand, Indonesia, and India \\
+Road annotation & Binary rasterized road target maps & Binary road-surface masks \\
+Primary challenge & Large scenes and fine road structures & Cross-region and
+appearance diversity \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Together, the datasets provide complementary evaluation conditions. The
+Massachusetts Roads Dataset tests extraction from large aerial tiles within a
+consistent regional domain, whereas DeepGlobe tests robustness to broader
+geographical, environmental, and road-surface variation.
+
+\section{Data Availability}
+\label{sec:data-availability}
+
+The dataset copies used in this study are publicly accessible through Kaggle:
+
+\begin{itemize}
+  \item Massachusetts Roads Dataset:\newline
+        \url{https://www.kaggle.com/datasets/balraj98/massachusetts-roads-dataset}
+  \item DeepGlobe Road Extraction Dataset:\newline
+        \url{https://www.kaggle.com/datasets/balraj98/deepglobe-road-extraction-dataset}
+\end{itemize}
+
+The original Massachusetts Roads Dataset and its citation information are
+available from the University of Toronto at
+\url{https://www.cs.utoronto.ca/~vmnih/data/}. The DeepGlobe dataset is described
+in I. Demir et al., ``DeepGlobe 2018: A Challenge to Parse the Earth Through
+Satellite Images,'' \textit{Proceedings of the IEEE/CVF Conference on Computer
+Vision and Pattern Recognition Workshops}, 2018, pp.~172--181,
+\url{https://openaccess.thecvf.com/content_cvpr_2018_workshops/html/Demir_DeepGlobe_2018_A_CVPR_2018_paper.html}.
+
+\end{document}
