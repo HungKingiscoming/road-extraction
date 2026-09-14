@@ -1160,11 +1160,12 @@ Section~\ref{subsec:limitations} returns to.
 Massachusetts road extraction datasets. Values for methods other than
 DBR-Net are as reported by WeavingUnet~\cite{weavingunet}. Params, FLOPs
 (GMACs), and peak memory (GiB) are measured at $1024\times1024$ input
-resolution; the hardware used for the inference time of methods other than
-DBR-Net is not stated in that source. DBR-Net inference time is the
-single-image FP32 deploy-form latency of Section~\ref{subsec:efficiency},
-measured on a Tesla T4 GPU, and is not necessarily measured on the same
-hardware as the other methods.}
+resolution. The WeavingUnet inference-time column is the per-image wall
+clock of the released \texttt{test\_one\_img\_from\_path\_8} loop (four
+sequential forward passes at batch size 2, i.e.\ eight TTA views per
+image); DBR-Net inference time is measured under the same protocol
+(Section~\ref{subsec:efficiency}) on a Tesla T4 GPU, though the GPU used
+for the other methods is not stated in that source.}
 \label{tab:sota}
 \resizebox{\textwidth}{!}{%
 \begin{tabular}{lcccccccccccc}
@@ -1223,7 +1224,7 @@ WeavingUnet \cite{weavingunet}
 \textbf{DBR-Net (ours)}
   & \underline{81.72} & \textbf{87.51} & \textbf{84.02} & \textbf{72.19}
   & \textbf{76.52} & 72.96 & \textbf{74.21} & \textbf{61.76}
-  & 22.35\,M & 90.38\,G & 4.04 & 0.06 \\
+  & 22.35\,M & 90.38\,G & 4.04 & [PROFILE] \\
 \bottomrule
 \end{tabular}%
 }
@@ -1262,9 +1263,11 @@ against a higher false-positive rate on DeepGlobe. DBR-Net reaches this
 accuracy with 22.35\,M stored parameters after re-parameterization, against
 182.71\,M for WeavingUnet, and at 90.38\,GMACs and 4.04\,GiB peak memory at
 $1024\times1024$ resolution, both markedly below the corresponding
-WeavingUnet figures in Table~\ref{tab:sota}. The reported inference time is
-likewise lower, 0.06\,s against 0.68\,s for WeavingUnet, although the two
-values are not confirmed to have been measured on the same hardware.
+WeavingUnet figures in Table~\ref{tab:sota}. [VERIFY: report DBR-Net
+inference time once measured under the eight-view
+\texttt{test\_one\_img\_from\_path\_8} protocol (Section~\ref{subsec:efficiency})
+against WeavingUnet's 0.68\,s, noting that the GPU used for the WeavingUnet
+figure is not confirmed.]
 
 The pattern differs between the two benchmarks. On DeepGlobe, whose
 0.5\,m/pixel imagery and larger share of narrow rural and unpaved roads make

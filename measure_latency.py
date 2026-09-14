@@ -1,14 +1,28 @@
-"""Single-image inference latency benchmark for DualBranchRoadNet.
+"""Inference latency benchmark for DualBranchRoadNet.
 
 Companion to compare_reparameterization.py, which measures Params/GMACs/Peak
 memory but not latency. This script reuses its checkpoint-loading and
-deploy-conversion logic so all three numbers in Table~\\ref{tab:efficiency}
-come from a consistent model instance.
+deploy-conversion logic so all numbers in Table~\\ref{tab:efficiency} come
+from a consistent model instance.
 
-Protocol: FP32, eval mode, single-image (B=1) forward at 1024x1024, no TTA --
-matching the "FLOPs path" already described in the paper
-(one B=1 forward, no TTA), so GMACs and latency are measured under the same
-input shape and batch size.
+Two protocols are offered:
+
+  single   -- FP32, eval mode, one B=1 forward at 1024x1024, no TTA. Matches
+              the GMAC-measurement path in compare_reparameterization.py, but
+              is NOT what the released WeavingUnet test code times.
+
+  weaving8 -- Reproduces the actual loop in the released testmassa.py /
+              testdg.py: WeavingUnet's `test_one_img_from_path_8` runs FOUR
+              sequential forward passes at batch size 2 (8 augmented TTA
+              views for one logical image), each followed by a
+              .cpu().data.numpy() transfer, then combines the four masks
+              with the same flip/rotate numpy ops before the (per-image) wall
+              clock in their test scripts advances. That per-image loop is
+              what their Table-5 "Inference time" column measures, so a
+              direct comparison against DBR-Net requires timing the same
+              4x-forward-pass, 8-view pattern rather than a bare B=1 forward.
+              Disk I/O (cv2.imread/imwrite) is excluded here since it is
+              filesystem-bound and not representative of model compute.
 """
 from __future__ import annotations
 
@@ -24,7 +38,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from compare_reparameterization import load_training_model, main_logits
+from compare_reparameterization import (
+    load_training_model,
+    main_logits,
+    make_weaving_tta_batches,
+)
 
 
 @torch.inference_mode()
@@ -73,6 +91,74 @@ def measure_latency(
     }
 
 
+def measure_latency_weaving8(
+    model_cpu: nn.Module,
+    height: int,
+    width: int,
+    device: torch.device,
+    warmup: int,
+    iters: int,
+    use_data_parallel: bool,
+) -> Dict[str, float]:
+    """Time the released test_one_img_from_path_8 pattern: 4x forward(B=2).
+
+    Deliberately NOT wrapped in torch.inference_mode()/no_grad(): the
+    released test code does not disable autograd either (see the docstring
+    of compare_reparameterization.weaving_memory_once for the same choice).
+    """
+    if device.type != "cuda":
+        raise RuntimeError("weaving8 latency benchmark requires CUDA")
+
+    model = model_cpu.to(device)
+    model.eval()
+    if use_data_parallel:
+        model = torch.nn.DataParallel(model, device_ids=[device.index or 0])
+
+    def one_pass() -> None:
+        img1, img2, img3, img4 = make_weaving_tta_batches(height, width, device)
+        maska = main_logits(model(img1)).squeeze().cpu().data.numpy()
+        maskb = main_logits(model(img2)).squeeze().cpu().data.numpy()
+        maskc = main_logits(model(img3)).squeeze().cpu().data.numpy()
+        maskd = main_logits(model(img4)).squeeze().cpu().data.numpy()
+        try:
+            mask1 = maska + maskb[:, ::-1] + maskc[:, :, ::-1] + maskd[:, ::-1, ::-1]
+            _ = mask1[0] + np.rot90(mask1[1])[::-1, ::-1]
+        except Exception:
+            # Output shape may differ from WeavingUnet (two-class logits);
+            # the four forwards are already timed, so this does not
+            # invalidate the measurement.
+            pass
+
+    for _ in range(warmup):
+        one_pass()
+    torch.cuda.synchronize(device)
+
+    timings_ms: List[float] = []
+    for _ in range(iters):
+        torch.cuda.synchronize(device)
+        start = time.perf_counter()
+        one_pass()
+        torch.cuda.synchronize(device)
+        timings_ms.append((time.perf_counter() - start) * 1000.0)
+
+    model_cpu.to("cpu")
+    del model
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    arr = np.asarray(timings_ms, dtype=np.float64)
+    return {
+        "iters": iters,
+        "warmup": warmup,
+        "mean_ms": float(arr.mean()),
+        "std_ms": float(arr.std()),
+        "median_ms": float(np.median(arr)),
+        "min_ms": float(arr.min()),
+        "max_ms": float(arr.max()),
+        "throughput_img_per_s": float(1000.0 / arr.mean()),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -84,6 +170,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument(
+        "--protocol",
+        choices=("single", "weaving8"),
+        default="weaving8",
+        help=(
+            "single: one B=1 forward, no TTA (matches the GMAC path, NOT "
+            "comparable to WeavingUnet's published Table-5 inference time). "
+            "weaving8: the released test_one_img_from_path_8 pattern (4x "
+            "forward at B=2, 8 TTA views/image) -- use this for a fair "
+            "comparison against Table~\\ref{tab:sota}."
+        ),
+    )
+    parser.add_argument(
+        "--data-parallel",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="weaving8 only: match released code, which wraps the model in DataParallel",
+    )
     parser.add_argument(
         "--form",
         choices=("deploy", "multi", "both"),
@@ -113,11 +217,18 @@ def main() -> None:
     deploy_model.eval()
 
     print("=" * 88)
-    print("LATENCY BENCHMARK (single-image, FP32, no TTA)")
+    print(f"LATENCY BENCHMARK (protocol={args.protocol})")
     print(f"Checkpoint : {checkpoint_path}")
     print(f"Weights    : {args.weights} | epoch={checkpoint.get('epoch')}")
     print(f"GPU        : {torch.cuda.get_device_name(device)}")
-    print(f"Input      : 1x3x{args.height}x{args.width} | FP32 | eval mode")
+    if args.protocol == "single":
+        print(f"Input      : 1x3x{args.height}x{args.width} | FP32 | eval mode | no TTA")
+    else:
+        print(
+            f"Input      : 2x3x{args.height}x{args.width} x4 forwards "
+            f"(8 TTA views/image) | FP32 | eval mode | "
+            f"DataParallel={args.data_parallel}; autograd=ON"
+        )
     print(f"Warmup     : {args.warmup} iters | Timed: {args.iters} iters")
 
     selected: List[Tuple[str, nn.Module]] = []
@@ -130,13 +241,19 @@ def main() -> None:
         "checkpoint": str(checkpoint_path),
         "checkpoint_epoch": checkpoint.get("epoch"),
         "weights": args.weights,
+        "protocol": args.protocol,
         "gpu": torch.cuda.get_device_name(device),
         "input": [1, 3, args.height, args.width],
         "forms": {},
     }
 
     for label, model in selected:
-        stats = measure_latency(model, args.height, args.width, device, args.warmup, args.iters)
+        if args.protocol == "single":
+            stats = measure_latency(model, args.height, args.width, device, args.warmup, args.iters)
+        else:
+            stats = measure_latency_weaving8(
+                model, args.height, args.width, device, args.warmup, args.iters, args.data_parallel
+            )
         result["forms"][label] = stats
         print("-" * 88)
         print(label)
@@ -148,7 +265,16 @@ def main() -> None:
         print(f"Throughput   : {stats['throughput_img_per_s']:.2f} img/s")
 
     print("=" * 88)
-    print("For Table 5, use DEPLOY latency (mean, ms) at B=1, 1024x1024, FP32.")
+    if args.protocol == "weaving8":
+        print(
+            "For Table 5, use DEPLOY weaving8 latency (mean, ms/image) -- this "
+            "matches WeavingUnet's released test_one_img_from_path_8 timing loop."
+        )
+    else:
+        print(
+            "single-protocol latency is NOT comparable to WeavingUnet's "
+            "published Table-5 inference time; use --protocol weaving8 for that."
+        )
 
     if args.json_out:
         out = Path(args.json_out)
