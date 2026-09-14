@@ -165,10 +165,45 @@ The network is designed to preserve thin road structures while still using large
 Training combines:
 
 - weighted cross-entropy for class imbalance
-- Dice loss for region coverage
-- centerline Tversky loss for topological connectivity
+- soft clDice (Shit et al., CVPR 2021) for topological connectivity — no separate area-based Dice term on the main output
+- an auxiliary CE + Dice loss on a lightweight S16 semantic head, ramped in after a warmup
 
 This helps the model recover thin roads and maintain continuity between distant segments.
+
+**(a) Weighted CE** on the road/background classes —
+
+$$\text{imbalance} = \frac{N_{\text{background}}}{N_{\text{road}}}, \qquad w_{\text{road}} = \min\!\left(\sqrt{\text{imbalance}},\ \text{cap}\right)$$
+
+with `--road_weight_cap` defaulting to 2.0. Rank 0 scans every training mask and
+broadcasts the result to the other ranks. Skip the scan entirely with
+`--fixed_road_weight`.
+
+**(b) Soft clDice** — the main topological contribution. This replaces the
+older centerline-Tversky auxiliary head (which needed a separate S4
+skeleton-prediction head and `--centerline_alpha`/`--centerline_beta`/
+`--centerline_dilation`); that head has been removed from the decoder.
+
+- `soft_skeletonize` performs morphological thinning using only `max_pool2d`
+  (erode = `-maxpool(-x)`, dilate = `maxpool(x)`, open = dilate∘erode), iterating
+  `--skeleton_iterations` times (default 8).
+- Unlike the old centerline target, both the *prediction* and the target are
+  skeletonized every step, and the prediction's skeleton carries gradients.
+- `--cldice_downsample` (default 4) shrinks the map with avg/max pooling before
+  skeletonizing to cut compute; set to 1 to skeletonize at full resolution.
+- The main loss is exactly CE + `--cldice_weight` (default 0.5) * clDice — no
+  separate Dice term. clDice constrains topology, not area, so watch fixed@.50
+  road IoU during training: if it stalls while F1/relaxed-F1 keep improving,
+  that's thin/mis-shaped-but-connected predictions, and raising `cldice_weight`
+  won't fix it — a Dice/Tversky term would need to come back.
+
+**(c) S16 semantic auxiliary** — a lightweight CE + Dice loss
+(`--semantic_aux_dice_weight`, default 0.5) on the semantic branch's S16
+feature, supervised against a max-pooled downsample of the target. Disabled
+before `--aux_start_epoch` (5), then ramped linearly over `--aux_warmup_epochs`
+(5) up to `--aux_weight` (0.15). This gives the semantic stream a direct
+incentive to become road-discriminative on its own, since cross-branch gate
+statistics showed the semantic->detail exchange dominating the reverse
+direction.
 
 ## Evaluation
 
@@ -260,35 +295,6 @@ This project is intended for research and experimentation in remote sensing road
 ## License
 
 This repository does not include an explicit license file in the workspace snapshot. Please check the project source or institutional repository policy before reuse or redistribution.
-
-
-$$\text{imbalance} = \frac{N_{\text{background}}}{N_{\text{road}}}, \qquad w_{\text{road}} = \min\!\left(\sqrt{\text{imbalance}},\ \text{cap}\right)$$
-
-with `--road_weight_cap` defaulting to 2.0. Rank 0 scans every training mask and
-broadcasts the result to the other ranks. Skip the scan entirely with
-`--fixed_road_weight`.
-
-**(b) Binary Dice** on the road probability — stabilizes gradients when the positive
-class is rare.
-
-**(c) Centerline Tversky** — the main topological contribution:
-
-- **Centerline targets are generated without any external library:**
-  `soft_skeletonize` performs morphological thinning using only `max_pool2d`
-  (erode = `-maxpool(-x)`, dilate = `maxpool(x)`, open = dilate∘erode), iterating
-  `--skeleton_iterations` times (default 8).
-- **Skeletonize BEFORE downsampling** — max-pooling the mask straight down to S4
-  would merge narrow branches and intersections.
-- Dilate slightly (`--centerline_dilation 1`), then `adaptive_max_pool` to S4 to
-  match the auxiliary head.
-- Tversky with $\alpha = 0.30 < \beta = 0.70$ **penalizes false negatives more
-  heavily**, i.e. it penalizes **broken roads** more than spurious ones — exactly the
-  connectivity objective.
-- **Ramp-up schedule:** disabled entirely before `--aux_start_epoch` (5), then ramped
-  linearly over `--aux_warmup_epochs` (5) up to `--aux_weight` (0.15). The centerline
-  branch is only meaningful once the coarse mask is roughly correct.
-- `--fast_centerline_target` skeletonizes at an intermediate S2 resolution (cheaper),
-  rescaling the iteration count and dilation radius accordingly.
 
 ---
 
