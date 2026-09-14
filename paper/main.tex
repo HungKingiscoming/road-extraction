@@ -1320,16 +1320,19 @@ during inference.
 
 \begin{table}[pos=t]
 \caption{Cost of the current training-time and deployment-time forms at
-$1024\times1024$ input resolution, measured under the WeavingUnet-compatible
-protocol of Section~\ref{subsec:metrics} (FP32, single-image forward for
-GMACs, and the 8-view TTA path for peak allocated memory).}
+$1024\times1024$ input resolution. Params, GMACs, and peak allocated memory
+follow the WeavingUnet-compatible protocol of Section~\ref{subsec:metrics}
+(FP32, single-image forward for GMACs, and the 8-view TTA path for peak
+memory). Latency is measured separately as the mean single-image (B=1) FP32
+forward time over 100 timed iterations after 20 warmup iterations, on the
+same GPU and checkpoint.}
 \label{tab:efficiency}
 \begin{tabular*}{\tblwidth}{@{}LRRRR@{}}
 \toprule
 Form & Params (M) & GMACs & Latency (ms) & Peak VRAM (MiB) \\
 \midrule
-Training (multi-branch) & 22.392 & 90.83 & [PROFILE] & 4847 \\
-Deploy (fused)          & 22.353 & 90.38 & [PROFILE] & 4138 \\
+Training (multi-branch) & 22.392 & 90.83 & 76.08 & 4847 \\
+Deploy (fused)          & 22.353 & 90.38 & 63.98 & 4138 \\
 \bottomrule
 \end{tabular*}
 \end{table}
@@ -1338,7 +1341,9 @@ The re-parameterized deploy form reduces compute by 0.44 GMACs and peak
 allocated memory by 0.69 GiB (709 MiB) relative to the training-time
 multi-branch form, consistent with folding the RepVGG and RepDepthwise
 branches into single convolutions rather than changing the represented
-function.
+function. Single-image latency on a Tesla T4 GPU falls from 76.08\,ms to
+63.98\,ms, a reduction of 12.11\,ms (15.9\%), corresponding to a throughput
+increase from 13.14 to 15.63 images per second.
 
 The re-parameterization is algebraic: batch normalization is folded into its
 preceding convolution, compatible kernels are padded to a common support, and
@@ -1346,9 +1351,8 @@ the branch kernels and biases are summed. A RepVGGBlock becomes one dense
 $3\times3$ convolution. In a RepDepthwiseBlock the $3\times3$,
 $1\times5$, $5\times1$, and identity spatial branches become one depthwise
 $5\times5$ convolution, followed by the existing pointwise $1\times1$
-convolution. Latency should still be profiled on the final V4 checkpoint;
-the WeavingUnet-compatible benchmark used for GMACs and memory does not
-measure inference latency.
+convolution. The latency reduction is consistent with this algebraic
+collapse rather than with any change to the represented function.
 
 \subsection{Qualitative analysis}
 \label{subsec:qualitative}
