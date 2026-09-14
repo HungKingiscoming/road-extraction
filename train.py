@@ -1661,6 +1661,34 @@ def parse_args() -> argparse.Namespace:
             "spatial adds lightweight location-adaptive gates in both directions"
         ),
     )
+    parser.add_argument(
+        "--ablate_dappm",
+        action="store_true",
+        help=(
+            "Component-ablation flag: skip ProgressiveDAPPM entirely. The "
+            "semantic stream keeps only its pretrained stride-16 feature, "
+            "with no stride-32 context injected"
+        ),
+    )
+    parser.add_argument(
+        "--ablate_detail_refinement",
+        action="store_true",
+        help=(
+            "Component-ablation flag: remove both detail-stream RepVGG "
+            "stages, the semantic-to-detail guidance, and strip pooling. "
+            "The detail branch is reduced to the raw S8 projection. This "
+            "implies --ablate_strip_pooling"
+        ),
+    )
+    parser.add_argument(
+        "--ablate_strip_pooling",
+        action="store_true",
+        help=(
+            "Component-ablation flag: skip only the strip-pooling module, "
+            "keeping both detail RepVGG stages and the semantic-to-detail "
+            "guidance"
+        ),
+    )
     parser.add_argument("--decoder_s4_channels", type=int, default=64)
     parser.add_argument("--decoder_s2_channels", type=int, default=32)
     parser.add_argument("--full_channels", type=int, default=24)

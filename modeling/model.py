@@ -361,6 +361,9 @@ class DualResolutionContext(nn.Module):
         fusion_blocks: int = 1,
         bilateral_fusion: str = "spatial",
         deploy: bool = False,
+        ablate_dappm: bool = False,
+        ablate_detail_refinement: bool = False,
+        ablate_strip_pooling: bool = False,
     ) -> None:
         super().__init__()
         if len(detail_blocks) != 2:
@@ -372,51 +375,65 @@ class DualResolutionContext(nn.Module):
             )
         self.bilateral_fusion = bilateral_fusion
 
+        # Ablation switches for the component study in Section~\ref{subsec:ablation}.
+        # ablate_detail_refinement removes both RepVGG stages, the
+        # semantic-to-detail guidance, and strip pooling, so it implies
+        # ablate_strip_pooling; kept as a separate flag only for reporting.
+        self.ablate_dappm = bool(ablate_dappm)
+        self.ablate_detail_refinement = bool(ablate_detail_refinement)
+        self.ablate_strip_pooling = (
+            bool(ablate_strip_pooling) or self.ablate_detail_refinement
+        )
+
         # Persistent S8 road-detail stream.
         self.detail_projection = ConvBNAct(128, detail_channels, 1, padding=0)
-        self.detail_stages = nn.ModuleList(
-            _rep_stage(detail_channels, depth, deploy)
-            for depth in detail_blocks
-        )
+        if not self.ablate_detail_refinement:
+            self.detail_stages = nn.ModuleList(
+                _rep_stage(detail_channels, depth, deploy)
+                for depth in detail_blocks
+            )
 
         # Pretrained ResNet layer4 supplies S32 semantic context.  Keep the
         # historical key name for checkpoint compatibility.
         _ = semantic_blocks
-        self.semantic_projection = ConvBNAct(
-            512, semantic_channels, 1, padding=0
-        )
-
-        # Keep Semantic -> Detail exactly as in the successful runs.
-        self.semantic_to_detail_1 = ConvBNAct(
-            256, detail_channels, 1, padding=0, activation=False
-        )
-        self.semantic_to_detail_scale_1 = nn.Parameter(
-            torch.full((1, detail_channels, 1, 1), 0.10)
-        )
-        if bilateral_fusion == "spatial":
-            self.semantic_to_detail_spatial_gate_1 = ResidualSpatialGate(
-                detail_channels,
-                detail_channels,
-                hidden_channels=max(16, min(64, detail_channels // 2)),
+        if not self.ablate_dappm:
+            self.semantic_projection = ConvBNAct(
+                512, semantic_channels, 1, padding=0
             )
 
+        # Keep Semantic -> Detail exactly as in the successful runs.
+        if not self.ablate_detail_refinement:
+            self.semantic_to_detail_1 = ConvBNAct(
+                256, detail_channels, 1, padding=0, activation=False
+            )
+            self.semantic_to_detail_scale_1 = nn.Parameter(
+                torch.full((1, detail_channels, 1, 1), 0.10)
+            )
+            if bilateral_fusion == "spatial":
+                self.semantic_to_detail_spatial_gate_1 = ResidualSpatialGate(
+                    detail_channels,
+                    detail_channels,
+                    hidden_channels=max(16, min(64, detail_channels // 2)),
+                )
+
         # Independent semantic/context route.
-        self.dappm = ProgressiveDAPPM(
-            semantic_channels,
-            dappm_channels,
-            semantic_channels,
-            pool_sizes=dappm_pool_sizes,
-        )
-        self.context_to_s16 = ConvBNAct(
-            semantic_channels,
-            256,
-            1,
-            padding=0,
-            activation=False,
-        )
-        self.context_scale = nn.Parameter(
-            torch.full((1, 256, 1, 1), 0.10)
-        )
+        if not self.ablate_dappm:
+            self.dappm = ProgressiveDAPPM(
+                semantic_channels,
+                dappm_channels,
+                semantic_channels,
+                pool_sizes=dappm_pool_sizes,
+            )
+            self.context_to_s16 = ConvBNAct(
+                semantic_channels,
+                256,
+                1,
+                padding=0,
+                activation=False,
+            )
+            self.context_scale = nn.Parameter(
+                torch.full((1, 256, 1, 1), 0.10)
+            )
 
         # Train-only semantic deep supervision is kept unchanged.
         semantic_aux_hidden = max(32, 256 // 4)
@@ -426,7 +443,8 @@ class DualResolutionContext(nn.Module):
         )
 
         # Road geometry context remains detail-only.
-        self.strip_pooling = StripPoolingModule(detail_channels)
+        if not self.ablate_strip_pooling:
+            self.strip_pooling = StripPoolingModule(detail_channels)
 
         # Dedicated final road-aware fusion.  This is the same proven module
         # from V3: independently normalize both branches, concatenate them,
@@ -465,10 +483,17 @@ class DualResolutionContext(nn.Module):
         Semantic information may guide Detail because this route consistently
         learned a meaningful scale in prior runs.  There is intentionally no
         reverse Detail->Semantic path in V4.
+
+        When ablate_detail_refinement is set, the detail branch is reduced to
+        the raw S8 projection: no RepVGG refinement, no semantic-to-detail
+        guidance, and no strip pooling. This is a combined ablation of the
+        whole detail-refinement pathway, not a single-component removal.
         """
-        detail_before = self.detail_stages[0](
-            self.detail_projection(shared_s8)
-        )
+        detail_before = self.detail_projection(shared_s8)
+        if self.ablate_detail_refinement:
+            return detail_before
+
+        detail_before = self.detail_stages[0](detail_before)
 
         semantic_delta = self._resize(
             self.semantic_to_detail_1(semantic_s16),
@@ -488,7 +513,8 @@ class DualResolutionContext(nn.Module):
             + self.semantic_to_detail_scale_1 * semantic_delta
         )
         detail = self.detail_stages[1](detail)
-        detail = self.strip_pooling(detail)
+        if not self.ablate_strip_pooling:
+            detail = self.strip_pooling(detail)
         return detail
 
     def context_fusion(
@@ -497,17 +523,25 @@ class DualResolutionContext(nn.Module):
         semantic_s16: Tensor,
         semantic_s32: Tensor,
     ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
-        """Gather S32 context and fuse it with the independent detail stream."""
-        context_s32 = self.dappm(
-            self.semantic_projection(semantic_s32)
-        )
-        context_s16 = self._resize(
-            self.context_to_s16(context_s32),
-            semantic_s16.shape[-2:],
-        )
-        semantic = self.activation(
-            semantic_s16 + self.context_scale * context_s16
-        )
+        """Gather S32 context and fuse it with the independent detail stream.
+
+        When ablate_dappm is set, semantic_s32 is left unused and the
+        semantic stream keeps exactly the pretrained stride-16 feature
+        (no S32 context injection).
+        """
+        if self.ablate_dappm:
+            semantic = semantic_s16
+        else:
+            context_s32 = self.dappm(
+                self.semantic_projection(semantic_s32)
+            )
+            context_s16 = self._resize(
+                self.context_to_s16(context_s32),
+                semantic_s16.shape[-2:],
+            )
+            semantic = self.activation(
+                semantic_s16 + self.context_scale * context_s16
+            )
 
         semantic_aux_logits: Optional[Tensor] = None
         if self.training:
@@ -538,12 +572,19 @@ class DualResolutionContext(nn.Module):
 
     @torch.no_grad()
     def gate_statistics(self) -> Dict[str, float]:
-        """Diagnostics for S->D, S32 context, and final road fusion."""
-        gates = {
-            "semantic_to_detail": self.semantic_to_detail_scale_1,
-            "s32_context_to_s16": self.context_scale,
+        """Diagnostics for S->D, S32 context, and final road fusion.
+
+        Entries for an ablated component are simply omitted rather than
+        raising, since its parameters do not exist in that configuration.
+        """
+        gates: Dict[str, Tensor] = {
             "semantic_to_final": self.final_fusion.fusion_scale,
         }
+        if not self.ablate_detail_refinement:
+            gates["semantic_to_detail"] = self.semantic_to_detail_scale_1
+        if not self.ablate_dappm:
+            gates["s32_context_to_s16"] = self.context_scale
+
         statistics: Dict[str, float] = {}
         for name, gate in gates.items():
             detached = gate.detach().float()
@@ -555,12 +596,13 @@ class DualResolutionContext(nn.Module):
             )
 
         if self.bilateral_fusion == "spatial":
-            statistics["semantic_to_detail_spatial_mean"] = float(
-                self.semantic_to_detail_spatial_gate_1.last_mean.cpu()
-            )
-            statistics["semantic_to_detail_spatial_std"] = float(
-                self.semantic_to_detail_spatial_gate_1.last_std.cpu()
-            )
+            if not self.ablate_detail_refinement:
+                statistics["semantic_to_detail_spatial_mean"] = float(
+                    self.semantic_to_detail_spatial_gate_1.last_mean.cpu()
+                )
+                statistics["semantic_to_detail_spatial_std"] = float(
+                    self.semantic_to_detail_spatial_gate_1.last_std.cpu()
+                )
             statistics["final_fusion_spatial_mean"] = float(
                 self.final_fusion.fusion_spatial_gate.last_mean.cpu()
             )
@@ -599,6 +641,9 @@ class DualBranchRoadNet(nn.Module):
         imagenet_pretrained: bool = True,
         encoder_weights_path: Optional[str] = None,
         deploy: bool = False,
+        ablate_dappm: bool = False,
+        ablate_detail_refinement: bool = False,
+        ablate_strip_pooling: bool = False,
     ) -> None:
         super().__init__()
         self.encoder = TruncatedResNet34(
@@ -615,6 +660,9 @@ class DualBranchRoadNet(nn.Module):
             fusion_blocks=fusion_blocks,
             bilateral_fusion=bilateral_fusion,
             deploy=deploy,
+            ablate_dappm=ablate_dappm,
+            ablate_detail_refinement=ablate_detail_refinement,
+            ablate_strip_pooling=ablate_strip_pooling,
         )
         self.decode_head = RoadReconstructionDecoder(
             stem_channels=64,
@@ -828,4 +876,11 @@ def build_model(args) -> DualBranchRoadNet:
         dropout=float(args.dropout),
         imagenet_pretrained=bool(args.imagenet_pretrained),
         encoder_weights_path=args.encoder_weights_path,
+        ablate_dappm=bool(getattr(args, "ablate_dappm", False)),
+        ablate_detail_refinement=bool(
+            getattr(args, "ablate_detail_refinement", False)
+        ),
+        ablate_strip_pooling=bool(
+            getattr(args, "ablate_strip_pooling", False)
+        ),
     )
