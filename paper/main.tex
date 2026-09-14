@@ -1163,9 +1163,10 @@ DBR-Net are as reported by WeavingUnet~\cite{weavingunet}. Params, FLOPs
 resolution. The WeavingUnet inference-time column is the per-image wall
 clock of the released \texttt{test\_one\_img\_from\_path\_8} loop (four
 sequential forward passes at batch size 2, i.e.\ eight TTA views per
-image); DBR-Net inference time is measured under the same protocol
-(Section~\ref{subsec:efficiency}) on a Tesla T4 GPU, though the GPU used
-for the other methods is not stated in that source.}
+image), reported on an NVIDIA A100 GPU; DBR-Net inference time is measured
+under the same protocol (Section~\ref{subsec:efficiency}) on a Tesla T4
+GPU, a substantially less powerful device, so the two wall-clock values are
+not hardware-matched.}
 \label{tab:sota}
 \resizebox{\textwidth}{!}{%
 \begin{tabular}{lcccccccccccc}
@@ -1265,16 +1266,18 @@ accuracy with 22.35\,M stored parameters after re-parameterization, against
 $1024\times1024$ resolution, both markedly below the corresponding
 WeavingUnet figures in Table~\ref{tab:sota}. Measured under the matching
 eight-view \texttt{test\_one\_img\_from\_path\_8} protocol
-(Section~\ref{subsec:efficiency}), however, DBR-Net's per-image inference
-time is 0.79\,s on a Tesla T4, slower than the 0.68\,s WeavingUnet reports,
-despite DBR-Net's substantially lower parameter count, compute, and memory;
-the GPU used for the WeavingUnet figure is not confirmed, so the two
-wall-clock values are not guaranteed to be directly comparable. This
-indicates that the compute and memory advantages do not translate into
-lower single-GPU wall-clock latency under this protocol, plausibly because
-per-forward kernel-launch and DataParallel synchronization overhead account
-for a larger share of the eight-view wall time when the underlying network
-is already comparatively lightweight.
+(Section~\ref{subsec:efficiency}), DBR-Net's per-image inference time is
+0.79\,s on a Tesla T4 GPU, compared with the 0.68\,s WeavingUnet reports on
+an NVIDIA A100. Because the A100 offers substantially higher throughput
+than the T4 used here, this hardware gap alone could plausibly account for
+some or all of the apparent difference, so the comparison does not
+establish a real wall-clock speed advantage or disadvantage for either
+method. The eight-view protocol is, in any case, not what DBR-Net requires
+in practice: the evaluation protocol of Section~\ref{subsec:metrics}, which
+produced the accuracy figures above, applies no flip or rotation
+test-time augmentation, so the relevant deployment latency is the
+single-forward figure of Table~\ref{tab:efficiency}, 0.064\,s per image on
+the same Tesla T4.
 
 The pattern differs between the two benchmarks. On DeepGlobe, whose
 0.5\,m/pixel imagery and larger share of narrow rural and unpaved roads make
