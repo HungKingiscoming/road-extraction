@@ -253,21 +253,30 @@ the limitations. Section~\ref{sec:conclusion} summarizes the findings.
 \subsection{Encoder-decoder networks for road extraction}
 \label{subsec:rw-encdec}
 
-Road extraction moved to fully convolutional models with the release of the
-Massachusetts Roads dataset \cite{mnih2013aerial}, which established patch-based
-learning of road masks from aerial imagery as a benchmark task. U-Net
+Mnih~\cite{mnih2013aerial} trained neural networks on large aerial image
+datasets to label road pixels from a wide image context, because occlusions and
+shadows cast by trees and tall buildings often make local cues insufficient,
+and released the Massachusetts Roads dataset, which established patch-based
+learning of road masks from aerial imagery as a benchmark task. Fully
+convolutional networks~\cite{shelhamer2017fcn}, trained end to end from pixels
+to pixels, then moved segmentation from patch-wise classification to dense
+prediction over inputs of arbitrary size. U-Net
 \cite{ronneberger2015unet} introduced the skip-connected encoder-decoder that
 most later road models inherit: the encoder builds semantic capacity by
 downsampling, and lateral skips return spatial detail to the decoder. Deep
-Residual U-Net \cite{zhang2018resunet} replaced the plain encoder with residual
+Residual U-Net \cite{zhang2018resunet} rebuilt this architecture from residual
 units and reported improved road delineation on Massachusetts with fewer
 parameters than the original.
 
 The DeepGlobe challenge \cite{demir2018deepglobe} shifted attention to
 0.5\,m/pixel satellite imagery and larger scene variety. Its winning entry,
-D-LinkNet \cite{zhou2018dlinknet}, inserted a cascade of dilated convolutions at
+D-LinkNet \cite{zhou2018dlinknet}, built on the LinkNet architecture with a
+pretrained encoder, inserted a cascade of dilated convolutions at
 the encoder bottleneck, enlarging the receptive field without an additional
-downsampling stage, and it remains the reference baseline on that benchmark. The
+downsampling stage, and it remains the reference baseline on that benchmark.
+NL-LinkNet \cite{wang2022nllinknet} added non-local blocks to a LinkNet-based
+network, so that every location can draw on global context, and outperformed
+D-LinkNet with 43\% fewer parameters. The
 shared limitation of this family is structural rather than incidental. Skip
 connections return detail that survived the encoder, but a road eight to twenty
 pixels wide is represented by a fraction of a pixel at stride 32, so what the
@@ -291,22 +300,32 @@ Real-time segmentation networks reduce that cost to two branches. BiSeNet~V2
 branch and merges them once through a guided aggregation layer. DDRNet
 \cite{pan2023ddrnet} keeps two resolutions throughout and exchanges between them
 repeatedly, and introduces the deep aggregation pyramid pooling module to enlarge
-the receptive field at the low-resolution branch. Both were designed for
-street-level traffic scenes, where objects are large and the detail branch mainly
-sharpens boundaries. Overhead road imagery inverts that balance: the structures
-of interest are themselves near the resolution limit, so which resolutions
-exchange, and under what control, matters more than how many exchanges occur.
-Neither design gates the exchange spatially, and neither is initialized so that
-adding the exchange leaves a pretrained encoder undisturbed.
+the receptive field at the low-resolution branch. Both were developed for
+real-time scene parsing and benchmarked chiefly on street-level scenes, where
+objects are large and the detail branch mainly sharpens boundaries. Overhead
+road imagery inverts that balance: the structures of interest are themselves
+near the resolution limit, so which resolutions exchange, and under what
+control, matters more than how many exchanges occur. DDRNet sums projected
+features of the two branches without any gating, and the guided aggregation
+layer of BiSeNet~V2 multiplies each branch by sigmoid-activated responses of
+the other, a dense gate over every channel and location rather than a single
+spatial map; neither is initialized so that adding the exchange leaves a
+pretrained encoder undisturbed. Within road extraction, DBRANet
+\cite{chen2022dbranet} places a dual-branch module, a residual block beside a
+refined asymmetric block, in the encoder of a U-shaped network and decodes
+with a regional attention module; its two branches strengthen the feature
+extraction of the encoder, and the network keeps the encoder-decoder layout
+discussed in Section~\ref{subsec:rw-encdec}.
 
 Context aggregation modules developed for scene parsing are used across both
 families. Pyramid pooling \cite{zhao2017pspnet} and atrous spatial pyramid
-pooling \cite{chen2018deeplabv3plus} both compute several receptive-field scales
+pooling \cite{chen2018deeplab} both compute several receptive-field scales
 in parallel and combine them once at the end. The deep aggregation variant
 \cite{pan2023ddrnet} adds hierarchical residual connections among the pooling
 branches. These modules are normally built on batch normalization, which becomes
-unreliable at the small per-device batch sizes that 1024-pixel remote sensing
-crops impose, particularly for a branch that pools to a single spatial location.
+unreliable at the small per-device batch sizes \cite{wu2020groupnorm} that
+1024-pixel remote sensing crops impose, particularly for a branch that pools
+to a single spatial location.
 
 \subsection{Connectivity and topology-aware supervision}
 \label{subsec:rw-topology}
@@ -314,20 +333,39 @@ crops impose, particularly for a branch that pools to a single spatial location.
 Because pixel overlap is insensitive to short breaks, a separate line of work
 supervises connectivity explicitly. Batra et al.~\cite{batra2019connectivity}
 predict a road orientation field jointly with the mask and use it in a stacked
-refinement stage that reconnects fragmented predictions. CoANet
-\cite{mei2021coanet} matches the network to road geometry directly, using strip
-convolutions along four directions together with a connectivity attention module
-that predicts whether neighboring locations belong to the same road.
+refinement stage that reconnects fragmented predictions. Several road networks
+predict the centerline as a second task: CasNet \cite{cheng2017cascaded}
+cascades a centerline extraction network onto a road detection network and
+thins its output into a single-pixel-wide centerline network, RCNN-UNet
+\cite{yang2019rcnnunet} and MSMT-RE \cite{lu2019msmtre} train road detection
+and centerline extraction jointly in U-Net-based multi-task models, and
+RoadNet \cite{liu2019roadnet} predicts road surfaces, edges, and centerlines
+simultaneously. DiResNet \cite{ding2021diresnet} supervises local road
+directions at the pixel level and adds a structural supervision and a
+refinement network to improve road topology, and BT-RoadNet
+\cite{zhou2020btroadnet} refines a coarse road map with a second
+encoder-decoder and uses a spatial context module to counter discontinuities.
+CoANet \cite{mei2021coanet} matches the network to road geometry directly,
+using strip convolutions along four directions together with a connectivity
+attention module that predicts whether neighboring locations belong to the
+same road. A further line abandons the raster mask and builds the road graph
+directly: RNGDet \cite{xu2022rngdet} generates the road network graph vertex
+by vertex from an aerial image with a transformer, motivated by the limited
+topological correctness of segmentation-based approaches. The present work
+stays within the raster formulation, whose consequences are discussed in
+Section~\ref{subsec:limitations}.
 
 Loss functions attack the same problem without changing the architecture. Region
 losses of the Dice family \cite{milletari2016vnet} and reweighted classification
 losses \cite{lin2017focal} counteract the imbalance itself, and the Tversky loss
 \cite{salehi2017tversky} generalizes Dice with separate weights for false
 positives and false negatives, so an application can declare which error is worse.
-clDice \cite{shit2021cldice} measures overlap between the skeletons of prediction
-and label, which makes a break expensive even when it costs few pixels, and
-provides a differentiable soft skeletonization built from morphological
-operations.
+Oner et al.~\cite{oner2022connectivity} express road connectivity through the
+background regions that a gap in the prediction wrongly merges, and penalize
+such connections so that the gaps close. clDice \cite{shit2021cldice} measures
+overlap between the skeletons of prediction and label, which makes a break
+expensive even when it costs few pixels, and provides a differentiable soft
+skeletonization built from morphological operations.
 
 Two practical constraints in this literature motivate the present design. First,
 skeleton-based supervision is often implemented with external morphological
@@ -340,7 +378,11 @@ precisely the structures the term is meant to protect.
 \subsection{Structural re-parameterization}
 \label{subsec:rw-reparam}
 
-Multi-branch blocks improve optimization but cost inference time. RepVGG
+Multi-branch blocks improve optimization but cost inference time. ACNet
+\cite{ding2019acnet} strengthened square kernels with parallel
+one-dimensional asymmetric convolutions during training and converted the
+trained network back into its original architecture, so the added branches
+cost nothing at inference. RepVGG
 \cite{ding2021repvgg} showed that a training-time block of parallel $3\times3$,
 $1\times1$, and identity paths, each followed by batch normalization, can be
 folded algebraically into a single $3\times3$ convolution, so the deployed model
@@ -348,13 +390,17 @@ is a plain sequential stack with no accuracy loss. The transformation is exact:
 batch normalization folds into the preceding convolution, and kernels padded to a
 common size sum linearly.
 
-Re-parameterization has been applied mainly to classification backbones and
+Re-parameterization has been applied mainly to classification backbones
+\cite{ding2019acnet, ding2021repvgg} and
 general-purpose detectors. In the present network, the detail stages use the
 standard ungrouped RepVGG formulation, whereas the post-fusion and decoder
 refinement stages use a depthwise variant with $3\times3$, $1\times5$, and
-$5\times1$ spatial branches followed by pointwise channel mixing. The
-anisotropic branches are motivated by the elongated geometry of road segments
-and fuse into a single $5\times5$ depthwise kernel at deployment.
+$5\times1$ spatial branches followed by pointwise channel mixing, following
+the same fold-and-sum algebra as ACNet's asymmetric branches. The
+anisotropic branches are motivated by the elongated geometry of road
+segments, in the spirit of the strip convolutions of CoANet
+\cite{mei2021coanet}, and fuse into a single $5\times5$ depthwise kernel at
+deployment.
 
 \section{Methodology}
 \label{sec:methods}
@@ -1193,13 +1239,13 @@ UPerNet+Swin-T \cite{liu2021swin}
 UPerNet+ConvNeXt \cite{liu2022convnext}
   & 81.52 & 82.65 & 80.79 & 68.93 & 73.38 & 70.62 & 70.70 & 58.40
   & 122.04\,M & 1174.83\,G & 20.60 & 1.95 \\
-NL-LinkNet \cite{wang2021nllinknet}
+NL-LinkNet \cite{wang2022nllinknet}
   & 80.31 & 82.65 & 80.46 & 68.59 & 73.09 & 71.59 & 70.99 & 58.18
   & 21.82\,M & 125.97\,G & 5.53 & 0.34 \\
 MACU-Net \cite{li2021macunet}
   & 79.68 & 80.94 & 79.28 & 67.46 & 73.04 & 70.33 & 70.51 & 58.18
   & 5.15\,M & 134.34\,G & 8.43 & 0.66 \\
-DBRANet \cite{dbranet}
+DBRANet \cite{chen2022dbranet}
   & 81.52 & 82.30 & 80.99 & 68.95 & 73.41 & 70.60 & 70.89 & 58.34
   & 47.67\,M & 212.70\,G & 7.57 & 0.41 \\
 SGCN \cite{sgcn}
