@@ -1224,7 +1224,7 @@ WeavingUnet \cite{weavingunet}
 \textbf{DBR-Net (ours)}
   & \underline{81.72} & \textbf{87.51} & \textbf{84.02} & \textbf{72.19}
   & \textbf{76.52} & 72.96 & \textbf{74.21} & \textbf{61.76}
-  & 22.35\,M & 90.38\,G & 4.04 & [PROFILE] \\
+  & 22.35\,M & 90.38\,G & 4.04 & 0.79 \\
 \bottomrule
 \end{tabular}%
 }
@@ -1263,11 +1263,18 @@ against a higher false-positive rate on DeepGlobe. DBR-Net reaches this
 accuracy with 22.35\,M stored parameters after re-parameterization, against
 182.71\,M for WeavingUnet, and at 90.38\,GMACs and 4.04\,GiB peak memory at
 $1024\times1024$ resolution, both markedly below the corresponding
-WeavingUnet figures in Table~\ref{tab:sota}. [VERIFY: report DBR-Net
-inference time once measured under the eight-view
-\texttt{test\_one\_img\_from\_path\_8} protocol (Section~\ref{subsec:efficiency})
-against WeavingUnet's 0.68\,s, noting that the GPU used for the WeavingUnet
-figure is not confirmed.]
+WeavingUnet figures in Table~\ref{tab:sota}. Measured under the matching
+eight-view \texttt{test\_one\_img\_from\_path\_8} protocol
+(Section~\ref{subsec:efficiency}), however, DBR-Net's per-image inference
+time is 0.79\,s on a Tesla T4, slower than the 0.68\,s WeavingUnet reports,
+despite DBR-Net's substantially lower parameter count, compute, and memory;
+the GPU used for the WeavingUnet figure is not confirmed, so the two
+wall-clock values are not guaranteed to be directly comparable. This
+indicates that the compute and memory advantages do not translate into
+lower single-GPU wall-clock latency under this protocol, plausibly because
+per-forward kernel-launch and DataParallel synchronization overhead account
+for a larger share of the eight-view wall time when the underlying network
+is already comparatively lightweight.
 
 The pattern differs between the two benchmarks. On DeepGlobe, whose
 0.5\,m/pixel imagery and larger share of narrow rural and unpaved roads make
