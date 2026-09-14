@@ -1219,7 +1219,7 @@ WeavingUnet \cite{weavingunet}
 \textbf{DBR-Net (ours)}
   & \underline{81.72} & \textbf{87.51} & \textbf{84.02} & \textbf{72.19}
   & \textbf{76.52} & 72.96 & \textbf{74.21} & \textbf{61.76}
-  & 22.35\,M & 90.46\,G & 3.99 \\
+  & 22.35\,M & 90.38\,G & 4.04 \\
 \bottomrule
 \end{tabular}%
 }
@@ -1256,7 +1256,7 @@ benchmark: WeavingUnet reports 83.10\%, 1.38 points above the 81.72\%
 achieved by DBR-Net, indicating that part of the recall gain trades off
 against a higher false-positive rate on DeepGlobe. DBR-Net reaches this
 accuracy with 22.35\,M stored parameters after re-parameterization, against
-187.71\,M for WeavingUnet, and at 90.46\,GMACs and 3.99\,GiB peak memory at
+187.71\,M for WeavingUnet, and at 90.38\,GMACs and 4.04\,GiB peak memory at
 $1024\times1024$ resolution, both markedly below the corresponding
 WeavingUnet figures in Table~\ref{tab:sota}.
 
@@ -1320,17 +1320,25 @@ during inference.
 
 \begin{table}[pos=t]
 \caption{Cost of the current training-time and deployment-time forms at
-$1024\times1024$ input resolution.}
+$1024\times1024$ input resolution, measured under the WeavingUnet-compatible
+protocol of Section~\ref{subsec:metrics} (FP32, single-image forward for
+GMACs, and the 8-view TTA path for peak allocated memory).}
 \label{tab:efficiency}
 \begin{tabular*}{\tblwidth}{@{}LRRRR@{}}
 \toprule
 Form & Params (M) & GMACs & Latency (ms) & Peak VRAM (MiB) \\
 \midrule
-Training (multi-branch) & 22.392 & [PROFILE] & [PROFILE] & [PROFILE] \\
-Deploy (fused)          & 22.353 & [PROFILE] & [PROFILE] & [PROFILE] \\
+Training (multi-branch) & 22.392 & 90.83 & [PROFILE] & 4847 \\
+Deploy (fused)          & 22.353 & 90.38 & [PROFILE] & 4138 \\
 \bottomrule
 \end{tabular*}
 \end{table}
+
+The re-parameterized deploy form reduces compute by 0.44 GMACs and peak
+allocated memory by 0.69 GiB (709 MiB) relative to the training-time
+multi-branch form, consistent with folding the RepVGG and RepDepthwise
+branches into single convolutions rather than changing the represented
+function.
 
 The re-parameterization is algebraic: batch normalization is folded into its
 preceding convolution, compatible kernels are padded to a common support, and
@@ -1338,8 +1346,9 @@ the branch kernels and biases are summed. A RepVGGBlock becomes one dense
 $3\times3$ convolution. In a RepDepthwiseBlock the $3\times3$,
 $1\times5$, $5\times1$, and identity spatial branches become one depthwise
 $5\times5$ convolution, followed by the existing pointwise $1\times1$
-convolution. Final GMAC, latency, and peak-memory values should be re-profiled
-on the final V4 checkpoint instead of copied from the previous architecture.
+convolution. Latency should still be profiled on the final V4 checkpoint;
+the WeavingUnet-compatible benchmark used for GMACs and memory does not
+measure inference latency.
 
 \subsection{Qualitative analysis}
 \label{subsec:qualitative}
