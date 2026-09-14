@@ -56,7 +56,7 @@ Supervision for Road Extraction from High-resolution Remote Sensing Imagery}
 }
 
 \affiliation[2]{
-	organization={Application of Artificial Intelligence for Structural Health Monitoring (AI-SHM) Research Group, Faculty of Civil Engineering and Environment (R2026-UTC-01), University of Transport and Communications},
+	organization={Application of Artificial Intelligence for Structural Health Monitoring (AI-SHM) Research Group, Faculty of Civil and Environment Engineering (R2026-UTC-01), University of Transport and Communications},
 	city={Hanoi},
 	country={Vietnam}
 }
@@ -109,120 +109,85 @@ structural re-parameterization \sep global-local context \sep feature fusion
 \section{Introduction}
 \label{sec:introduction}
 
-Road networks are a primary layer of nearly every geospatial information system,
-and keeping that layer current is a recurring cost. New construction, closures,
-and damage after floods or earthquakes change the network faster than manual
-digitization can follow. High-resolution optical satellite and aerial imagery is
-now acquired at sub-meter to meter ground sampling distance over most inhabited
-areas, which makes automated extraction of road surfaces from such imagery a
-practical route to map maintenance \rev{\cite{abdollahi2020roadreview, chen2022roadsurvey, luweng2025roadreview}}. The applications
-that consume the result, including routing, logistics, and the allocation of
-emergency access after a disaster, depend less on the exact area of the predicted
-road surface than on whether the extracted network remains connected.
+Road networks form a fundamental layer of geospatial information systems and
+support applications such as map updating, logistics planning, and emergency
+response. However, road maps can become outdated as construction, closures, and
+damage alter the network faster than manual digitization can capture. The
+increasing availability of high-resolution optical satellite and aerial imagery
+makes automatic road extraction a practical means of updating this information
+\rev{\cite{abdollahi2020roadreview,chen2022roadsurvey,luweng2025roadreview}}.
+For many downstream applications, accurate road coverage is important, but so is
+the continuity of the extracted network because even a short missing segment can
+interrupt an otherwise valid route.
 
-Road extraction is usually posed as binary semantic segmentation, yet several
-properties separate it from the object-centric problems that drive most
-architectural progress. Roads occupy roughly two to five percent of the pixels in
-a typical scene\rev{~\cite{demir2018deepglobe}}, so an unweighted pixel objective converges toward a near-empty
-prediction and pixel accuracy carries almost no information. At one meter per
-pixel a two-lane road is between eight and twenty pixels wide; a feature map at
-stride 32 represents it with less than one pixel, and no decoder can reliably
-reconstruct what the encoder has already discarded. The structures are also
-anisotropic and long-range: rivers, field boundaries, fences, and elongated
-rooftops are locally indistinguishable from roads, and only regional context
-resolves the ambiguity. Occlusion compounds the difficulty\rev{~\cite{mnih2013aerial, cheng2017cascaded, zhou2020btroadnet}}, because a five-pixel
-gap caused by a tree canopy leaves the intersection-over-union nearly unchanged
-while destroying an entire route. Evaluation protocols that report only pixel
-overlap therefore reward the wrong behavior.
+Road extraction is commonly formulated as binary semantic segmentation, but it
+remains challenging for several reasons. Road pixels often occupy only a small
+fraction of an image, which can bias pixel-wise learning toward the background
+class. Roads are also thin, elongated structures whose visual evidence may be
+weakened by repeated downsampling. Their appearance varies with surface material,
+illumination, and acquisition conditions, while rivers, field boundaries,
+rooftops, and other linear structures can produce similar local patterns.
+Occlusion by trees, shadows, buildings, and vehicles introduces additional gaps
+\rev{\cite{mnih2013aerial,cheng2017cascaded,zhou2020btroadnet}}. Consequently,
+effective road extraction requires both fine spatial detail and broader semantic
+context. Pixel-overlap metrics remain useful for evaluation, but they may
+under-penalize small disconnections that are important to network usability.
 
-Two lines of work address these properties. The first adapts general-purpose
-encoder-decoder segmentation networks to aerial imagery, from U-Net
-\cite{ronneberger2015unet} and Deep Residual U-Net \cite{zhang2018resunet} to
-D-LinkNet \cite{zhou2018dlinknet}, and then improves feature aggregation through
-\rev{non-local context \cite{wang2022nllinknet},} multi-resolution exchange
-\cite{wang2021hrnet}\rev{,} or attention decoders \rev{\cite{xie2021segformer, wang2022unetformer}}. The
-second supervises connectivity directly, either through auxiliary geometric
-targets such as road \rev{centerlines \cite{cheng2017cascaded, lu2019msmtre},
-local direction \cite{ding2021diresnet},} and
-connectivity attention \cite{mei2021coanet}, or through topology-aware objectives
-such as \rev{connectivity-oriented losses \cite{oner2022connectivity} and} clDice
-\cite{shit2021cldice}\rev{, complemented by imbalance-aware region losses such as}
-the asymmetric Tversky loss \cite{salehi2017tversky}.
-Section~\ref{sec:related-work} reviews both lines in detail.
+Existing approaches address these challenges along two main directions.
+Encoder--decoder models, including U-Net \cite{ronneberger2015unet}, Deep
+Residual U-Net \cite{zhang2018resunet}, and D-LinkNet
+\cite{zhou2018dlinknet}, recover spatial resolution through skip connections and
+decoder stages. Later methods improve contextual representation through
+non-local operations \cite{wang2022nllinknet}, multi-resolution exchange
+\cite{wang2021hrnet}, or attention-based decoders
+\cite{xie2021segformer,wang2022unetformer}. A complementary line of research
+introduces geometric or connectivity-related supervision, including road
+centerlines \cite{cheng2017cascaded,lu2019msmtre}, local direction
+\cite{ding2021diresnet}, connectivity attention \cite{mei2021coanet}, and
+topology-aware objectives \cite{oner2022connectivity,shit2021cldice}. Although
+these developments improve road delineation, retaining high-resolution features
+throughout a network can increase computation, whereas aggressive downsampling
+can remove evidence for narrow roads. Multi-branch feature aggregation may also
+improve optimization while adding inference-time cost. These trade-offs motivate
+a design that preserves spatial detail selectively, incorporates contextual
+information, and remains efficient after deployment.
 
-Three issues remain unresolved across them. Preserving a high-resolution stream
-is effective, yet the usual mechanism, symmetric exchange among all resolution
-pairs \cite{wang2021hrnet, yu2021bisenetv2, pan2023ddrnet}, spends part of its
-budget on exchanges a thin-structure task cannot use: a stride-32 map cannot
-represent an eight-pixel road, so requiring it to participate in a
-detail-preserving exchange contributes little. Connectivity supervision is
-likewise effective, but published formulations either depend on external
-morphological libraries, which complicates reproducibility and distributed
-training, or skeletonize after the label has been downsampled, which merges
-narrow branches and intersections before they can be supervised. The third issue
-is discussed less often: multi-branch blocks and parallel context modules that
-improve accuracy also slow inference on the large scenes operational mapping
-requires, and structural re-parameterization \rev{\cite{ding2019acnet, ding2021repvgg}}, which removes
-that cost exactly, has to our knowledge not been combined with a road-specific
-detail-preserving design. An architecture is needed in which the detail stream is
-preserved by construction, the semantic stream contributes only where it helps,
-connectivity is supervised without external dependencies, and the multi-branch
-machinery collapses into a single-path network for deployment.
+To this end, we propose DBR-Net, an asymmetric dual-branch network for road
+extraction. A detail stream remains at stride~8 to retain fine spatial evidence,
+while a semantic stream reaches stride~32 to capture broader context. The two
+streams communicate through a single bilateral exchange controlled by a
+single-channel spatial gate. The final gate convolution is zero-initialized so
+that the exchange initially behaves like its ungated residual counterpart and
+learns spatial selectivity during training. A progressive pyramid pooling module
+aggregates multi-scale context, and a controlled fusion module returns this
+information to the detail stream. In addition, an auxiliary centerline head
+encourages structural continuity. Its targets are generated before downsampling
+using max-pooling-based morphological thinning, and the head is optimized with
+an asymmetric Tversky loss that assigns a larger penalty to false-negative road
+pixels than to false positives \cite{salehi2017tversky}. The multi-branch blocks
+are structurally re-parameterized into single convolutions for deployment
+\cite{ding2021repvgg}.
 
-DBR-Net is designed around those requirements. A detail stream is
-anchored at stride~8 and never descends further, so evidence for narrow roads is
-never destroyed. A semantic stream anchored at stride~16 reaches stride~32 only
-to collect context, and exactly one bilateral exchange, between stride~8 and
-stride~16, connects the two. Each direction of that exchange is a residual term
-modulated by a single-channel spatial gate whose final convolution is
-zero-initialized, so the gate evaluates to one at initialization and the network
-begins as an exact copy of the ungated variant, leaving the pretrained feature
-distribution undisturbed. Context is aggregated by a progressive pyramid module
-that adds pooling scales from fine to coarse and uses group normalization
-\rev{\cite{wu2020groupnorm}}, which keeps the global pooling branch valid at the small
-per-device batch sizes imposed by 1024-pixel crops. The context returns to the
-detail stream through a fusion step that normalizes the two streams separately
-and admits semantics through a learnable per-channel scale. Connectivity is
-supervised by an auxiliary centerline head trained with a Tversky loss
-\cite{salehi2017tversky} whose targets are generated by morphological thinning
-implemented entirely with max-pooling and applied before any downsampling. All
-multi-branch blocks are re-parameterizable \cite{ding2021repvgg} and fuse into
-single convolutions after training.
+We evaluate DBR-Net on the Massachusetts Roads \cite{mnih2013aerial} and
+DeepGlobe \cite{demir2018deepglobe} datasets. DBR-Net achieves road IoU scores
+of 72.19\% and 61.76\%, respectively, exceeding the strongest compared baseline
+by 0.75 percentage points on both benchmarks. The corresponding F1-scores are
+84.02\% and 74.21\%. For a $512\times512$ input, the model contains 22.53~M
+parameters, requires 90.457~GFLOPs, and uses 3.99~GB of GPU memory.
 
-The experimental program evaluates the model on the Massachusetts Roads dataset
-\cite{mnih2013aerial} and the DeepGlobe road extraction dataset
-\cite{demir2018deepglobe}, which differ in ground sampling distance, scene
-composition, and image size. Every evaluation runs at native resolution with
-overlapping tiles blended by a Hann window in the logit domain, so reported
-scores are not inflated by resizing. The primary metric is the
-intersection-over-union of the road class alone; a relaxed F1 score with a
-three-pixel tolerance is reported alongside it to separate route quality from
-boundary precision. Ablations isolate the spatial gate, the centerline objective,
-the occlusion augmentation, and the progressive context module, and a separate
-study quantifies the accuracy and compute effect of re-parameterization.
-
-The contributions of this work are the following.
+The main contributions of this work are summarized as follows:
 
 \begin{enumerate}
-\item An asymmetric dual-resolution architecture for road extraction in which a
-      stride-8 detail stream is preserved by construction and a single gated
-      bilateral exchange, rather than an all-pairs exchange, couples it to a
-      semantic stream.
-\item A zero-initialized single-channel spatial gate that makes the gated
-      exchange an exact extension of an ungated residual exchange at
-      initialization, so selectivity is learned without perturbing pretrained
-      features.
-\item A centerline supervision scheme whose targets are produced by
-      max-pooling-based morphological thinning applied before downsampling and
-      optimized with an asymmetric Tversky loss that penalizes broken roads more
-      heavily than spurious ones.
-\item A road-guided occlusion augmentation that draws shadows, vegetation, and
-      vehicles onto labeled road pixels while leaving the target mask unchanged,
-      which converts occlusion into an explicit reconstruction objective.
-\item An evaluation and deployment protocol combining native-resolution
-      Hann-blended inference, manifest-recorded splits, validation-only threshold
-      calibration, and structural re-parameterization verified to float32
-      round-off.
+\item We introduce an asymmetric dual-resolution architecture that retains a
+      stride-8 detail stream and couples it to a context-oriented semantic stream
+      through a single gated bilateral exchange.
+\item We develop an auxiliary centerline-supervision scheme whose targets are
+      generated by tensor-based morphological thinning before downsampling and
+      optimized with an asymmetric Tversky objective to emphasize missed road
+      pixels.
+\item We combine the proposed representation with structurally
+      re-parameterizable blocks and demonstrate a favorable accuracy--efficiency
+      balance on two public road-extraction benchmarks.
 \end{enumerate}
 
 The remainder of this paper is organized as follows.
@@ -232,7 +197,7 @@ re-parameterization. Section~\ref{sec:methods} presents the overall architecture
 and each of its modules, followed by the training objective.
 Section~\ref{sec:experimental-setup} specifies the datasets, splits, training
 strategy, and metrics. Section~\ref{sec:results-discussion} reports the
-comparison with prior work, the ablation studies, and the efficiency analysis.
+comparison with prior work and the efficiency analysis.
 Section~\ref{sec:conclusion} summarizes the findings, discusses the limitations,
 and outlines directions for future work.
 
