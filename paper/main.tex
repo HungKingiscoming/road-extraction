@@ -1163,7 +1163,7 @@ DBR-Net are as reported by WeavingUnet~\cite{weavingunet}. Params, FLOPs
 resolution. The WeavingUnet inference-time column is the per-image wall
 clock of the released \texttt{test\_one\_img\_from\_path\_8} loop (four
 sequential forward passes at batch size 2, i.e.\ eight TTA views per
-image), reported on an NVIDIA A100 GPU; DBR-Net inference time is measured
+image), reported on an NVIDIA A100 80\,GB GPU; DBR-Net inference time is measured
 under the same protocol (Section~\ref{subsec:efficiency}) on a Tesla T4
 GPU, a substantially less powerful device, so the two wall-clock values are
 not hardware-matched.}
@@ -1268,7 +1268,7 @@ WeavingUnet figures in Table~\ref{tab:sota}. Measured under the matching
 eight-view \texttt{test\_one\_img\_from\_path\_8} protocol
 (Section~\ref{subsec:efficiency}), DBR-Net's per-image inference time is
 0.79\,s on a Tesla T4 GPU, compared with the 0.68\,s WeavingUnet reports on
-an NVIDIA A100. Because the A100 offers substantially higher throughput
+an NVIDIA A100 80\,GB. Because the A100 offers substantially higher throughput
 than the T4 used here, this hardware gap alone could plausibly account for
 some or all of the apparent difference, so the comparison does not
 establish a real wall-clock speed advantage or disadvantage for either
