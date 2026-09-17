@@ -1971,6 +1971,43 @@ def save_split_manifest(
         json.dump(manifest, handle, indent=2)
 
 
+def format_gate_routes(gate_metrics: Dict[str, float]) -> str:
+    """Render gate_statistics() into a log fragment, skipping ablated routes.
+
+    gate_statistics() omits entries for components an --ablate_* flag has
+    removed rather than raising, so this formatter must do the same instead
+    of indexing the dict unconditionally.
+    """
+    route_labels = (
+        ("semantic_to_detail_abs_mean", "s2d"),
+        ("s32_context_to_s16_abs_mean", "ctx"),
+        ("semantic_to_final_abs_mean", "final"),
+    )
+    parts = [
+        f"{label}={gate_metrics[key]:.3f}"
+        for key, label in route_labels
+        if key in gate_metrics
+    ]
+    routes = "routes " + "/".join(parts) if parts else "routes n/a"
+
+    spatial_parts = []
+    if "semantic_to_detail_spatial_mean" in gate_metrics:
+        spatial_parts.append(
+            "spatial s2d mean/std="
+            f"{gate_metrics['semantic_to_detail_spatial_mean']:.3f}/"
+            f"{gate_metrics['semantic_to_detail_spatial_std']:.3f}"
+        )
+    if "final_fusion_spatial_mean" in gate_metrics:
+        spatial_parts.append(
+            "final mean/std="
+            f"{gate_metrics['final_fusion_spatial_mean']:.3f}/"
+            f"{gate_metrics['final_fusion_spatial_std']:.3f}"
+        )
+    if spatial_parts:
+        routes += " | " + " | ".join(spatial_parts)
+    return routes
+
+
 def main() -> None:
     args = parse_args()
     distributed, rank, local_rank, world_size, device = init_distributed()
@@ -2233,20 +2270,7 @@ def main() -> None:
                 f"calibrated road IoU={calibrated:.5f} "
                 f"@{validation_metrics['calibrated_threshold']:.2f} | "
                 f"F1={validation_metrics['fixed_f1']:.5f} | "
-                f"routes s2d/ctx/final="
-                f"{gate_metrics['semantic_to_detail_abs_mean']:.3f}/"
-                f"{gate_metrics['s32_context_to_s16_abs_mean']:.3f}/"
-                f"{gate_metrics['semantic_to_final_abs_mean']:.3f}"
-                + (
-                    " | spatial s2d mean/std="
-                    f"{gate_metrics['semantic_to_detail_spatial_mean']:.3f}/"
-                    f"{gate_metrics['semantic_to_detail_spatial_std']:.3f}"
-                    " | final mean/std="
-                    f"{gate_metrics['final_fusion_spatial_mean']:.3f}/"
-                    f"{gate_metrics['final_fusion_spatial_std']:.3f}"
-                    if args.bilateral_fusion == "spatial"
-                    else ""
-                )
+                f"{format_gate_routes(gate_metrics)}"
             )
             if is_main_process():
                 state = checkpoint_state(
