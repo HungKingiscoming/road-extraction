@@ -1429,6 +1429,9 @@ def transfer_weights(
     path: str | Path,
     weights: str,
     device: torch.device,
+    ablate_detail_refinement: bool = False,
+    ablate_strip_pooling: bool = False,
+    ablate_dappm: bool = False,
 ) -> Path:
     checkpoint_path, checkpoint = safe_torch_load(path, device)
     if not isinstance(checkpoint, dict):
@@ -1443,11 +1446,11 @@ def transfer_weights(
     result = model.load_state_dict(cleaned, strict=False)
     # missing_keys: tensors introduced after the source checkpoint was
     # trained are allowed. V4 adds no new D->S module.
-    allowed_missing_tokens = (
+    allowed_missing_tokens = [
         "spatial_gate",
         "strip_pooling",
         "semantic_aux_head",
-    )
+    ]
     allowed_missing = all(
         any(token in key for token in allowed_missing_tokens)
         for key in result.missing_keys
@@ -1455,13 +1458,34 @@ def transfer_weights(
 
     # unexpected_keys: source checkpoints can contain either the legacy
     # additive D->S route or the V3 DetailGuidedSemanticBlock. V4 removes both.
-    allowed_unexpected_tokens = (
+    allowed_unexpected_tokens = [
         "centerline_head",
         "detail_to_semantic_1",
         "detail_to_semantic_scale_1",
         "detail_to_semantic_spatial_gate_1",
         "detail_guided_semantic",
-    )
+    ]
+    # Component-ablation flags intentionally shrink the model relative to a
+    # full-architecture checkpoint, so the corresponding checkpoint tensors
+    # are expected to be left over rather than a sign of a stale/wrong
+    # checkpoint. Only the tensors for the ablation actually requested are
+    # allowed through, so a genuinely mismatched checkpoint still fails.
+    if ablate_detail_refinement:
+        allowed_unexpected_tokens += [
+            "detail_stages",
+            "semantic_to_detail_1",
+            "semantic_to_detail_scale_1",
+            "semantic_to_detail_spatial_gate_1",
+        ]
+    if ablate_strip_pooling:
+        allowed_unexpected_tokens.append("strip_pooling")
+    if ablate_dappm:
+        allowed_unexpected_tokens += [
+            "semantic_projection",
+            "dappm",
+            "context_to_s16",
+            "context_scale",
+        ]
     allowed_unexpected = all(
         any(token in key for token in allowed_unexpected_tokens)
         for key in result.unexpected_keys
@@ -1471,8 +1495,15 @@ def transfer_weights(
             "Transfer checkpoint architecture does not match DualBranchRoadNet V4. "
             f"Missing={result.missing_keys}, unexpected={result.unexpected_keys}. "
             "Only known optional V4 tensors may be missing, and only removed "
-            "D->S/SemanticBlock or centerline-head tensors may be unexpected."
+            "D->S/SemanticBlock, centerline-head, or actively-ablated tensors "
+            "may be unexpected."
         )
+    total_model_tensors = len(model.state_dict())
+    rank_zero_print(
+        f"Transfer loaded {total_model_tensors - len(result.missing_keys)}/"
+        f"{total_model_tensors} model tensors; {len(result.missing_keys)} left "
+        f"at fresh init, {len(result.unexpected_keys)} checkpoint tensors unused."
+    )
     return checkpoint_path
 
 
@@ -2039,7 +2070,13 @@ def main() -> None:
         model = model.to(memory_format=torch.channels_last)
     if args.pretrained_checkpoint:
         loaded = transfer_weights(
-            model, args.pretrained_checkpoint, args.transfer_weights, device
+            model,
+            args.pretrained_checkpoint,
+            args.transfer_weights,
+            device,
+            ablate_detail_refinement=args.ablate_detail_refinement,
+            ablate_strip_pooling=args.ablate_strip_pooling,
+            ablate_dappm=args.ablate_dappm,
         )
         rank_zero_print(f"Transferred {args.transfer_weights} weights from {loaded}")
     if args.freeze_params:
