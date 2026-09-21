@@ -828,6 +828,52 @@ def pooled_metrics_at_threshold(
     return metrics_from_counts(*pooled)
 
 
+def parse_color(text: str) -> Tuple[int, int, int]:
+    parts = [p.strip() for p in text.split(",")]
+    if len(parts) != 3:
+        raise ValueError(f"--overlay-color must be 'R,G,B', got {text!r}")
+    values = tuple(int(p) for p in parts)
+    if any(not 0 <= v <= 255 for v in values):
+        raise ValueError(f"--overlay-color channels must be in [0, 255], got {text!r}")
+    return values  # type: ignore[return-value]
+
+
+def save_prediction_outputs(
+    pairs: Sequence[Tuple[Path, Path]],
+    probabilities: Sequence[np.ndarray],
+    threshold: float,
+    save_dir: Path,
+    tag: str,
+    overlay_color: Tuple[int, int, int],
+) -> None:
+    """Dump per-image overlay + binary-mask predictions.
+
+    Matches the existing images/<dataset>/<tag>/ convention used for the
+    paper's qualitative comparison figures:
+      {stem}_sat_{tag}_overlay.jpg  -- RGB image with predicted road pixels
+                                        painted solid ``overlay_color``
+      {stem}_sat_{tag}_pred_bin.png -- binary road mask (0/255)
+    """
+    save_dir.mkdir(parents=True, exist_ok=True)
+    for (image_path, _mask_path), probability in zip(pairs, probabilities):
+        base_name = sample_key(image_path)
+        image = read_rgb(image_path)
+        pred = probability >= threshold
+
+        height = min(image.shape[0], pred.shape[0])
+        width = min(image.shape[1], pred.shape[1])
+        pred = pred[:height, :width]
+
+        overlay = image[:height, :width].copy()
+        overlay[pred] = overlay_color
+        binary_mask = (pred.astype(np.uint8) * 255)
+
+        overlay_path = save_dir / f"{base_name}_sat_{tag}_overlay.jpg"
+        bin_path = save_dir / f"{base_name}_sat_{tag}_pred_bin.png"
+        Image.fromarray(overlay, mode="RGB").save(overlay_path, quality=95)
+        Image.fromarray(binary_mask, mode="L").save(bin_path)
+
+
 def load_cache(path: Path) -> Tuple[List[np.ndarray], List[np.ndarray], List[str]]:
     data = np.load(path, allow_pickle=True)
     probs = [np.asarray(x, dtype=np.float32) for x in data["probs"]]
@@ -970,6 +1016,35 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--threshold-step", type=float, default=0.02)
     ap.add_argument("--relaxed-buffer-px", type=int, default=3)
     ap.add_argument("--out", default=None, help="Optional .npz probability/GT cache")
+    ap.add_argument(
+        "--save-preds",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Also dump per-image predictions as "
+            "{stem}_sat_{model-tag}_overlay.jpg and "
+            "{stem}_sat_{model-tag}_pred_bin.png, matching the images/ "
+            "qualitative-comparison convention"
+        ),
+    )
+    ap.add_argument(
+        "--save-dir",
+        default=None,
+        help=(
+            "Output directory for --save-preds; defaults to "
+            "images/<dataset>/<model-tag>"
+        ),
+    )
+    ap.add_argument(
+        "--model-tag",
+        default="carnet",
+        help="Model name embedded in saved filenames and the default --save-dir",
+    )
+    ap.add_argument(
+        "--overlay-color",
+        default="32,178,170",
+        help="R,G,B (0-255 each) used to paint predicted road pixels in the overlay image",
+    )
 
     ap.add_argument(
         "--data-root",
@@ -1091,6 +1166,7 @@ def main() -> None:
         raise ValueError("--threshold-step must be positive")
     if not 0.0 <= args.threshold_min <= args.threshold_max <= 1.0:
         raise ValueError("Threshold search range must be inside [0, 1]")
+    overlay_color = parse_color(args.overlay_color)
     calibration_subsets = {"val61", "deepglobe_val300", "deepglobe_eval_val"}
     if args.search_threshold and args.subset not in calibration_subsets:
         raise ValueError(
@@ -1360,6 +1436,17 @@ def main() -> None:
         if cache is not None:
             save_cache(cache, probabilities, ground_truths, names)
             print(f"Saved cache: {cache}")
+
+    if args.save_preds:
+        save_dir = (
+            Path(args.save_dir)
+            if args.save_dir
+            else Path("images") / args.dataset / args.model_tag
+        )
+        save_prediction_outputs(
+            pairs, probabilities, args.thr, save_dir, args.model_tag, overlay_color
+        )
+        print(f"Saved {len(pairs)} prediction image pairs to {save_dir}")
 
     pooled, weaving, mean_iou, relaxed_f1 = score_maps(
         probabilities,
