@@ -1,7 +1,7 @@
-%% DBR-Net manuscript
+%% DBRR-Net manuscript
 %% Elsevier CAS single-column template (cas-sc.cls).
 %% Switch to cas-dc when the target journal requires a double-column layout.
-\documentclass[a4paper,fleqn]{cas-sc}
+\documentclass[a4paper,fleqn, review]{cas-sc}
 
 \usepackage[numbers,sort&compress]{natbib}
 \usepackage{graphicx}
@@ -9,6 +9,8 @@
 \usepackage{multirow}
 \usepackage{amsmath}
 \usepackage{xcolor}
+
+\usepackage{todonotes}
 
 % Placeholder figure box.  Every occurrence marks a figure that still has to be
 % produced from an experiment snapshot and placed in figs/.
@@ -25,10 +27,10 @@
 
 \begin{document}
 
-\shorttitle{DBR-Net for road extraction}
+\shorttitle{DBRR-Net for road extraction}
 \shortauthors{L.X. Thang et~al.}
 
-\title[mode=title]{DBR-Net: A Dual-branch Road Network for Road Extraction from High-resolution Remote Sensing Imagery}
+\title[mode=title]{DBRR-Net: A Dual-Branch Reparameterized Road Network for Road Extraction from High-resolution Remote Sensing Imagery}
 
 %% Authors
 \author[1,2]{Le Xuan Thang}[type=editor,
@@ -78,7 +80,7 @@ shadows, and vehicles, and are useful only when their connectivity is preserved.
 Encoder-decoder networks that downsample deeply discard the evidence for narrow
 roads before the decoder can recover it, whereas networks that hold high
 resolution throughout are costly at inference time. This paper presents
-DBR-Net (Dual-Branch Road Network), a segmentation network built around a detail
+DBRR-Net (Dual-Branch Reparameterized Road Network), a segmentation network built around a detail
 stream that never leaves stride~8 and a semantic stream that descends to
 stride~32 to gather context. The two streams communicate through a single
 bilateral exchange.
@@ -107,7 +109,7 @@ response. However, road maps can become outdated as construction, closures, and
 damage alter the network faster than manual digitization can capture. The
 increasing availability of high-resolution optical satellite and aerial imagery
 makes automatic road extraction a practical means of updating this information
-\rev{\cite{abdollahi2020roadreview,chen2022roadsurvey,luweng2025roadreview}}.
+\cite{abdollahi2020roadreview,chen2022roadsurvey,luweng2025roadreview}.
 For many downstream applications, accurate road coverage is important, but so is
 the continuity of the extracted network because even a short missing segment can
 interrupt an otherwise valid route.
@@ -120,12 +122,13 @@ weakened by repeated downsampling. Their appearance varies with surface material
 illumination, and acquisition conditions, while rivers, field boundaries,
 rooftops, and other linear structures can produce similar local patterns.
 Occlusion by trees, shadows, buildings, and vehicles introduces additional gaps
-\rev{\cite{mnih2013aerial,cheng2017cascaded,zhou2020btroadnet}}. Consequently,
+\cite{mnih2013aerial,cheng2017cascaded,zhou2020btroadnet}. Consequently,
 effective road extraction requires both fine spatial detail and broader semantic
 context. Pixel-overlap metrics remain useful for evaluation, but they may
 under-penalize small disconnections that are important to network usability.
 
 Existing approaches address these challenges along two main directions.
+\todo[inline,color=yellow]{you should write this more details. "The author A [\#] proposed... But... " you must show the reader where is disadvantage of these study}
 Encoder--decoder models, including U-Net \cite{ronneberger2015unet}, Deep
 Residual U-Net \cite{zhang2018resunet}, and D-LinkNet
 \cite{zhou2018dlinknet}, recover spatial resolution through skip connections and
@@ -144,7 +147,9 @@ improve optimization while adding inference-time cost. These trade-offs motivate
 a design that preserves spatial detail selectively, incorporates contextual
 information, and remains efficient after deployment.
 
-To this end, DBR-Net is designed as an asymmetric dual-branch network for road
+To this end,
+\todo[inline,color=yellow]{replace by using the word "addressing"}
+ DBRR-Net is designed as an asymmetric dual-branch network for road
 extraction. A detail stream remains at stride~8 to retain fine spatial evidence,
 while a semantic stream reaches stride~32 to capture broader context. The two
 streams communicate through a single bilateral exchange controlled by a
@@ -160,8 +165,8 @@ pixels than to false positives \cite{salehi2017tversky}. The multi-branch blocks
 are structurally re-parameterized into single convolutions for deployment
 \cite{ding2021repvgg}.
 
-DBR-Net is evaluated on the Massachusetts Roads \cite{mnih2013aerial} and
-DeepGlobe \cite{demir2018deepglobe} datasets. DBR-Net achieves road IoU scores
+DBRR-Net is evaluated on the Massachusetts Roads \cite{mnih2013aerial} and
+DeepGlobe \cite{demir2018deepglobe} datasets. DBRR-Net achieves road IoU scores
 of 72.19\% and 61.76\%, respectively, exceeding the strongest compared baseline
 by 0.75 percentage points on both benchmarks. The corresponding F1-scores are
 84.02\% and 74.21\%. For a $512\times512$ input, the model contains 22.53~M
@@ -301,7 +306,8 @@ of height $H$ and width $W$, and let
 $\mathbf{Y} \in \{0,1\}^{H \times W}$ denote the corresponding label, where
 $Y_{ij} = 1$ marks a road-surface pixel. The task is to learn a mapping
 $f_{\boldsymbol{\theta}}$ that produces two-channel logits at the input
-resolution,
+resolution, 
+\todo[color=yellow, inline]{we should use the term such as: as shown in Eq() / as following / as according/... try to avoid this representation "below..." }
 %
 \begin{equation}
 \label{eq:task}
@@ -313,7 +319,7 @@ where $\boldsymbol{\theta}$ collects all trainable parameters. The road
 probability map $\mathbf{P} \in [0,1]^{H \times W}$ and the predicted mask
 $\hat{\mathbf{Y}}$ follow from the channel-wise softmax and a decision threshold
 $\tau$,
-%
+\todo{try to use the same symbol across entire the manuscript. we don't use $\hat{\mathbf{Y}}$ and $\hat{Y}_{ij}$ at the same time. It makes reader confusing}
 \begin{equation}
 \label{eq:threshold}
 P_{ij} = \frac{\exp(Z_{1ij})}{\exp(Z_{0ij}) + \exp(Z_{1ij})},
@@ -342,7 +348,7 @@ $\mathbf{S}_0,\mathbf{S}_1$.
 \begin{figure*}[pos=t]
     \centering
     \placeholderfig[0.95\linewidth]{figs/graph.png}
-    \caption{Overall architecture of the proposed DBR-Net.}
+    \caption{Overall architecture of the proposed DBRR-Net.}
     \label{fig:architecture}
 \end{figure*}
 
@@ -351,6 +357,7 @@ ResNet-34 encoder, the gated dual-branch pathways, progressive DAPPM
 semantic context, and road-aware fusion detailed in
 Section~\ref{subsec:dualres}, and the reconstruction decoder described
 below.
+\todo{try to avoid begin the sentence by using Fig or Sec or Table. It looks like AI agent}
 
 The encoder is a ResNet-34~\cite{he2016resnet} truncated after its last
 residual stage and initialized from ImageNet weights~\cite{deng2009imagenet},
@@ -395,7 +402,7 @@ configuration ($C_d=96$, semantic projection width 192, DAPPM branch width 32,
 detail depths $(2,2)$, and one final fusion-refinement block).
 
 \begin{table*}[pos=t]
-\caption{Modules of the current DBR-Net default configuration.}
+\caption{Modules of the current DBRR-Net default configuration.}
 \label{tab:modules}
 \footnotesize
 \begin{tabular*}{\tblwidth}{@{}LLLR@{}}
@@ -459,7 +466,8 @@ first makes the module descriptions that follow self-contained.
 \end{figure*}
 
 Fig.~\ref{fig:reparam} illustrates both block types before and after this
-fusion.
+fusion. 
+\todo[inline]{you should not write this sentences, this call is duplicate because the figure caption has this information} 
 
 The RepVGGBlock is a standard-convolution block combining a $3 \times 3$
 convolution, a $1 \times 1$ convolution, and an identity path, each followed by
@@ -706,6 +714,7 @@ $\mathcal{R}_{dw}$ is one RepDepthwiseBlock.
     modulate how much of $\mathbf{M}$ is added back to $\mathbf{D}_2$, which
     remains the residual anchor, before a RepDepthwiseBlock produces
     $\mathbf{F}_f$.}
+    \todo[color=yellow,inline]{the caption is too long}
     \label{fig:fusion}
 \end{figure*}
 
@@ -852,7 +861,7 @@ fixed seed of 3407, the first 5000 form the training split, and the remaining
   \par\smallskip
   \textbf{(a) Massachusetts Roads}
   \par\medskip
-  \includegraphics[width=\linewidth]{deepglobe_samples_5x2.png}
+  \includegraphics[width=\linewidth]{figs/deepglobe_samples_5x2.png}
   \par\smallskip
   \textbf{(b) DeepGlobe Road Extraction}
   \caption{Representative image--mask pairs from the two road-extraction
@@ -1007,13 +1016,13 @@ placed exactly.
 Massachusetts and DeepGlobe test splits. Values for the comparison methods
 are as reported by WeavingUnet~\cite{weavingunet}, whose published
 comparison table this study adopts as the external reference; these methods
-are not independently retrained in this study. DBR-Net alone is trained and
+are not independently retrained in this study. DBRR-Net alone is trained and
 evaluated under the protocol of Section~\ref{sec:experimental-setup}, with
 precision, recall, and F1 measured using the WeavingUnet-compatible
 aggregation of Section~\ref{subsec:metrics}, so that these values remain
 comparable with the reported baselines. The comparison therefore combines a
 controlled
-measurement of DBR-Net with literature-reported baselines rather than a
+measurement of DBRR-Net with literature-reported baselines rather than a
 fully controlled re-implementation of every method, a point
 Section~\ref{subsec:limitations} returns to.
 \begin{table*}[pos=t]
@@ -1059,13 +1068,13 @@ WeavingUnet \cite{weavingunet}
   & \textbf{83.10} & \underline{83.51} & \underline{82.73} & \underline{71.44}
   & \underline{73.92} & \underline{73.30} & \underline{72.52} & \underline{61.01} \\
 \midrule
-\textbf{DBR-Net (ours)}
+\textbf{DBRR-Net (ours)}
   & \underline{81.72} & \textbf{87.51} & \textbf{84.02} & \textbf{72.19}
   & \textbf{75.84} & \textbf{73.45} & \textbf{74.06} & \textbf{61.48} \\
 \bottomrule
 \end{tabular}%
 }
-
+\todo[inline]{please remove all "ours" in the manuscript}
 \vspace{2pt}
 \begin{minipage}{\textwidth}
 \raggedright
@@ -1098,7 +1107,7 @@ MSMDFFNet \cite{msmdffnet}               & 39.26\,M  & 598.40\,G  & 15.24 & A100
 StripUnet \cite{stripunet}               & 57.98\,M  & 252.22\,G  & 13.51 & A100 80\,GB & 0.62 \\
 WeavingUnet \cite{weavingunet}           & 182.71\,M & 295.66\,G  & 14.95 & A100 80\,GB & 0.68 \\
 \midrule
-\textbf{DBR-Net (ours)}                  & 22.35\,M  & 90.38\,G   & 4.04  & Tesla T4 x 2 & 0.79 \\
+\textbf{DBRR-Net (ours)}                  & 22.35\,M  & 90.38\,G   & 4.04  & Tesla T4 x 2 & 0.79 \\
 \bottomrule
 \end{tabular*}
 \end{table}
@@ -1109,7 +1118,7 @@ WeavingUnet \cite{weavingunet}           & 182.71\,M & 295.66\,G  & 14.95 & A100
 \footnotesize
 
 \end{minipage}
-On the Massachusetts test split, the comparative experimental results are shown in Table~\ref{tab:sota-results} (accuracy) and Table~\ref{tab:sota-eff} (computational cost). The experimental results demonstrate that DBR-Net achieves the highest score on all four metrics, reaching 75.84\% precision, 73.45\% recall, 74.06\% F1, and 61.48\% IoU. Compared with the second best model, WeavingUnet, DBR-Net improves precision, recall, F1, and IoU by 1.92, 0.15, 1.54, and 0.47 percentage points, respectively. DBR-Net also achieves higher IoU, F1-score, and precision than other road-specific methods such as D-LinkNet, NL-LinkNet, DBRANet, SGCN, RCFSNet, MSMDFFNet, and StripUnet. Meanwhile, DBR-Net significantly outperforms general-purpose segmentation methods, including U-Net, DeepLabV3+, UPerNet with Swin-T, UPerNet with ConvNeXt, and MACU-Net, across all evaluation metrics. The recall margin over WeavingUnet is narrow (73.45\% versus 73.30\%), so the two models are effectively tied on that metric, while DBR-Net's advantage on precision, F1, and IoU is more pronounced. It also maintains a favorable computational trade-off, requiring only 22.35M parameters and 90.38G FLOPs, substantially lower than many competing road-specific methods, while also consuming considerably less memory than several high-performing architectures. These results indicate that DBR-Net provides a strong balance between segmentation accuracy and computational efficiency.
+On the Massachusetts test split, the comparative experimental results are shown in Table~\ref{tab:sota-results} (accuracy) and Table~\ref{tab:sota-eff} (computational cost). The experimental results demonstrate that DBRR-Net achieves the highest score on all four metrics, reaching 75.84\% precision, 73.45\% recall, 74.06\% F1, and 61.48\% IoU. Compared with the second best model, WeavingUnet, DBRR-Net improves precision, recall, F1, and IoU by 1.92, 0.15, 1.54, and 0.47 percentage points, respectively. DBRR-Net also achieves higher IoU, F1-score, and precision than other road-specific methods such as D-LinkNet, NL-LinkNet, DBRANet, SGCN, RCFSNet, MSMDFFNet, and StripUnet. Meanwhile, DBRR-Net significantly outperforms general-purpose segmentation methods, including U-Net, DeepLabV3+, UPerNet with Swin-T, UPerNet with ConvNeXt, and MACU-Net, across all evaluation metrics. The recall margin over WeavingUnet is narrow (73.45\% versus 73.30\%), so the two models are effectively tied on that metric, while DBRR-Net's advantage on precision, F1, and IoU is more pronounced. It also maintains a favorable computational trade-off, requiring only 22.35M parameters and 90.38G FLOPs, substantially lower than many competing road-specific methods, while also consuming considerably less memory than several high-performing architectures. These results indicate that DBRR-Net provides a strong balance between segmentation accuracy and computational efficiency.
 
 To test the adaptability and efficiency of DBRNet in varied road scenarios, we ran comparative experiments on the DeepGlobe dataset. As shown in Table~\ref{tab:sota-results}, DBRNet achieves significant improvements in Recall, F1, and IoU scored compared with other models. Especially, its IoU outperform the second-best model, WeavingUnet, by 0.75\%, and it is the only model with an Recall score exceeding 85\%. Moreover, compared with its performance on the Massachusetts dataset, DBRNet exhibits a substantially higher recall on DeepGlobe, suggesting a stronger ability to recover road pixels under more diverse road and scene conditions. Although its precision is not the highest, DBRNet still maintains a competitive precision of 81.72\%, indicating reliable road predictions with a relatively low false-positive rate.
 
@@ -1119,7 +1128,7 @@ omission the dominant error mode, the advantage over WeavingUnet is
 concentrated in recall rather than precision, consistent with the persistent
 $1/8$-resolution detail stream and the directional strip-pooling context recovering thin road segments that a heavier,
 single-resolution decoder misses. On Massachusetts, whose 1\,m/pixel imagery
-covers denser suburban and forested scenes, DBR-Net instead leads mainly
+covers denser suburban and forested scenes, DBRR-Net instead leads mainly
 through precision, and its recall margin over the closest baseline
 (WeavingUnet) is much narrower than on DeepGlobe; this pattern may reflect
 the one-way semantic guidance and road-aware fusion suppressing
@@ -1127,7 +1136,7 @@ background confusers such as driveways and building outlines more
 effectively than they recover additional road pixels in these denser scenes.
 The accuracy advantage is therefore uneven in magnitude across metrics on
 either benchmark, but road IoU, the primary metric of this study, and every
-other reported metric, is highest for DBR-Net on both datasets.
+other reported metric, is highest for DBRR-Net on both datasets.
 
 \subsection{Ablation studies}
 \label{subsec:ablation}
@@ -1141,7 +1150,7 @@ variants by their impact on IoU, largest first, with a $\Delta$IoU column
 against the full model for direct comparison.
 
 \begin{table}[pos=t]
-\caption{Component ablation for the current DBR-Net architecture on the
+\caption{Component ablation for the current DBRR-Net architecture on the
 Massachusetts test split, ranked by impact on IoU.}
 \label{tab:ablation}
 \begin{tabular*}{\tblwidth}{@{}LRRRRR@{}}
@@ -1214,7 +1223,7 @@ Pooling and DAPPM each cost a fraction of a point of IoU on their own, and
 in opposite ways -- Strip Pooling affects precision and recall evenly,
 DAPPM affects precision only -- while losing the detail stage that carries
 both of them is nearly an order of magnitude more costly. The three
-ablations point to the same conclusion from different angles: DBR-Net's
+ablations point to the same conclusion from different angles: DBRR-Net's
 accuracy depends primarily on keeping a persistent, semantically guided
 $1/8$-resolution stream intact, and only secondarily on the two smaller modules
 that refine each branch's context.
@@ -1270,7 +1279,7 @@ collapse rather than with any change to the represented function.
 \begin{figure*}[pos=t]
 \centering
 \placeholderfig[0.95\linewidth]{figs/qualitative.pdf - image, ground truth,
-two strongest baselines, and DBR-Net on: (a) a tree-occluded suburban
+two strongest baselines, and DBRR-Net on: (a) a tree-occluded suburban
 road; (b) a narrow rural road adjacent to a river; (c) a multi-lane interchange;
 (d) a failure case.}
 \caption{Qualitative comparison on selected test scenes. Rows (a) to (c)
@@ -1278,6 +1287,40 @@ illustrate the occlusion, linear-confuser, and topology cases discussed in
 Section~\ref{subsec:qualitative}; row (d) is a failure case.}
 \label{fig:qualitative}
 \end{figure*}
+
+\begin{figure*}[pos=t]
+\centering
+\includegraphics[width=0.95\linewidth]{figs/deepglobe_full_comparison_131094.png}
+\caption{Full-baseline qualitative comparison on DeepGlobe test scene 131094, a
+multi-ramp highway interchange. Every panel overlays that method's predicted
+road pixels on the same scene; the red box marks an elevated, curved ramp that
+DBRR-Net recovers (scene IoU 0.850) while all 13 compared baselines miss it
+entirely, including the strongest baseline on this scene, UperNet-Swin (scene
+IoU 0.719).}
+\label{fig:deepglobe-full-comparison}
+\end{figure*}
+
+\begin{figure*}[pos=t]
+\centering
+\includegraphics[width=0.95\linewidth]{figs/massachusetts_full_comparison_24779290.png}
+\caption{Full-baseline qualitative comparison on Massachusetts test scene
+24779290, a road segment heavily occluded by tree canopy. The red box marks a
+stretch that at least 12 of the 13 baselines fail to detect at all, while
+DBRR-Net traces it continuously (scene IoU 0.679, versus 0.646 for the
+strongest baseline on this scene, UperNet-ConvNeXt).}
+\label{fig:massachusetts-full-comparison}
+\end{figure*}
+
+Unlike Figure~\ref{fig:qualitative}, which contrasts DBRR-Net with only the two
+strongest baselines per scene, Figures~\ref{fig:deepglobe-full-comparison} and
+\ref{fig:massachusetts-full-comparison} place every compared method side by
+side on one fixed scene per dataset. This isolates a per-method gap from a
+property of the scene: on the DeepGlobe interchange, the curved ramp inside the
+red box is absent from every baseline's prediction, including the strongest
+one, so the gap is attributable to the baseline architectures rather than to
+an unusually hard crop. The same holds for the tree-occluded Massachusetts
+segment, where the road is not merely thinner or fragmented in the baselines
+but missing outright across 12 of 13 of them.
 
 [QUALITATIVE PARAGRAPH: select examples that test the current architecture.
 Row (a) should show whether long-range detail context and clDice preserve a road
@@ -1293,13 +1336,14 @@ conditions under which it occurs.]
 \section{Conclusion}
 \label{sec:conclusion}
 
-This paper introduces DBR-Net, a dual branch road extraction network that efficiently captures long-range dependencies in remote sensing images. In DBR-Net, we present a Detail Stage 1, 2 and strip pooling that significantly enhances the model's local context modeling capabilities. Meanwhile, the semantic branch keeps the pretrained E4 feature as it anchor while the E5 feature is processed by the progressive DAPPM to aggregate multi-scale context. To effectively bridge these two branche, a Road-Aware Fusion is designed to preserve the detail feature and semantic feature.
+This paper introduces DBRR-Net, a dual-branch reparameterized road extraction network that efficiently captures long-range dependencies in remote sensing images. In DBRR-Net, we present a Detail Stage 1, 2 and strip pooling that significantly enhances the model's local context modeling capabilities. Meanwhile, the semantic branch keeps the pretrained E4 feature as it anchor while the E5 feature is processed by the progressive DAPPM to aggregate multi-scale context. To effectively bridge these two branche, a Road-Aware Fusion is designed to preserve the detail feature and semantic feature.
 
-DBR-Net
+DBRR-Net
 reaches a road IoU of 61.48\% on Massachusetts and 72.19\% on DeepGlobe, the
-highest values among the compared methods. DBR-Net also maintains high computational efficiency, with only 22.35 M parameters, 90.38 G FLOPs, and 4.04 GiB memory usage, while achieving practical inference speed on Tesla T4 GPUs.
+highest values among the compared methods. DBRR-Net also maintains high computational efficiency, with only 22.35 M parameters, 90.38 G FLOPs, and 4.04 GiB memory usage, while achieving practical inference speed on Tesla T4 GPUs.
 
-Despite these advantages, DBR-Net still has several limitations. The model has been evaluated on a limited number of road extraction datasets, and its generalization across different geographic regions, sensors, and imaging conditions requires further investigation. In addition, the current CNN-based architecture may still have limitations in modeling long-range dependencies and global road structures. In future work, we will therefore focus on evaluating DBR-Net on more diverse datasets and incorporating Transformer-based components or other global-context modeling strategies to further improve extraction accuracy and road connectivity.
+\label{subsec:limitations}
+Despite these advantages, DBRR-Net still has several limitations. The model has been evaluated on a limited number of road extraction datasets, and its generalization across different geographic regions, sensors, and imaging conditions requires further investigation. In addition, the current CNN-based architecture may still have limitations in modeling long-range dependencies and global road structures. In future work, we will therefore focus on evaluating DBRR-Net on more diverse datasets and incorporating Transformer-based components or other global-context modeling strategies to further improve extraction accuracy and road connectivity.
 
 \section*{CRediT authorship contribution statement}
 \textbf{Le Xuan Thang:} Conceptualization, Methodology, Writing -- original
