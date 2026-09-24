@@ -46,6 +46,7 @@ DATASETS = {
             Path("/kaggle/input/datasets/k4nngg/massa-road/datasetmassa/ROAD/training"),
         ],
         "out": "massachusetts_samples_5x2.png",
+        "out_overlay": "massachusetts_augmentation_1x5.png",
     },
     "deepglobe": {
         "roots": [
@@ -53,8 +54,12 @@ DATASETS = {
             Path("/kaggle/input/datasets/k4nngg/datadg/datasetdg/ROAD/training"),
         ],
         "out": "deepglobe_samples_5x2.png",
+        "out_overlay": "deepglobe_augmentation_1x5.png",
     },
 }
+
+OVERLAY_COLOR = (255, 45, 45)
+OVERLAY_ALPHA = 0.55
 
 MASK_SUBDIR_NAMES = ("labels", "masks")
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
@@ -211,6 +216,17 @@ def augment_pair(image: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.nd
     return image, np.ascontiguousarray(mask)
 
 
+def overlay_mask_on_image(
+    image: np.ndarray, mask: np.ndarray, color: Tuple[int, int, int], alpha: float
+) -> np.ndarray:
+    """Blend the road mask onto the image as a translucent color fill."""
+    overlay = image.astype(np.float32)
+    color_arr = np.asarray(color, dtype=np.float32)
+    road = mask.astype(bool)
+    overlay[road] = (1.0 - alpha) * overlay[road] + alpha * color_arr
+    return np.clip(overlay, 0, 255).astype(np.uint8)
+
+
 # ---------------------------------------------------------------------------
 # Grid rendering
 # ---------------------------------------------------------------------------
@@ -226,6 +242,7 @@ def render_grid(
     tile_size: int,
     gap: int,
     out_path: Path,
+    mode: str = "pairs",
 ) -> None:
     chosen = random.sample(pairs, n) if len(pairs) >= n else random.choices(pairs, k=n)
 
@@ -237,18 +254,25 @@ def render_grid(
         )
         image, mask = augment_pair(image, mask)
 
-        image_tile = Image.fromarray(image).resize((tile_size, tile_size), Image.BILINEAR)
-        mask_tile = Image.fromarray((mask * 255).astype(np.uint8)).resize((tile_size, tile_size), Image.NEAREST)
-        tiles_image.append(image_tile)
-        tiles_mask.append(mask_tile.convert("RGB"))
+        if mode == "overlay":
+            image = overlay_mask_on_image(image, mask, OVERLAY_COLOR, OVERLAY_ALPHA)
+            image_tile = Image.fromarray(image).resize((tile_size, tile_size), Image.BILINEAR)
+            tiles_image.append(image_tile)
+        else:
+            image_tile = Image.fromarray(image).resize((tile_size, tile_size), Image.BILINEAR)
+            mask_tile = Image.fromarray((mask * 255).astype(np.uint8)).resize((tile_size, tile_size), Image.NEAREST)
+            tiles_image.append(image_tile)
+            tiles_mask.append(mask_tile.convert("RGB"))
 
+    rows = 1 if mode == "overlay" else 2
     canvas_w = n * tile_size + (n - 1) * gap
-    canvas_h = 2 * tile_size + gap
+    canvas_h = rows * tile_size + (rows - 1) * gap
     canvas = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
     for col in range(n):
         x = col * (tile_size + gap)
         canvas.paste(tiles_image[col], (x, 0))
-        canvas.paste(tiles_mask[col], (x, tile_size + gap))
+        if mode != "overlay":
+            canvas.paste(tiles_mask[col], (x, tile_size + gap))
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(out_path)
@@ -258,6 +282,12 @@ def render_grid(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dataset", choices=["massachusetts", "deepglobe", "both"], default="both")
+    parser.add_argument(
+        "--mode",
+        choices=["pairs", "overlay"],
+        default="pairs",
+        help="'pairs': image row + binary mask row (2xN). 'overlay': single row, mask blended onto the image (1xN)",
+    )
     parser.add_argument("--n", type=int, default=5, help="number of columns (samples) per grid")
     parser.add_argument("--crop_size", type=int, default=1024, help="training crop size (train.py --crop_size)")
     parser.add_argument("--road_crop_probability", type=float, default=0.60)
@@ -277,6 +307,7 @@ def main() -> None:
         spec = DATASETS[name]
         images_dir, masks_dir = resolve_dataset_dirs(spec["roots"])
         pairs = build_pairs(images_dir, masks_dir)
+        out_name = spec["out_overlay"] if args.mode == "overlay" else spec["out"]
         render_grid(
             pairs,
             args.n,
@@ -286,7 +317,8 @@ def main() -> None:
             args.road_crop_tries,
             args.tile_size,
             args.gap,
-            args.out_dir / spec["out"],
+            args.out_dir / out_name,
+            mode=args.mode,
         )
 
 
