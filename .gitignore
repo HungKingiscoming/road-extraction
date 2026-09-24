@@ -59,3 +59,8 @@ paper/**/*.synctex.gz
 paper/**/*.abs
 paper/**/*.spl
 paper/main.pdf
+
+# Raw datasets and generated prediction dumps (never commit)
+/deepglobe/datasetdg/ROAD/
+/massachusetts/
+/images/

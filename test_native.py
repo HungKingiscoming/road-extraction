@@ -1,31 +1,19 @@
 """Trainer-matched Massachusetts/DeepGlobe evaluation with TTA and WeavingUnet-compatible metrics.
 
-The default inference path reproduces train.py validation: native resolution,
-ImageNet normalization, reflect padding, checkpoint-saved validation tile size
-and overlap, and Hann-weighted LOGIT blending. Optional flip4 or D4 TTA applies
-this complete path to each transformed full image and inverse-transforms the
-complete blended map. TTA views can be merged as probabilities (recommended)
-or logits.
+The default inference path is native resolution with ImageNet normalization,
+reflect padding, a 1024 window with 256 overlap (stride 768), and Hann-weighted
+LOGIT blending. Optional flip4 or D4 TTA applies this complete path to each
+transformed full image and inverse-transforms the complete blended map. TTA
+views can be merged as probabilities (recommended) or logits.
 
-Massachusetts subsets come from test.txt.
+There is no validation split: the decision threshold is fixed (--thr, default
+0.5) and the whole test split is evaluated.
 
-DeepGlobe has TWO protocols, selected by --subset:
-
-  V4 protocol (current, k4nngg/datadg source -- ROAD/training + ROAD/eval):
-    train.py trains on the ENTIRE ROAD/training/ pool (no train holdout) and
-    splits the SEPARATE ROAD/eval/ pool into a val slice and a DISJOINT test
-    slice (val is NOT a subset of test, unlike the legacy protocol below).
-    Subsets: deepglobe_eval_val, deepglobe_eval_test, deepglobe_eval_all
-    (the entire labeled eval/ pool, no split -- e.g. 1226 images).
-    Prefers split_manifest.json next to the checkpoint (exact reproduction);
-    falls back to regenerating the same permutation train.py used.
-
-  Legacy protocol (older balraj98 DeepGlobe source, single shared pool):
-    5000 random train + a test holdout that CONTAINS an overlapping 300-image
-    val slice (val subset of test, by design).
-    Subsets: deepglobe_val300, deepglobe_test1226.
-    Prefers split_manifest.json (must record overlap_counts.val_test==300);
-    falls back to regenerating the same permutation train.py used.
+Subsets (--subset):
+  Massachusetts: test178 -- every entry of test.txt.
+  DeepGlobe:     deepglobe_test -- the split_manifest.json "test" list next to
+                 the checkpoint when present, otherwise the entire labeled
+                 ROAD/eval pool (k4nngg/datadg source, e.g. 1226 images).
 """
 from __future__ import annotations
 
@@ -113,66 +101,6 @@ def build_pairs(
             f"images={len(images)}, masks={len(masks)}, pairs={len(common)}"
         )
     return [(images[key], masks[key]) for key in common]
-
-
-def regenerate_deepglobe_split(
-    image_dir: str | Path,
-    mask_dir: str | Path,
-    train_count: int,
-    val_from_test_count: int,
-    split_seed: int,
-) -> Tuple[List[Tuple[Path, Path]], List[Tuple[Path, Path]]]:
-    """Reproduce train.py's LEGACY overlapping DeepGlobe split (single pool).
-
-    val is a SUBSET of test by design (see train.py's single-pool fallback
-    protocol). Do not use this for the V4 ROAD/training + ROAD/eval source --
-    use deepglobe_eval_pool_split instead.
-    """
-    all_pairs = build_pairs(image_dir, mask_dir)
-    total = len(all_pairs)
-    if not 0 < train_count < total:
-        raise ValueError(
-            f"train_count={train_count} is invalid for {total} labeled pairs"
-        )
-    generator = np.random.default_rng(split_seed)
-    indices = generator.permutation(total)
-    test_pairs = [all_pairs[int(i)] for i in indices[train_count:]]
-    if not 0 < val_from_test_count <= len(test_pairs):
-        raise ValueError(
-            f"val_from_test_count={val_from_test_count} is invalid for "
-            f"{len(test_pairs)} test pairs"
-        )
-    return test_pairs[:val_from_test_count], test_pairs
-
-
-def deepglobe_eval_pool_split(
-    image_dir: str | Path,
-    mask_dir: str | Path,
-    eval_val_count: int,
-    split_seed: int,
-) -> Tuple[List[Tuple[Path, Path]], List[Tuple[Path, Path]]]:
-    """Reproduce train.py's V4 non-overlapping eval-pool split exactly.
-
-    Must use the identical RNG algorithm train.py's resolve_splits() uses for
-    the labeled eval/ pool: np.random.default_rng(split_seed).permutation(len),
-    then slice [:eval_val_count] for val and [eval_val_count:] for test.
-    Unlike the legacy protocol, val and test here are DISJOINT -- val is NOT
-    a subset of test.
-    """
-    eval_pairs = build_pairs(image_dir, mask_dir)
-    total = len(eval_pairs)
-    if not 0 < eval_val_count < total:
-        raise ValueError(
-            f"deepglobe_eval_val_count={eval_val_count} is invalid for "
-            f"{total} labeled eval pairs"
-        )
-    generator = np.random.default_rng(split_seed)
-    indices = generator.permutation(total)
-    val_indices = indices[:eval_val_count]
-    test_indices = indices[eval_val_count:]
-    val_pairs = [eval_pairs[int(i)] for i in val_indices]
-    test_pairs = [eval_pairs[int(i)] for i in test_indices]
-    return val_pairs, test_pairs
 
 
 def pairs_from_list(
@@ -279,15 +207,9 @@ def resolve_checkpoint(path: str | Path) -> Path:
     if path.is_file():
         return path
     if path.is_dir():
-        for name in (
-            "best_fixed_road_iou.pt",
-            "best.pt",
-            "best_calibrated_road_iou.pt",
-            "last.pt",
-        ):
-            candidate = path / name
-            if candidate.is_file():
-                return candidate
+        candidate = path / "last.pt"
+        if candidate.is_file():
+            return candidate
         candidates = sorted(path.rglob("*.pt")) + sorted(path.rglob("*.pth"))
         if len(candidates) == 1:
             return candidates[0]
@@ -815,19 +737,6 @@ def score_maps(
     )
 
 
-def pooled_metrics_at_threshold(
-    probabilities: Sequence[np.ndarray],
-    ground_truths: Sequence[np.ndarray],
-    threshold: float,
-) -> Dict[str, float]:
-    pooled = [0, 0, 0, 0]
-    for probability, gt in zip(probabilities, ground_truths):
-        values = counts(probability >= threshold, gt)
-        for index, value in enumerate(values):
-            pooled[index] += value
-    return metrics_from_counts(*pooled)
-
-
 def parse_color(text: str) -> Tuple[int, int, int]:
     parts = [p.strip() for p in text.split(",")]
     if len(parts) != 3:
@@ -895,7 +804,7 @@ def save_cache(
     gt_objects = np.empty(len(ground_truths), dtype=object)
     for index, probability in enumerate(probabilities):
         # Keep float32 so reloading a cache cannot move pixels across the
-        # fixed/calibrated threshold and change the reported IoU.
+        # decision threshold and change the reported IoU.
         prob_objects[index] = probability.astype(np.float32)
     for index, gt in enumerate(ground_truths):
         gt_objects[index] = gt.astype(np.uint8)
@@ -939,8 +848,8 @@ def parse_args() -> argparse.Namespace:
         choices=("none", "roadx3", "flip4", "d4"),
         default="none",
         help=(
-            "none matches trainer validation; roadx3 uses corrected 3-view "
-            "RoadX TTA; flip4/d4 retain trainer-matched sliding inference"
+            "none is plain sliding-window inference; roadx3 uses corrected "
+            "3-view RoadX TTA; flip4/d4 use flip/rotation TTA"
         ),
     )
     ap.add_argument(
@@ -961,14 +870,14 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--window",
         type=int,
-        default=None,
-        help="auto-read checkpoint args.val_tile_size when omitted",
+        default=1024,
+        help="sliding-window tile size in pixels",
     )
     ap.add_argument(
         "--stride",
         type=int,
-        default=None,
-        help="auto-compute window - checkpoint args.val_overlap when omitted",
+        default=768,
+        help="sliding-window stride in pixels (window - overlap)",
     )
     ap.add_argument("--tile-batch-size", type=int, default=1)
     ap.add_argument(
@@ -978,42 +887,19 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument(
         "--subset",
-        choices=(
-            "val61", "test117", "all178", "custom",
-            # V4 protocol: ROAD/training (full train) + ROAD/eval (val/test,
-            # disjoint). deepglobe_eval_all is the entire labeled eval/ pool
-            # with no split (e.g. 1226 images).
-            "deepglobe_eval_val", "deepglobe_eval_test", "deepglobe_eval_all",
-            # Legacy protocol: old balraj98 single shared pool, val is a
-            # SUBSET of test (overlapping by design).
-            "deepglobe_val300", "deepglobe_test1226",
-        ),
+        choices=("test178", "deepglobe_test"),
         default=None,
         help=(
-            "Default is test117 for Massachusetts and deepglobe_eval_test "
-            "for DeepGlobe (V4 protocol). Use deepglobe_eval_all to evaluate "
-            "on the entire labeled eval/ pool at once."
+            "Default is test178 for Massachusetts (all of test.txt) and "
+            "deepglobe_test for DeepGlobe (the whole test split)."
         ),
     )
-    ap.add_argument("--val-count", type=int, default=61)
     ap.add_argument(
         "--limit",
         type=int,
         default=None,
         help="Optional debug limit applied after subset selection",
     )
-    ap.add_argument(
-        "--search-threshold",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Search pooled-IoU threshold; permitted only on val61 or "
-            "deepglobe_eval_val/deepglobe_val300"
-        ),
-    )
-    ap.add_argument("--threshold-min", type=float, default=0.20)
-    ap.add_argument("--threshold-max", type=float, default=0.80)
-    ap.add_argument("--threshold-step", type=float, default=0.02)
     ap.add_argument("--relaxed-buffer-px", type=int, default=3)
     ap.add_argument("--out", default=None, help="Optional .npz probability/GT cache")
     ap.add_argument(
@@ -1051,11 +937,9 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Auto-select the known Massachusetts/DeepGlobe Kaggle root. For "
-            "DeepGlobe V4 subsets, defaults to "
+            "DeepGlobe, defaults to "
             "/kaggle/input/datasets/k4nngg/datadg/datasetdg/ROAD "
-            "(images/masks resolved as <root>/eval/images, <root>/eval/masks). "
-            "For legacy deepglobe_val300/deepglobe_test1226, defaults to the "
-            "old balraj98 dataset root."
+            "(images/masks resolved as <root>/eval/images, <root>/eval/masks)."
         ),
     )
     ap.add_argument(
@@ -1073,34 +957,9 @@ def parse_args() -> argparse.Namespace:
         "--split-manifest",
         default=None,
         help=(
-            "split_manifest.json to reproduce an exact train.py split; "
+            "split_manifest.json to reproduce an exact train.py test split; "
             "defaults to split_manifest.json beside the checkpoint"
         ),
-    )
-    ap.add_argument("--split-seed", type=int, default=3407)
-    ap.add_argument(
-        "--deepglobe-eval-val-count",
-        type=int,
-        default=226,
-        help=(
-            "V4 protocol only: size of the val slice carved out of the "
-            "labeled eval/ pool (the rest becomes deepglobe_eval_test). Must "
-            "match the value train.py was run with (--deepglobe_eval_val_count) "
-            "for the regenerated split to line up with the checkpoint's "
-            "actual validation set when split_manifest.json is unavailable."
-        ),
-    )
-    ap.add_argument(
-        "--deepglobe-train-count",
-        type=int,
-        default=5000,
-        help="Legacy protocol only (deepglobe_val300/deepglobe_test1226)",
-    )
-    ap.add_argument(
-        "--deepglobe-val-from-test-count",
-        type=int,
-        default=300,
-        help="Legacy protocol only (deepglobe_val300/deepglobe_test1226)",
     )
     ap.add_argument(
         "--channels-last",
@@ -1132,172 +991,49 @@ def main() -> None:
         raise ValueError(f"Unsupported checkpoint dataset: {args.dataset}")
     if args.subset is None:
         args.subset = (
-            "deepglobe_eval_test"
-            if args.dataset == "deepglobe"
-            else "test117"
+            "deepglobe_test" if args.dataset == "deepglobe" else "test178"
         )
     if not 0.0 <= args.thr <= 1.0:
         raise ValueError("--thr must be in [0, 1]")
-    if args.window is not None and args.window < 32:
+    if args.window < 32:
         raise ValueError("--window must be >= 32")
-    if args.stride is not None and args.stride < 1:
-        raise ValueError("--stride must be >= 1")
-    if (
-        args.window is not None
-        and args.stride is not None
-        and args.stride > args.window
-    ):
+    if args.stride < 1 or args.stride > args.window:
         raise ValueError("--stride must satisfy 1 <= stride <= window")
     if args.tile_batch_size < 1:
         raise ValueError("--tile-batch-size must be >= 1")
     if args.limit is not None and args.limit < 1:
         raise ValueError("--limit must be >= 1")
-    if args.val_count < 1:
-        raise ValueError("--val-count must be positive")
-    if args.deepglobe_train_count < 1:
-        raise ValueError("--deepglobe-train-count must be positive")
-    if args.deepglobe_val_from_test_count < 1:
-        raise ValueError("--deepglobe-val-from-test-count must be positive")
-    if args.deepglobe_eval_val_count < 1:
-        raise ValueError("--deepglobe-eval-val-count must be positive")
     if args.relaxed_buffer_px < 0:
         raise ValueError("--relaxed-buffer-px cannot be negative")
-    if args.threshold_step <= 0:
-        raise ValueError("--threshold-step must be positive")
-    if not 0.0 <= args.threshold_min <= args.threshold_max <= 1.0:
-        raise ValueError("Threshold search range must be inside [0, 1]")
     overlay_color = parse_color(args.overlay_color)
-    calibration_subsets = {"val61", "deepglobe_val300", "deepglobe_eval_val"}
-    if args.search_threshold and args.subset not in calibration_subsets:
-        raise ValueError(
-            "Threshold search is allowed only on val61, deepglobe_eval_val, "
-            "or deepglobe_val300; reuse the selected threshold on the "
-            "corresponding full test set"
-        )
-
-    v4_subsets = {"deepglobe_eval_val", "deepglobe_eval_test", "deepglobe_eval_all"}
-    legacy_subsets = {"deepglobe_val300", "deepglobe_test1226"}
 
     if args.dataset == "deepglobe":
-        if args.subset not in v4_subsets | legacy_subsets:
-            raise ValueError(
-                "DeepGlobe requires --subset one of: "
-                "deepglobe_eval_val, deepglobe_eval_test, deepglobe_eval_all "
-                "(current k4nngg ROAD/eval protocol), or the legacy "
-                "deepglobe_val300/deepglobe_test1226 (old balraj98 protocol)"
-            )
-
-        if args.subset in v4_subsets:
-            eval_root = Path(
-                args.data_root
-                or "/kaggle/input/datasets/k4nngg/datadg/datasetdg/ROAD"
-            )
-            image_dir = (
-                Path(args.image_dir) if args.image_dir else eval_root / "eval" / "images"
-            )
-            mask_dir = (
-                Path(args.mask_dir) if args.mask_dir else eval_root / "eval" / "masks"
-            )
-
-            if args.subset == "deepglobe_eval_all":
-                # Entire labeled eval/ pool, no split -- e.g. all 1226 images.
-                pairs = build_pairs(image_dir, mask_dir)
-                split_source = f"{image_dir} (full eval pool, no val/test split)"
-            else:
-                manifest_path = (
-                    Path(args.split_manifest)
-                    if args.split_manifest
-                    else resolved_ckpt.parent / "split_manifest.json"
-                )
-                manifest_split = (
-                    "val" if args.subset == "deepglobe_eval_val" else "test"
-                )
-                if manifest_path.is_file():
-                    pairs, _manifest = pairs_from_manifest(
-                        manifest_path, manifest_split
-                    )
-                    split_source = manifest_path
-                else:
-                    val_pairs, test_pairs = deepglobe_eval_pool_split(
-                        image_dir,
-                        mask_dir,
-                        args.deepglobe_eval_val_count,
-                        args.split_seed,
-                    )
-                    pairs = (
-                        val_pairs
-                        if args.subset == "deepglobe_eval_val"
-                        else test_pairs
-                    )
-                    split_source = Path(
-                        "regenerated (V4 eval-pool protocol): "
-                        f"seed={args.split_seed}, "
-                        f"eval_val_count={args.deepglobe_eval_val_count} "
-                        f"-- WARNING: only correct if this matches the "
-                        f"--deepglobe_eval_val_count train.py actually used"
-                    )
-            # No hardcoded expected_count here: the labeled eval/ pool size
-            # depends on the data source, unlike the fixed legacy 300/1226.
+        if args.subset != "deepglobe_test":
+            raise ValueError("DeepGlobe requires --subset deepglobe_test")
+        eval_root = Path(
+            args.data_root
+            or "/kaggle/input/datasets/k4nngg/datadg/datasetdg/ROAD"
+        )
+        image_dir = (
+            Path(args.image_dir) if args.image_dir else eval_root / "eval" / "images"
+        )
+        mask_dir = (
+            Path(args.mask_dir) if args.mask_dir else eval_root / "eval" / "masks"
+        )
+        manifest_path = (
+            Path(args.split_manifest)
+            if args.split_manifest
+            else resolved_ckpt.parent / "split_manifest.json"
+        )
+        if manifest_path.is_file():
+            pairs, _manifest = pairs_from_manifest(manifest_path, "test")
+            split_source = manifest_path
         else:
-            manifest_path = (
-                Path(args.split_manifest)
-                if args.split_manifest
-                else resolved_ckpt.parent / "split_manifest.json"
-            )
-            manifest_split = "val" if args.subset == "deepglobe_val300" else "test"
-            if manifest_path.is_file():
-                pairs, manifest = pairs_from_manifest(manifest_path, manifest_split)
-                overlap_counts = manifest.get("overlap_counts", {})
-                if int(overlap_counts.get("val_test", -1)) != 300:
-                    raise RuntimeError(
-                        "Manifest does not record the requested 300-image "
-                        f"val/test overlap: {overlap_counts}. If this "
-                        "manifest was produced by the current train.py "
-                        "(V4 protocol), use --subset deepglobe_eval_val / "
-                        "deepglobe_eval_test instead -- V4 does not use "
-                        "overlapping val/test."
-                    )
-                split_source = manifest_path
-            else:
-                deepglobe_root = Path(
-                    args.data_root
-                    or "/kaggle/input/datasets/balraj98/"
-                    "deepglobe-road-extraction-dataset"
-                )
-                image_dir = (
-                    Path(args.image_dir)
-                    if args.image_dir
-                    else deepglobe_root / "train"
-                )
-                mask_dir = (
-                    Path(args.mask_dir)
-                    if args.mask_dir
-                    else deepglobe_root / "train"
-                )
-                val_pairs, test_pairs = regenerate_deepglobe_split(
-                    image_dir=image_dir,
-                    mask_dir=mask_dir,
-                    train_count=args.deepglobe_train_count,
-                    val_from_test_count=args.deepglobe_val_from_test_count,
-                    split_seed=args.split_seed,
-                )
-                pairs = val_pairs if manifest_split == "val" else test_pairs
-                split_source = Path(
-                    "regenerated (legacy protocol): "
-                    f"seed={args.split_seed},train={args.deepglobe_train_count},"
-                    f"val_from_test={args.deepglobe_val_from_test_count}"
-                )
-            expected_count = 300 if manifest_split == "val" else 1226
-            if len(pairs) != expected_count:
-                raise RuntimeError(
-                    f"{args.subset} requires {expected_count} pairs, but the "
-                    f"resolved split contains {len(pairs)}"
-                )
+            pairs = build_pairs(image_dir, mask_dir)
+            split_source = f"{image_dir} (entire labeled eval pool)"
     else:
-        if args.subset not in {"val61", "test117", "all178", "custom"}:
-            raise ValueError(
-                "Massachusetts requires val61, test117, all178, or custom"
-            )
+        if args.subset != "test178":
+            raise ValueError("Massachusetts requires --subset test178")
         root = Path(
             args.data_root
             or "/kaggle/input/datasets/datnguyentien204/massachu/massachusets"
@@ -1305,13 +1041,7 @@ def main() -> None:
         image_dir = Path(args.image_dir) if args.image_dir else root / "images"
         mask_dir = Path(args.mask_dir) if args.mask_dir else root / "labels"
         test_list = Path(args.test_list) if args.test_list else root / "test.txt"
-        all_pairs = pairs_from_list(image_dir, mask_dir, test_list)
-        if args.subset == "val61":
-            pairs = all_pairs[: args.val_count]
-        elif args.subset == "test117":
-            pairs = all_pairs[args.val_count :]
-        else:
-            pairs = all_pairs
+        pairs = pairs_from_list(image_dir, mask_dir, test_list)
         split_source = test_list
     if not pairs:
         raise RuntimeError(f"Subset {args.subset} contains no images")
@@ -1345,24 +1075,8 @@ def main() -> None:
             channels_last=args.channels_last,
             deploy=args.deploy,
         )
-        checkpoint_args = checkpoint["args"]
-        saved_window = int(checkpoint_args.get("val_tile_size", 1024))
-        saved_overlap = int(checkpoint_args.get("val_overlap", 256))
-        window = saved_window if args.window is None else int(args.window)
-        stride = (
-            window - saved_overlap
-            if args.stride is None
-            else int(args.stride)
-        )
-        if window < 32:
-            raise ValueError("Resolved inference window must be >= 32")
-        if stride < 1 or stride > window:
-            raise ValueError(
-                "Resolved stride must satisfy 1 <= stride <= window; "
-                f"checkpoint val_tile_size={saved_window}, "
-                f"val_overlap={saved_overlap}, resolved window={window}, "
-                f"stride={stride}"
-            )
+        window = int(args.window)
+        stride = int(args.stride)
         epoch = int(checkpoint.get("epoch", -1)) + 1
         print(f"Checkpoint : {ckpt_path}")
         print(f"Weights    : {args.weights}")
@@ -1371,16 +1085,8 @@ def main() -> None:
         print(f"Device     : {device}")
         print(f"Dataset    : {args.dataset}")
         print(f"Split file : {split_source}")
-        if args.dataset == "deepglobe":
-            protocol = "V4 (non-overlapping)" if args.subset in v4_subsets else "legacy (overlapping)"
-            print(f"Subset     : {args.subset} [{protocol}]")
-        else:
-            print(f"Subset     : {args.subset} (val_count={args.val_count})")
+        print(f"Subset     : {args.subset}")
         print(f"Images     : {len(pairs)}")
-        print(
-            f"Train val  : tile={saved_window} | overlap={saved_overlap} | "
-            f"stride={saved_window - saved_overlap}"
-        )
         if args.tta_mode == "roadx3":
             inference_profile = (
                 "stride-multiple reflect pad | uniform PROB blending | "
@@ -1484,22 +1190,6 @@ def main() -> None:
         f"RELAXED ±{args.relaxed_buffer_px}px F1={relaxed_f1:.4f}"
     )
 
-    if args.search_threshold:
-        best_threshold = args.thr
-        best_iou = -1.0
-        threshold = args.threshold_min
-        while threshold <= args.threshold_max + 1e-9:
-            candidate = pooled_metrics_at_threshold(
-                probabilities, ground_truths, threshold
-            )
-            if candidate["iou"] > best_iou:
-                best_iou = candidate["iou"]
-                best_threshold = threshold
-            threshold += args.threshold_step
-        print(
-            f"VAL-CALIBRATED threshold={best_threshold:.2f} "
-            f"pooled road IoU={best_iou:.4f}"
-        )
     print("=" * 72)
 
 

@@ -259,6 +259,7 @@ ENTRY
     assignee
     author
     booktitle
+    doi
     chapter
     day
     dayfiled
@@ -1929,6 +1930,26 @@ FUNCTION {format.url}
 
 
 
+%% DOI (printed as an http://dx.doi.org/ link after the URL)
+
+FUNCTION {format.doi}
+{ doi empty$
+    { "" }
+    { this.to.prev.status
+      this.status.std
+      cap.yes 'status.cap :=
+      "\url{http://dx.doi.org/" doi * "}" *
+      punct.no 'this.status.punct :=
+      punct.period 'prev.status.punct :=
+      space.normal 'this.status.space :=
+      space.normal 'prev.status.space :=
+      quote.no 'this.status.quote :=
+    }
+  if$
+}
+
+
+
 %%%%%%%%%%%%%%%%%%%%
 %% ENTRY HANDLERS %%
 %%%%%%%%%%%%%%%%%%%%
@@ -1951,6 +1972,7 @@ FUNCTION {article}
   format.date "year" output.warn
   format.note output
   format.url output
+  format.doi output
   fin.entry
   if.url.std.interword.spacing
 }
@@ -1975,6 +1997,7 @@ FUNCTION {book}
   format.number output
   format.note output
   format.url output
+  format.doi output
   fin.entry
   if.url.std.interword.spacing
 }
@@ -1992,6 +2015,7 @@ FUNCTION {booklet}
   format.date output
   format.note output
   format.url output
+  format.doi output
   fin.entry
   if.url.std.interword.spacing
 }
@@ -2009,6 +2033,7 @@ FUNCTION {electronic}
   format.address "address" bibinfo.check output
   format.note output
   format.url output
+  format.doi output
   fin.entry
   empty.entry.warn
   if.url.std.interword.spacing
@@ -2032,6 +2057,7 @@ FUNCTION {inbook}
   format.pages output
   format.note output
   format.url output
+  format.doi output
   fin.entry
   if.url.std.interword.spacing
 }
@@ -2053,6 +2079,7 @@ FUNCTION {incollection}
   format.pages output
   format.note output
   format.url output
+  format.doi output
   fin.entry
   if.url.std.interword.spacing
 }
@@ -2079,6 +2106,7 @@ FUNCTION {inproceedings}
   format.pages output
   format.note output
   format.url output
+  format.doi output
   fin.entry
   if.url.std.interword.spacing
 }
@@ -2096,6 +2124,7 @@ FUNCTION {manual}
   format.date output
   format.note output
   format.url output
+  format.doi output
   fin.entry
   if.url.std.interword.spacing
 }
@@ -2113,6 +2142,7 @@ FUNCTION {mastersthesis}
   format.date "year" output.warn
   format.note output
   format.url output
+  format.doi output
   fin.entry
   if.url.std.interword.spacing
 }
@@ -2131,6 +2161,7 @@ FUNCTION {misc}
   format.date output
   format.note output
   format.url output
+  format.doi output
   fin.entry
   empty.entry.warn
   if.url.std.interword.spacing
@@ -2147,6 +2178,7 @@ FUNCTION {patent}
   format.patent.date output
   format.note output
   format.url output
+  format.doi output
   fin.entry
   empty.entry.warn
   if.url.std.interword.spacing
@@ -2166,6 +2198,7 @@ FUNCTION {periodical}
   format.date "year" output.warn
   format.note output
   format.url output
+  format.doi output
   fin.entry
   if.url.std.interword.spacing
 }
@@ -2183,6 +2216,7 @@ FUNCTION {phdthesis}
   format.date "year" output.warn
   format.note output
   format.url output
+  format.doi output
   fin.entry
   if.url.std.interword.spacing
 }
@@ -2205,6 +2239,7 @@ FUNCTION {proceedings}
   if$
   format.note output
   format.url output
+  format.doi output
   fin.entry
   if.url.std.interword.spacing
 }
@@ -2222,6 +2257,7 @@ FUNCTION {standard}
   format.date output
   format.note output
   format.url output
+  format.doi output
   fin.entry
   if.url.std.interword.spacing
 }
@@ -2240,6 +2276,7 @@ FUNCTION {techreport}
   format.date "year" output.warn
   format.note output
   format.url output
+  format.doi output
   fin.entry
   if.url.std.interword.spacing
 }
@@ -2254,6 +2291,7 @@ FUNCTION {unpublished}
   format.date output
   format.note "note" output.warn
   format.url output
+  format.doi output
   fin.entry
   if.url.std.interword.spacing
 }

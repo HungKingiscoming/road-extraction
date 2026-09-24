@@ -86,12 +86,15 @@ Typical layout:
 
 ```text
 /data_root/
-├── train/
-├── valid/
-├── test/
+├── training/
+│   ├── images/
+│   └── masks/
+└── eval/
+    ├── images/
+    └── masks/
 ```
 
-The project supports a deterministic overlapping split protocol for reproducibility. It writes a `split_manifest.json` file for training and evaluation alignment.
+`train.py` trains on every pair under `training/` and uses the whole labeled `eval/` pool as the test split. There is no validation split. It writes a `split_manifest.json` file for training and evaluation alignment.
 
 ## Training
 
@@ -118,9 +121,7 @@ python train.py \
 ```bash
 python train.py \
   --dataset deepglobe \
-  --data_root /path/to/deepglobe \
-  --deepglobe_train_count 5000 \
-  --deepglobe_val_from_test_count 300 \
+  --data_root /path/to/deepglobe/ROAD \
   --epochs 120 \
   --crop_size 1024 \
   --save_dir ./checkpoints/dg_dualbranch
@@ -142,7 +143,7 @@ python train.py --dataset massachusetts --resume ./checkpoints/mass_dualbranch/l
 
 ```bash
 python train.py --dataset deepglobe \
-  --pretrained_checkpoint ./checkpoints/mass_dualbranch/best_fixed_road_iou.pt \
+  --pretrained_checkpoint ./checkpoints/mass_dualbranch/last.pt \
   --transfer_weights ema
 ```
 
@@ -209,32 +210,24 @@ direction.
 
 The project evaluates at native image resolution instead of resizing inputs. It uses an overlapping sliding-window strategy with Hann-weighted logit blending to reduce seam artifacts.
 
-### Validation / testing
+### Testing
+
+There is no validation split: the decision threshold is fixed (`--thr`, default 0.5) and the whole test split is evaluated.
 
 ```bash
 python test_native.py \
-  --ckpt ./checkpoints/mass_dualbranch/best_fixed_road_iou.pt \
-  --subset val61 \
-  --search-threshold
-```
-
-Then apply the threshold on the test split:
-
-```bash
-python test_native.py \
-  --ckpt ./checkpoints/mass_dualbranch/best_fixed_road_iou.pt \
-  --subset test117 \
-  --thr 0.46 \
+  --ckpt ./checkpoints/mass_dualbranch/last.pt \
+  --subset test178 \
   --tta-mode flip4 \
-  --out cache_test117.npz
+  --out cache_test178.npz
 ```
 
 DeepGlobe evaluation:
 
 ```bash
-a python test_native.py \
-  --ckpt ./checkpoints/dg_dualbranch/best_fixed_road_iou.pt \
-  --subset deepglobe_test1226
+python test_native.py \
+  --ckpt ./checkpoints/dg_dualbranch/last.pt \
+  --subset deepglobe_test
 ```
 
 ### Main metrics
@@ -252,15 +245,13 @@ Each run saves a checkpoint directory such as:
 
 ```text
 save_dir/
-├── best_fixed_road_iou.pt
-├── best_calibrated_road_iou.pt
 ├── last.pt
 ├── split_manifest.json
 ├── metrics.jsonl
 └── ...
 ```
 
-The checkpoint stores the model, EMA weights, optimizer state, scheduler state, scaler state, epoch, validation metrics, and full training arguments, allowing exact resumption and reproducible evaluation.
+The checkpoint stores the model, EMA weights, optimizer state, scheduler state, scaler state, epoch, and full training arguments, allowing exact resumption and reproducible evaluation.
 
 ## Deployment optimization
 
@@ -277,13 +268,13 @@ The script `compare_reparameterization.py` verifies that the deploy-time model m
 - `batch_size` is per-GPU
 - `accumulation_steps` controls effective batch size
 - AMP (automatic mixed precision) and `channels_last` are enabled by default
-- EMA weights are used for validation and testing
+- EMA weights are used for testing
 - progressive unfreezing is supported for transfer learning scenarios
 
 ## Useful scripts
 
 - `train.py`: training pipeline
-- `test_native.py`: native-resolution validation/test inference
+- `test_native.py`: native-resolution test inference
 - `compare_reparameterization.py`: deployment equivalence and efficiency comparison
 - `modeling/model.py`: model architecture
 - `modeling/decoder.py`: loss and decoder logic
@@ -350,8 +341,7 @@ Images smaller than the crop are **reflect-padded** while masks are **zero-padde
 - **Gradient accumulation** via `--accumulation_steps` (2). Effective batch =
   `batch_size × world_size × accumulation_steps` (2×1×2 = 4 by default).
 - **Gradient clipping** at norm 3.0. **EMA** with decay 0.999 and a ramp
-  $d_t = 0.999\,(1 - e^{-t/2000})$ — **the EMA weights are what gets validated and
-  tested**.
+  $d_t = 0.999\,(1 - e^{-t/2000})$ — **the EMA weights are what gets tested**.
 
 ### 5.4. Progressive unfreezing
 
@@ -387,10 +377,6 @@ for the **entire** encoder).
   removes one blocking all-reduce and two device synchronizations from **every healthy
   batch**.
 - In-epoch metrics are gathered with **one** device-to-host copy covering five scalars.
-- Validation uses `DistributedEvalSampler`, which shards **exactly** rather than
-  padding with duplicated images the way `DistributedSampler` does (duplicates would
-  corrupt the pooled IoU).
-- `ema.module` is broadcast from rank 0 before each validation pass.
 
 ---
 
@@ -398,43 +384,36 @@ for the **entire** encoder).
 
 ### 6.1. Native-resolution inference
 
-Images are never resized. A sliding window of `--val_tile_size` (1024) with
-`--val_overlap` (256) gives stride 768. Each tile is multiplied by a **2-D Hann
+Images are never resized. A sliding window of `--window` (1024) with
+`--stride` (768, i.e. 256 overlap) is used by `test_native.py`. Each tile is multiplied by a **2-D Hann
 window** (clamped to a minimum of 0.05) and accumulated in the **logit domain**, then
 divided by the accumulated weights — removing tile seams completely. Images smaller
 than one tile are `reflect`-padded.
 
 ### 6.2. Metrics
 
-All metrics are computed from the **dataset-pooled confusion matrix**, reported with a
-`fixed_` prefix (threshold 0.5) and a `calibrated_` prefix (optimal threshold):
+`test_native.py` computes all metrics at the fixed threshold `--thr` (default 0.5)
+from the **dataset-pooled confusion matrix**:
 
 - `road_iou` — the **primary metric**, IoU of the road class alone.
 - `background_iou`, `miou`, `precision`, `recall`, `f1`, `accuracy`.
-- `fixed_road_iou_macro` — IoU averaged **per image** (macro).
-- `fixed_relaxed_f1` — **relaxed F1 at ±3 px** (`--relaxed_buffer_px`): a prediction
+- macro IoU — IoU averaged **per image**.
+- relaxed F1 at ±3 px (`--relaxed-buffer-px`): a prediction
   counts as correct if it falls within a 3 px dilation of the ground truth, and vice
   versa. This reflects **route/topology quality** and is far less sensitive to the
   1–2 px jitter of hand-drawn labels.
-
-**Threshold calibration.** A 1001-bin histogram of probabilities per true class is
-accumulated, then thresholds from 0.20 to 0.80 in steps of 0.02 are swept to maximize
-road IoU — **without ever storing full probability maps**. The result is reported as
-`calibrated_threshold`.
 
 ### 6.3. Run outputs
 
 ```
 save_dir/
-├── best_fixed_road_iou.pt        # best IoU @0.5
-├── best_calibrated_road_iou.pt   # best IoU at the calibrated threshold
-├── last.pt                       # for exact resumption
+├── last.pt                       # latest epoch, for evaluation and exact resumption
 ├── split_manifest.json           # split reproducibility
 └── metrics.jsonl                 # one JSON line per epoch
 ```
 
 Every checkpoint stores `model`, `ema`, `optimizer`, `scheduler`, `scaler`, `epoch`,
-`validation`, and the **complete `args`** — which is how `test_native.py` reconstructs
+and the **complete `args`** — which is how `test_native.py` reconstructs
 the **exact** architecture without you passing the hyperparameters again. Saving goes
 through `atomic_torch_save` (write `.tmp`, then `os.replace`), so a process killed
 mid-write never leaves a corrupt checkpoint.
@@ -476,14 +455,12 @@ python train.py \
   --save_dir ./checkpoints/mass_dualbranch
 ```
 
-### 8.2. Training — DeepGlobe with the overlapping protocol
+### 8.2. Training — DeepGlobe
 
 ```bash
 python train.py \
   --dataset deepglobe \
-  --data_root /path/to/deepglobe \
-  --deepglobe_train_count 5000 \
-  --deepglobe_val_from_test_count 300 \
+  --data_root /path/to/deepglobe/ROAD \
   --epochs 120 --crop_size 1024 \
   --save_dir ./checkpoints/dg_dualbranch
 ```
@@ -498,7 +475,7 @@ torchrun --nproc_per_node=2 train.py --dataset massachusetts --data_root /path/.
 
 ```bash
 python train.py --dataset deepglobe \
-  --pretrained_checkpoint ./checkpoints/mass_dualbranch/best_fixed_road_iou.pt \
+  --pretrained_checkpoint ./checkpoints/mass_dualbranch/last.pt \
   --transfer_weights ema
 # --progressive_unfreeze turns on automatically;
 # only the newly introduced spatial-gate tensors are allowed to be missing
@@ -510,23 +487,19 @@ python train.py --dataset deepglobe \
 python train.py --dataset massachusetts --resume ./checkpoints/mass_dualbranch/last.pt
 ```
 
-`--resume` restores the **full** model / EMA / optimizer / scheduler / scaler / epoch /
-best-score state. It cannot be combined with `--pretrained_checkpoint`.
+`--resume` restores the **full** model / EMA / optimizer / scheduler / scaler / epoch
+state. It cannot be combined with `--pretrained_checkpoint`.
 
 ### 8.6. Final evaluation — `test_native.py`
 
 ```bash
-# Massachusetts: calibrate the threshold on val61 (the only place it is permitted)
-python test_native.py --ckpt ./checkpoints/mass_dualbranch/best_fixed_road_iou.pt \
-  --subset val61 --search-threshold
-
-# then apply the chosen threshold to test117
-python test_native.py --ckpt ./checkpoints/mass_dualbranch/best_fixed_road_iou.pt \
-  --subset test117 --thr 0.46 --tta-mode flip4 --out cache_test117.npz
+# Massachusetts: the whole test.txt (178 images), fixed threshold 0.5
+python test_native.py --ckpt ./checkpoints/mass_dualbranch/last.pt \
+  --subset test178 --tta-mode flip4 --out cache_test178.npz
 
 # DeepGlobe (reads split_manifest.json next to the checkpoint)
-python test_native.py --ckpt ./checkpoints/dg_dualbranch/best_fixed_road_iou.pt \
-  --subset deepglobe_test1226
+python test_native.py --ckpt ./checkpoints/dg_dualbranch/last.pt \
+  --subset deepglobe_test
 ```
 
 Key options:
@@ -535,10 +508,10 @@ Key options:
 |---|---|
 | `--weights ema\|model` | defaults to `ema` |
 | `--deploy` | fuse the Rep-blocks **after** loading the checkpoint (the `.npz` cache is renamed automatically so caches never mix) |
-| `--tta-mode none\|roadx3\|flip4\|d4` | `none` exactly matches training-time validation |
+| `--tta-mode none\|roadx3\|flip4\|d4` | `none` is plain sliding-window inference |
 | `--tta-merge probabilities\|logits` | `probabilities` recommended |
 | `--out cache.npz` | save/reload float32 probability maps and labels (change the threshold without re-running the model) |
-| `--search-threshold` | **allowed only on `val61` / `deepglobe_val300`** — prevents test-set leakage |
+| `--thr` | fixed decision threshold (default 0.5) |
 
 > **`roadx3`** is a compatibility profile for the supplied `roadx.infer` code: pad to a
 > stride multiple, use three views (identity / horizontal / vertical flip), blend
@@ -550,8 +523,8 @@ Key options:
 
 ```bash
 python compare_reparameterization.py \
-  --ckpt ./checkpoints/mass_dualbranch/best_fixed_road_iou.pt \
-  --subset val61 --json-out rep_report.json
+  --ckpt ./checkpoints/mass_dualbranch/last.pt \
+  --json-out rep_report.json
 ```
 
 In a **single run**, the script:
@@ -573,8 +546,8 @@ Trim the run with `--skip-benchmark` / `--skip-eval`.
 |---|---|
 | [modeling/model.py](modeling/model.py) | `TruncatedResNet34`, `ProgressiveDAPPM`, `ResidualSpatialGate`, `ControlledRoadFusion`, `DualResolutionContext`, `DualBranchRoadNet`, `build_model` |
 | [modeling/decoder.py](modeling/decoder.py) | `ConvBNAct` / `ConvGNAct`, `RepVGGBlock`, `RepDepthwiseBlock`, `RoadReconstructionDecoder`, `soft_skeletonize`, `RoadSegCenterlineTverskyLoss`, `verify_reparameterization` |
-| [train.py](train.py) | DDP, dataset discovery, split resolution, dataset/augmentation, optimizer/scheduler/EMA, training loop, sliding-window validation, checkpointing |
-| [test_native.py](test_native.py) | Native-resolution evaluation with TTA, threshold calibration, `.npz` caching |
+| [train.py](train.py) | DDP, dataset discovery, split resolution, dataset/augmentation, optimizer/scheduler/EMA, training loop, checkpointing |
+| [test_native.py](test_native.py) | Native-resolution test evaluation with TTA, `.npz` caching |
 | [compare_reparameterization.py](compare_reparameterization.py) | Equivalence + FLOPs/latency/VRAM + evaluation of both model forms |
 | [run-gpu-container.sh](run-gpu-container.sh) | CUDA PyTorch container mounting the project at `/workspace` |
 
@@ -598,5 +571,5 @@ Trim the run with `--skip-benchmark` / `--skip-eval`.
 6. **Verified re-parameterization** — a DW 5×5 kernel fused from 3×3 / 1×5 / 5×1 /
    identity, with a script that proves equivalence and quantifies the deployment gain.
 7. **A strict evaluation protocol** — native resolution, Hann logit blending, splits
-   written to a manifest, threshold calibration **restricted** to validation, and
+   written to a manifest, a fixed decision threshold (no validation split), and
    relaxed F1 for topology.

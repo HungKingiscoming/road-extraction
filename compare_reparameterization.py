@@ -42,16 +42,9 @@ def resolve_checkpoint(path: str | Path) -> Path:
     if path.is_file():
         return path
     if path.is_dir():
-        for name in (
-            "best_fixed_road_iou.pt",
-            "best_fixed_iou.pt",
-            "best.pt",
-            "best_calibrated_road_iou.pt",
-            "last.pt",
-        ):
-            candidate = path / name
-            if candidate.is_file():
-                return candidate
+        candidate = path / "last.pt"
+        if candidate.is_file():
+            return candidate
         candidates = sorted(path.rglob("*.pt")) + sorted(path.rglob("*.pth"))
         if len(candidates) == 1:
             return candidates[0]

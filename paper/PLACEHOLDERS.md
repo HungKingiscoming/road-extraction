@@ -44,9 +44,9 @@ is self-contained.
 |---|---|
 | `[MASS_PAIRS]`, `[MASS_TRAIN]` | count entries in the Massachusetts `train.txt` / `test.txt` lists |
 
-The DeepGlobe counts (6226 / 5000 / 300 / 1226) and the Massachusetts
-validation and test counts (61 / 117) are fixed by the split code and need no
-verification.
+The DeepGlobe counts (6226 / 5000 / 1226) and the Massachusetts train and
+test counts (600 / 178) are fixed by the split code and need no verification.
+There is no validation split.
 
 ## Training configuration
 

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from time import perf_counter
-from typing import Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
@@ -20,12 +20,11 @@ from tqdm import tqdm
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.functional as F
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
 from modeling.decoder import RoadSegClDiceLoss
@@ -100,22 +99,6 @@ def unwrap_model(model: nn.Module) -> DualBranchRoadNet:
 def cleanup_distributed() -> None:
     if distributed_active():
         dist.destroy_process_group()
-
-
-class DistributedEvalSampler(Sampler[int]):
-    """Shard validation exactly, without padded duplicate images."""
-
-    def __init__(self, dataset: Dataset, rank: int, world_size: int) -> None:
-        self.dataset = dataset
-        self.rank = int(rank)
-        self.world_size = int(world_size)
-
-    def __iter__(self) -> Iterator[int]:
-        return iter(range(self.rank, len(self.dataset), self.world_size))
-
-    def __len__(self) -> int:
-        remaining = len(self.dataset) - self.rank
-        return max(0, math.ceil(remaining / self.world_size))
 
 
 def seed_everything(seed: int) -> None:
@@ -262,8 +245,8 @@ def _first_labeled_pair(
 ) -> Optional[Tuple[Path, Path]]:
     """Return the first directory pair that contains matched masks.
 
-    DeepGlobe mirrors commonly ship ``valid`` images without public masks.  A
-    directory existing is therefore not enough to call it a validation split.
+    Some DeepGlobe mirrors ship unlabeled image folders, so a directory
+    existing is not enough to call it a labeled test split.
     """
     for image_dir, mask_dir in candidates:
         if not image_dir.is_dir() or not mask_dir.is_dir():
@@ -287,14 +270,13 @@ def configure_dataset_paths(args: argparse.Namespace) -> None:
         args.train_mask_dir = args.train_mask_dir or str(root / "labels")
         args.train_list = args.train_list or str(root / "train.txt")
         args.test_list = args.test_list or str(root / "test.txt")
-        args.val_image_dir = None
-        args.val_mask_dir = None
+        args.test_image_dir = None
+        args.test_mask_dir = None
         return
 
     # k4nngg/datadg source: ROAD/training/{images,masks} (fully labeled,
     # used entirely for training) and ROAD/eval/{images,masks} (fully
-    # labeled pool of 1452 pairs, split by resolve_splits() into
-    # deepglobe_eval_val_count val images + the remainder as test).
+    # labeled, used entirely as the test split).
     root = Path(
         args.data_root
         or "/kaggle/input/datasets/k4nngg/datadg/datasetdg/ROAD"
@@ -312,21 +294,18 @@ def configure_dataset_paths(args: argparse.Namespace) -> None:
     )
     args.train_image_dir = args.train_image_dir or str(train_images)
     args.train_mask_dir = args.train_mask_dir or str(train_masks)
-    if args.val_image_dir is None and args.val_mask_dir is None:
-        labeled_validation = _first_labeled_pair(
+    if args.test_image_dir is None and args.test_mask_dir is None:
+        labeled_test = _first_labeled_pair(
             (
                 (root / "eval" / "images", root / "eval" / "masks"),
-                # Fallbacks for the older balraj98 DeepGlobe layout, which
-                # commonly ships an unlabeled "valid" directory.
-                (root / "valid" / "images", root / "valid" / "gt"),
-                (root / "val" / "images", root / "val" / "gt"),
-                (root / "valid", root / "valid"),
+                (root / "test" / "images", root / "test" / "masks"),
+                (root / "test" / "images", root / "test" / "gt"),
             )
         )
-        if labeled_validation is not None:
-            val_images, val_masks = labeled_validation
-            args.val_image_dir = str(val_images)
-            args.val_mask_dir = str(val_masks)
+        if labeled_test is not None:
+            test_images, test_masks = labeled_test
+            args.test_image_dir = str(test_images)
+            args.test_mask_dir = str(test_masks)
 
 
 def read_rgb(path: Path) -> np.ndarray:
@@ -605,197 +584,110 @@ class RoadCropDataset(Dataset):
         return image_to_tensor(image), torch.from_numpy(mask).long()
 
 
-class RoadNativeValidationDataset(Dataset):
-    def __init__(self, pairs: Sequence[Tuple[Path, Path]]) -> None:
-        self.pairs = list(pairs)
-
-    def __len__(self) -> int:
-        return len(self.pairs)
-
-    def __getitem__(self, index: int):
-        image_path, mask_path = self.pairs[index]
-        image, mask = read_rgb(image_path), read_binary_mask(mask_path)
-        if image.shape[:2] != mask.shape:
-            raise RuntimeError(f"Shape mismatch: {image_path} vs {mask_path}")
-        return image_to_tensor(image), torch.from_numpy(mask).long(), image_path.stem
-
-
 def resolve_splits(
     args: argparse.Namespace,
-) -> Tuple[
-    List[Tuple[Path, Path]],
-    List[Tuple[Path, Path]],
-    List[Tuple[Path, Path]],
-]:
+) -> Tuple[List[Tuple[Path, Path]], List[Tuple[Path, Path]]]:
+    """Return (train_pairs, test_pairs)."""
     if args.dataset == "massachusetts":
         train_pairs = pairs_from_list(
             args.train_image_dir, args.train_mask_dir, args.train_list
         )
-        listed_test_pairs = pairs_from_list(
+        test_pairs = pairs_from_list(
             args.train_image_dir, args.train_mask_dir, args.test_list
         )
         train_keys = {sample_key(image) for image, _ in train_pairs}
-        listed_test_keys = {sample_key(image) for image, _ in listed_test_pairs}
-        overlap = train_keys & listed_test_keys
+        test_keys = {sample_key(image) for image, _ in test_pairs}
+        overlap = train_keys & test_keys
         if overlap:
             raise RuntimeError(
                 f"train.txt and test.txt overlap on {len(overlap)} samples; "
                 f"examples={sorted(overlap)[:10]}"
             )
-        if args.test_eval_images >= len(listed_test_pairs):
-            raise ValueError(
-                "test_eval_images must be smaller than the number of test.txt "
-                "samples so a non-empty final test split remains"
-            )
-        val_pairs = listed_test_pairs[: args.test_eval_images]
-        test_pairs = listed_test_pairs[args.test_eval_images :]
         rank_zero_print(
-            f"TXT split: train={len(train_pairs)}, val={len(val_pairs)}, "
-            f"test={len(test_pairs)} | val=first {args.test_eval_images} entries "
-            f"of {args.test_list}"
+            f"TXT split: train={len(train_pairs)}, test={len(test_pairs)}"
         )
-        return train_pairs, val_pairs, test_pairs
+        return train_pairs, test_pairs
 
     all_pairs = build_pairs(args.train_image_dir, args.train_mask_dir)
-    if args.val_image_dir and args.val_mask_dir:
-        val_images, val_masks = Path(args.val_image_dir), Path(args.val_mask_dir)
-        if val_images.is_dir() and val_masks.is_dir():
+    if args.test_image_dir and args.test_mask_dir:
+        test_images, test_masks = Path(args.test_image_dir), Path(args.test_mask_dir)
+        if test_images.is_dir() and test_masks.is_dir():
             try:
-                eval_pairs = build_pairs(val_images, val_masks)
+                test_pairs = build_pairs(test_images, test_masks)
             except RuntimeError:
                 if args.dataset != "deepglobe":
                     raise
                 rank_zero_print(
-                    "DeepGlobe validation directory has no matched masks; "
+                    "DeepGlobe test directory has no matched masks; "
                     "using a labeled deterministic holdout from train instead."
                 )
             else:
-                if args.dataset == "deepglobe" and args.deepglobe_eval_split:
-                    # ROAD/eval is one labeled pool (1452 pairs in the
-                    # k4nngg source). Split it deterministically into a
-                    # small val slice and the full remainder as test.
-                    # Training keeps every pair under ROAD/training
-                    # untouched -- no holdout is carved out of train.
-                    eval_generator = np.random.default_rng(args.split_seed)
-                    eval_indices = eval_generator.permutation(len(eval_pairs))
-                    eval_val_count = int(args.deepglobe_eval_val_count)
-                    if eval_val_count >= len(eval_pairs):
-                        raise ValueError(
-                            "deepglobe_eval_val_count "
-                            f"({eval_val_count}) must be smaller than the "
-                            f"labeled eval pool ({len(eval_pairs)})"
-                        )
-                    val_indices = eval_indices[:eval_val_count]
-                    test_indices = eval_indices[eval_val_count:]
-                    val_pairs = [eval_pairs[int(i)] for i in val_indices]
-                    test_pairs = [eval_pairs[int(i)] for i in test_indices]
-                    rank_zero_print(
-                        "DeepGlobe eval-pool split: "
-                        f"train={len(all_pairs)} (full training/ dir, no "
-                        f"holdout), eval pool={len(eval_pairs)} -> "
-                        f"val={len(val_pairs)}, test={len(test_pairs)}, "
-                        f"seed={args.split_seed}"
-                    )
-                    return all_pairs, val_pairs, test_pairs
                 rank_zero_print(
-                    f"Official/provided split: train={len(all_pairs)}, "
-                    f"val={len(eval_pairs)}"
+                    f"Provided split: train={len(all_pairs)}, "
+                    f"test={len(test_pairs)}"
                 )
-                return all_pairs, eval_pairs, []
+                return all_pairs, test_pairs
 
     generator = np.random.default_rng(args.split_seed)
     indices = generator.permutation(len(all_pairs))
 
     if args.dataset == "deepglobe":
         train_count = int(args.deepglobe_train_count)
-        val_count = int(args.deepglobe_val_count)
         total_count = len(all_pairs)
-
         if train_count <= 0 or train_count >= total_count:
             raise ValueError(
                 f"deepglobe_train_count must be in [1, {total_count - 1}], "
                 f"got {train_count}"
             )
 
-        holdout_count = total_count - train_count
-        if val_count <= 0 or val_count > holdout_count:
-            raise ValueError(
-                f"deepglobe_val_count must be in [1, {holdout_count}], "
-                f"got {val_count}"
-            )
-
-        # Legacy protocol, used only as a fallback when no separate labeled
-        # eval/ directory is found (see configure_dataset_paths):
-        #   1) Randomly choose exactly deepglobe_train_count samples for
-        #      train from the single combined pool.
-        #   2) The remaining samples are the FULL test holdout.
-        #   3) Take deepglobe_val_count samples from that holdout for val.
-        #   4) Keep those same samples inside test_pairs too, so the final
-        #      test split still covers the entire holdout.
-        train_indices = indices[:train_count]
-        holdout_indices = indices[train_count:]
-        val_indices = holdout_indices[:val_count]
-
-        train_pairs = [all_pairs[int(i)] for i in train_indices]
-        val_pairs = [all_pairs[int(i)] for i in val_indices]
-        test_pairs = [all_pairs[int(i)] for i in holdout_indices]
+        # Single-pool fallback, used only when no separate labeled test
+        # directory is found (see configure_dataset_paths): randomly choose
+        # exactly deepglobe_train_count samples for training; the remaining
+        # samples form the full test holdout.
+        train_pairs = [all_pairs[int(i)] for i in indices[:train_count]]
+        test_pairs = [all_pairs[int(i)] for i in indices[train_count:]]
 
         train_keys = {sample_key(image) for image, _ in train_pairs}
-        val_keys = {sample_key(image) for image, _ in val_pairs}
         test_keys = {sample_key(image) for image, _ in test_pairs}
-
         if train_keys & test_keys:
             raise RuntimeError("DeepGlobe train/test overlap detected unexpectedly")
-        if not val_keys.issubset(test_keys):
-            raise RuntimeError("DeepGlobe validation must be a subset of test holdout")
 
         rank_zero_print(
-            "DeepGlobe single-pool random-split protocol (no labeled eval/ "
-            "dir found): "
-            f"train={len(train_pairs)}, val={len(val_pairs)} "
-            f"(subset of test), test={len(test_pairs)}, "
+            "DeepGlobe single-pool random-split protocol (no labeled test "
+            f"dir found): train={len(train_pairs)}, test={len(test_pairs)}, "
             f"seed={args.split_seed}"
         )
-        return train_pairs, val_pairs, test_pairs
+        return train_pairs, test_pairs
 
-    val_count = max(1, round(len(all_pairs) * args.val_ratio))
     test_count = (
         max(1, round(len(all_pairs) * args.test_ratio))
         if args.test_ratio > 0.0
         else 0
     )
     test_indices = set(indices[:test_count].tolist())
-    val_indices = set(indices[test_count : test_count + val_count].tolist())
     train_pairs = [
-        pair
-        for index, pair in enumerate(all_pairs)
-        if index not in val_indices and index not in test_indices
-    ]
-    val_pairs = [
-        pair for index, pair in enumerate(all_pairs) if index in val_indices
+        pair for index, pair in enumerate(all_pairs) if index not in test_indices
     ]
     test_pairs = [
         pair for index, pair in enumerate(all_pairs) if index in test_indices
     ]
     rank_zero_print(
         "Deterministic labeled split: "
-        f"train={len(train_pairs)}, val={len(val_pairs)}, "
-        f"test={len(test_pairs)}, seed={args.split_seed}"
+        f"train={len(train_pairs)}, test={len(test_pairs)}, "
+        f"seed={args.split_seed}"
     )
-    return train_pairs, val_pairs, test_pairs
+    return train_pairs, test_pairs
 
 
 def make_loaders(
     args: argparse.Namespace,
 ) -> Tuple[
     DataLoader,
-    DataLoader,
-    List[Tuple[Path, Path]],
     List[Tuple[Path, Path]],
     List[Tuple[Path, Path]],
     Optional[DistributedSampler],
 ]:
-    train_pairs, val_pairs, test_pairs = resolve_splits(args)
+    train_pairs, test_pairs = resolve_splits(args)
     train_dataset = RoadCropDataset(
         train_pairs,
         crop_size=args.crop_size,
@@ -806,7 +698,6 @@ def make_loaders(
         road_occlusion_max_patches=args.road_occlusion_max_patches,
         train_mode=args.train_mode,
     )
-    val_dataset = RoadNativeValidationDataset(val_pairs)
     train_sampler: Optional[DistributedSampler]
     if args.distributed:
         train_sampler = DistributedSampler(
@@ -817,11 +708,8 @@ def make_loaders(
             seed=args.seed,
             drop_last=True,
         )
-        val_sampler: Optional[Sampler[int]] = DistributedEvalSampler(
-            val_dataset, args.rank, args.world_size
-        )
     else:
-        train_sampler, val_sampler = None, None
+        train_sampler = None
     generator = torch.Generator().manual_seed(args.seed + args.rank)
     common = dict(
         num_workers=args.num_workers,
@@ -840,22 +728,7 @@ def make_loaders(
         drop_last=True,
         **common,
     )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=1,
-        shuffle=False,
-        sampler=val_sampler,
-        drop_last=False,
-        **common,
-    )
-    return (
-        train_loader,
-        val_loader,
-        train_pairs,
-        val_pairs,
-        test_pairs,
-        train_sampler,
-    )
+    return train_loader, train_pairs, test_pairs, train_sampler
 
 
 def compute_road_weight(
@@ -1174,217 +1047,6 @@ def train_one_epoch(
 
 
 # ---------------------------------------------------------------------------
-# Native sliding-window validation and metrics
-# ---------------------------------------------------------------------------
-
-
-def sliding_positions(length: int, tile_size: int, overlap: int) -> List[int]:
-    if length <= tile_size:
-        return [0]
-    stride = tile_size - overlap
-    positions = list(range(0, length - tile_size + 1, stride))
-    if positions[-1] != length - tile_size:
-        positions.append(length - tile_size)
-    return positions
-
-
-def hann_weight(tile_size: int, device: torch.device) -> Tensor:
-    axis = torch.hann_window(
-        tile_size, periodic=False, dtype=torch.float32, device=device
-    ).clamp_min_(0.05)
-    return (axis[:, None] * axis[None, :]).unsqueeze(0).unsqueeze(0)
-
-
-@torch.inference_mode()
-def sliding_window_logits(
-    model: nn.Module,
-    image: Tensor,
-    tile_size: int,
-    overlap: int,
-    tile_batch_size: int,
-    device: torch.device,
-    use_amp: bool,
-) -> Tensor:
-    if image.shape[0] != 1:
-        raise ValueError("Native validation requires batch_size=1")
-    original_h, original_w = image.shape[-2:]
-    pad_h, pad_w = max(0, tile_size - original_h), max(0, tile_size - original_w)
-    if pad_h or pad_w:
-        mode = "reflect" if min(original_h, original_w) > 1 else "replicate"
-        image = F.pad(image, (0, pad_w, 0, pad_h), mode=mode)
-    height, width = image.shape[-2:]
-    ys = sliding_positions(height, tile_size, overlap)
-    xs = sliding_positions(width, tile_size, overlap)
-    coordinates = [(y, x) for y in ys for x in xs]
-    accumulator = torch.zeros((1, 2, height, width), device=device)
-    normalizer = torch.zeros((1, 1, height, width), device=device)
-    weight = hann_weight(tile_size, device)
-    for start in range(0, len(coordinates), tile_batch_size):
-        batch_coordinates = coordinates[start : start + tile_batch_size]
-        tiles = torch.cat(
-            [
-                image[:, :, y : y + tile_size, x : x + tile_size]
-                for y, x in batch_coordinates
-            ],
-            dim=0,
-        )
-        with torch.autocast(
-            device_type=device.type, dtype=torch.float16, enabled=use_amp
-        ):
-            logits = model(tiles)
-        if isinstance(logits, tuple):
-            logits = logits[-1]
-        logits = logits.float()
-        for index, (y, x) in enumerate(batch_coordinates):
-            accumulator[:, :, y : y + tile_size, x : x + tile_size] += (
-                logits[index : index + 1] * weight
-            )
-            normalizer[:, :, y : y + tile_size, x : x + tile_size] += weight
-    return (accumulator / normalizer.clamp_min_(1e-6))[
-        :, :, :original_h, :original_w
-    ]
-
-
-def confusion_counts(prediction: Tensor, target: Tensor) -> Tuple[int, int, int, int]:
-    prediction, target = prediction.bool(), target.bool()
-    return (
-        int((prediction & target).sum()),
-        int((prediction & ~target).sum()),
-        int((~prediction & target).sum()),
-        int((~prediction & ~target).sum()),
-    )
-
-
-def metrics_from_counts(tp: int, fp: int, fn: int, tn: int) -> Dict[str, float]:
-    road_iou = tp / max(tp + fp + fn, 1)
-    background_iou = tn / max(tn + fp + fn, 1)
-    precision = tp / max(tp + fp, 1)
-    recall = tp / max(tp + fn, 1)
-    f1 = 2.0 * precision * recall / max(precision + recall, 1e-12)
-    return {
-        "road_iou": road_iou,
-        "background_iou": background_iou,
-        "miou": 0.5 * (road_iou + background_iou),
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "accuracy": (tp + tn) / max(tp + fp + fn + tn, 1),
-    }
-
-
-def histogram_counts(
-    probability: Tensor, target: Tensor, bins: int
-) -> Tuple[Tensor, Tensor]:
-    indices = (probability.clamp(0, 1) * (bins - 1)).long().flatten()
-    labels = target.bool().flatten()
-    positive = torch.bincount(indices[labels], minlength=bins)
-    negative = torch.bincount(indices[~labels], minlength=bins)
-    return positive, negative
-
-
-def counts_at_threshold(
-    positive: Tensor, negative: Tensor, threshold: float
-) -> Tuple[int, int, int, int]:
-    boundary = int(math.ceil(threshold * (len(positive) - 1)))
-    tp = int(positive[boundary:].sum())
-    fp = int(negative[boundary:].sum())
-    fn = int(positive[:boundary].sum())
-    tn = int(negative[:boundary].sum())
-    return tp, fp, fn, tn
-
-
-def relaxed_components(
-    prediction: Tensor, target: Tensor, buffer_px: int
-) -> Tuple[float, float, float, float]:
-    pred = prediction.float().unsqueeze(0).unsqueeze(0)
-    truth = target.float().unsqueeze(0).unsqueeze(0)
-    kernel = 2 * buffer_px + 1
-    pred_dilated = F.max_pool2d(pred, kernel, stride=1, padding=buffer_px) > 0
-    truth_dilated = F.max_pool2d(truth, kernel, stride=1, padding=buffer_px) > 0
-    return (
-        float((prediction & truth_dilated[0, 0]).sum()),
-        float((target & pred_dilated[0, 0]).sum()),
-        float(prediction.sum()),
-        float(target.sum()),
-    )
-
-
-@torch.inference_mode()
-def validate(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    args: argparse.Namespace,
-) -> Dict[str, float]:
-    model.eval()
-    bins = args.threshold_bins
-    positive_hist = torch.zeros(bins, dtype=torch.int64, device=device)
-    negative_hist = torch.zeros(bins, dtype=torch.int64, device=device)
-    totals = torch.zeros(10, dtype=torch.float64, device=device)
-    progress = tqdm(
-        loader, desc="Native validation", leave=False, disable=not is_main_process()
-    )
-    for images, masks, _ in progress:
-        images = images.to(device, non_blocking=True)
-        masks = masks.to(device, non_blocking=True)
-        if args.channels_last:
-            images = images.contiguous(memory_format=torch.channels_last)
-        logits = sliding_window_logits(
-            model,
-            images,
-            args.val_tile_size,
-            args.val_overlap,
-            args.val_tile_batch_size,
-            device,
-            args.use_amp,
-        )
-        probability = logits.softmax(dim=1)[:, 1]
-        target = masks > 0
-        prediction = probability >= 0.5
-        tp, fp, fn, tn = confusion_counts(prediction, target)
-        per_image_iou = tp / max(tp + fp + fn, 1)
-        relaxed = relaxed_components(
-            prediction[0], target[0], args.relaxed_buffer_px
-        )
-        totals += totals.new_tensor(
-            [tp, fp, fn, tn, per_image_iou, 1.0, *relaxed]
-        )
-        positive, negative = histogram_counts(probability, target, bins)
-        positive_hist += positive
-        negative_hist += negative
-
-    if distributed_active():
-        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
-        dist.all_reduce(positive_hist, op=dist.ReduceOp.SUM)
-        dist.all_reduce(negative_hist, op=dist.ReduceOp.SUM)
-    tp, fp, fn, tn = (int(value) for value in totals[:4].tolist())
-    metrics = {f"fixed_{key}": value for key, value in metrics_from_counts(tp, fp, fn, tn).items()}
-    metrics["fixed_road_iou_macro"] = float(totals[4] / max(float(totals[5]), 1.0))
-    relaxed_precision = float(totals[6] / max(float(totals[8]), 1.0))
-    relaxed_recall = float(totals[7] / max(float(totals[9]), 1.0))
-    metrics["fixed_relaxed_f1"] = 2.0 * relaxed_precision * relaxed_recall / max(
-        relaxed_precision + relaxed_recall, 1e-12
-    )
-
-    best_threshold, best_counts, best_iou = 0.5, (tp, fp, fn, tn), -1.0
-    threshold = args.threshold_min
-    while threshold <= args.threshold_max + 1e-9:
-        counts = counts_at_threshold(positive_hist, negative_hist, threshold)
-        candidate = metrics_from_counts(*counts)["road_iou"]
-        if candidate > best_iou:
-            best_threshold, best_counts, best_iou = threshold, counts, candidate
-        threshold += args.threshold_step
-    metrics.update(
-        {
-            f"calibrated_{key}": value
-            for key, value in metrics_from_counts(*best_counts).items()
-        }
-    )
-    metrics["calibrated_threshold"] = float(best_threshold)
-    return metrics
-
-
-# ---------------------------------------------------------------------------
 # Checkpoints and argument handling
 # ---------------------------------------------------------------------------
 
@@ -1394,15 +1056,9 @@ def resolve_checkpoint_path(path: str | Path) -> Path:
     if path.is_file():
         return path
     if path.is_dir():
-        preferred = (
-            "best_fixed_road_iou.pt",
-            "best_calibrated_road_iou.pt",
-            "last.pt",
-        )
-        for name in preferred:
-            candidate = path / name
-            if candidate.is_file():
-                return candidate
+        candidate = path / "last.pt"
+        if candidate.is_file():
+            return candidate
         files = sorted(path.rglob("*.pt")) + sorted(path.rglob("*.pth"))
         if len(files) == 1:
             return files[0]
@@ -1514,9 +1170,6 @@ def checkpoint_state(
     scheduler: LambdaLR,
     scaler,
     epoch: int,
-    best_fixed: float,
-    best_calibrated: float,
-    metrics: Dict[str, float],
     args: argparse.Namespace,
 ) -> Dict:
     return {
@@ -1527,9 +1180,6 @@ def checkpoint_state(
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "scaler": scaler.state_dict(),
-        "best_fixed_road_iou": best_fixed,
-        "best_calibrated_road_iou": best_calibrated,
-        "validation": metrics,
         "args": vars(args),
     }
 
@@ -1550,7 +1200,7 @@ def resume_training(
     scaler,
     path: str | Path,
     device: torch.device,
-) -> Tuple[int, float, float, Path]:
+) -> Tuple[int, Path]:
     checkpoint_path, checkpoint = safe_torch_load(path, device)
     model.load_state_dict(clean_state_dict(checkpoint["model"]), strict=True)
     ema.module.load_state_dict(clean_state_dict(checkpoint["ema"]), strict=True)
@@ -1558,12 +1208,7 @@ def resume_training(
     optimizer.load_state_dict(checkpoint["optimizer"])
     scheduler.load_state_dict(checkpoint["scheduler"])
     scaler.load_state_dict(checkpoint["scaler"])
-    return (
-        int(checkpoint["epoch"]) + 1,
-        float(checkpoint.get("best_fixed_road_iou", -1.0)),
-        float(checkpoint.get("best_calibrated_road_iou", -1.0)),
-        checkpoint_path,
-    )
+    return int(checkpoint["epoch"]) + 1, checkpoint_path
 
 
 def append_jsonl(path: str | Path, record: Dict) -> None:
@@ -1583,14 +1228,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train_mask_dir", default=None)
     parser.add_argument("--train_list", default=None)
     parser.add_argument("--test_list", default=None)
-    parser.add_argument("--val_image_dir", default=None)
-    parser.add_argument("--val_mask_dir", default=None)
-    parser.add_argument("--val_ratio", type=float, default=0.10)
+    parser.add_argument(
+        "--test_image_dir",
+        default=None,
+        help="Labeled test images (DeepGlobe: auto-detected ROAD/eval/images)",
+    )
+    parser.add_argument("--test_mask_dir", default=None)
     parser.add_argument(
         "--test_ratio",
         type=float,
         default=0.10,
-        help="Held out and never evaluated during training when no labeled val exists",
+        help="Fraction held out as the test split when no explicit test split exists",
     )
     parser.add_argument("--split_seed", type=int, default=3407)
     parser.add_argument(
@@ -1598,47 +1246,10 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=5000,
         help=(
-            "Legacy single-pool protocol fallback (only used when no "
-            "labeled eval/ directory is found): randomly select exactly "
-            "this many labeled pairs for training; the remaining pairs "
-            "form the full test holdout."
-        ),
-    )
-    parser.add_argument(
-        "--deepglobe_val_count",
-        type=int,
-        default=300,
-        help=(
-            "Legacy single-pool protocol fallback (only used when no "
-            "labeled eval/ directory is found): select this many samples "
-            "from the full holdout for validation. These validation "
-            "samples remain inside the final test holdout by design."
-        ),
-    )
-    parser.add_argument(
-        "--deepglobe_eval_split",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "When a labeled eval/ directory is found (e.g. ROAD/eval with "
-            "images+masks), split that pool deterministically into val/test "
-            "by count instead of using the whole pool as val. Training "
-            "always uses every pair under the training/ directory, "
-            "untouched. --no-deepglobe_eval_split restores the old "
-            "behaviour: the entire labeled eval/ dir is used as val and "
-            "test is left empty."
-        ),
-    )
-    parser.add_argument(
-        "--deepglobe_eval_val_count",
-        type=int,
-        default=226,
-        help=(
-            "Number of pairs from the labeled eval/ pool (e.g. ROAD/eval, "
-            "1452 pairs total) reserved for validation; the remainder "
-            "(e.g. 1226) becomes the test holdout. Ignored unless "
-            "deepglobe_eval_split is enabled and a labeled eval directory "
-            "is found."
+            "Single-pool fallback (only used when no labeled test "
+            "directory is found): randomly select exactly this many "
+            "labeled pairs for training; the remaining pairs form the "
+            "test split."
         ),
     )
 
@@ -1652,7 +1263,7 @@ def parse_args() -> argparse.Namespace:
             "context toàn ảnh. 'resize': resize NGUYÊN ảnh về crop_size x "
             "crop_size, giữ toàn cảnh nhưng thu nhỏ đường vốn đã mảnh; "
             "road_crop_probability/road_crop_min_fraction/road_crop_tries "
-            "bị bỏ qua khi dùng 'resize'. LƯU Ý: validate()/sliding_window "
+            "bị bỏ qua khi dùng 'resize'. LƯU Ý: inference/test_native.py "
             "vẫn luôn dùng native resolution (không resize) bất kể "
             "train_mode -- 'resize' tạo lệch scale giữa train và inference."
         ),
@@ -1831,25 +1442,6 @@ def parse_args() -> argparse.Namespace:
         "--freeze_encoder_bn", action=argparse.BooleanOptionalAction, default=True
     )
 
-    parser.add_argument("--val_tile_size", type=int, default=1024)
-    parser.add_argument("--val_overlap", type=int, default=256)
-    parser.add_argument("--val_tile_batch_size", type=int, default=2)
-    parser.add_argument("--val_interval", type=int, default=1)
-    parser.add_argument(
-        "--test_eval_images",
-        type=int,
-        default=61,
-        help=(
-            "For the Massachusetts txt protocol, reserve the first N test.txt "
-            "entries for validation and keep the remainder for final testing"
-        ),
-    )
-    parser.add_argument("--threshold_min", type=float, default=0.20)
-    parser.add_argument("--threshold_max", type=float, default=0.80)
-    parser.add_argument("--threshold_step", type=float, default=0.02)
-    parser.add_argument("--threshold_bins", type=int, default=1001)
-    parser.add_argument("--relaxed_buffer_px", type=int, default=3)
-
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--prefetch_factor", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
@@ -1878,32 +1470,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def validate_args(args: argparse.Namespace) -> None:
+def check_args(args: argparse.Namespace) -> None:
     if args.crop_size < 64 or args.crop_size % 16:
         raise ValueError("crop_size must be >=64 and divisible by 16")
-    if args.val_overlap < 0 or args.val_overlap >= args.val_tile_size:
-        raise ValueError("val_overlap must satisfy 0 <= overlap < tile size")
     if args.batch_size < 1 or args.accumulation_steps < 1:
         raise ValueError("batch_size and accumulation_steps must be positive")
     if args.dataset == "massachusetts":
         if not args.train_list or not args.test_list:
             raise ValueError("Massachusetts requires --train_list and --test_list")
-        if args.test_eval_images < 1:
-            raise ValueError("test_eval_images must be positive")
     if args.fixed_road_weight is not None and args.fixed_road_weight <= 0.0:
         raise ValueError("fixed_road_weight must be positive")
-    if not 0.0 < args.val_ratio < 1.0:
-        raise ValueError("val_ratio must be in (0, 1)")
     if not 0.0 <= args.test_ratio < 1.0:
         raise ValueError("test_ratio must be in [0, 1)")
-    if args.val_ratio + args.test_ratio >= 1.0:
-        raise ValueError("val_ratio + test_ratio must be smaller than 1")
     if args.deepglobe_train_count < 1:
         raise ValueError("deepglobe_train_count must be positive")
-    if args.deepglobe_val_count < 1:
-        raise ValueError("deepglobe_val_count must be positive")
-    if args.deepglobe_eval_val_count < 1:
-        raise ValueError("deepglobe_eval_val_count must be positive")
     if args.resume and args.pretrained_checkpoint:
         raise ValueError("Use either --resume or --pretrained_checkpoint, not both")
     if not args.dappm_pool_sizes or min(args.dappm_pool_sizes) < 1:
@@ -1952,7 +1532,6 @@ def validate_args(args: argparse.Namespace) -> None:
 def save_split_manifest(
     save_dir: Path,
     train_pairs: Sequence[Tuple[Path, Path]],
-    val_pairs: Sequence[Tuple[Path, Path]],
     test_pairs: Sequence[Tuple[Path, Path]],
     split_seed: int,
 ) -> None:
@@ -1960,11 +1539,9 @@ def save_split_manifest(
         "split_seed": int(split_seed),
         "counts": {
             "train": len(train_pairs),
-            "val": len(val_pairs),
             "test": len(test_pairs),
         },
         "train": [[str(image), str(mask)] for image, mask in train_pairs],
-        "val": [[str(image), str(mask)] for image, mask in val_pairs],
         "test": [[str(image), str(mask)] for image, mask in test_pairs],
     }
     with (save_dir / "split_manifest.json").open("w", encoding="utf-8") as handle:
@@ -2029,7 +1606,7 @@ def main() -> None:
         else:
             args.progressive_unfreeze = args.pretrained_checkpoint is not None
     configure_dataset_paths(args)
-    validate_args(args)
+    check_args(args)
     rank_zero_print(
         f"[startup 1/5] DDP initialized: world_size={world_size}, device={device}"
     )
@@ -2049,9 +1626,7 @@ def main() -> None:
     rank_zero_print("[startup 2/5] Resolving image/mask pairs and DataLoaders...")
     (
         train_loader,
-        val_loader,
         train_pairs,
-        val_pairs,
         test_pairs,
         train_sampler,
     ) = make_loaders(args)
@@ -2059,7 +1634,6 @@ def main() -> None:
         save_split_manifest(
             save_dir,
             train_pairs,
-            val_pairs,
             test_pairs,
             args.split_seed,
         )
@@ -2150,9 +1724,9 @@ def main() -> None:
         semantic_aux_dice_weight=args.semantic_aux_dice_weight,
     ).to(device)
 
-    start_epoch, best_fixed, best_calibrated = 0, -1.0, -1.0
+    start_epoch = 0
     if args.resume:
-        start_epoch, best_fixed, best_calibrated, loaded = resume_training(
+        start_epoch, loaded = resume_training(
             model, ema, optimizer, scheduler, scaler, args.resume, device
         )
         rank_zero_print(f"Resumed exact training state from {loaded}")
@@ -2183,19 +1757,16 @@ def main() -> None:
     if args.train_mode == "resize":
         rank_zero_print(
             "  WARNING: train_mode=resize resizes the FULL image to "
-            f"{args.crop_size}x{args.crop_size}; validate()/sliding-window "
-            "inference still runs at native resolution unresized -- this is "
+            f"{args.crop_size}x{args.crop_size}; native-resolution "
+            "inference still runs unresized -- this is "
             "a real train/inference scale mismatch, not a bug."
         )
     if args.dataset == "deepglobe":
         rank_zero_print(
             f"deepglobe data source: train_dir={args.train_image_dir} | "
-            f"eval_dir={args.val_image_dir} | "
-            f"eval_split={args.deepglobe_eval_split} "
-            f"(val_count={args.deepglobe_eval_val_count} if a labeled eval/ "
-            "dir was found; otherwise falls back to the legacy single-pool "
-            f"protocol with train_count={args.deepglobe_train_count}, "
-            f"val_count={args.deepglobe_val_count})"
+            f"test_dir={args.test_image_dir} "
+            "(if no labeled test dir was found, falls back to the "
+            f"single-pool protocol with train_count={args.deepglobe_train_count})"
         )
     rank_zero_print(
         f"shared ResNet34 to S8 | detail={args.detail_channels}ch S8 | "
@@ -2252,62 +1823,16 @@ def main() -> None:
             args,
         )
         gate_metrics = unwrap_model(model).dual_branch.gate_statistics()
-        validation_metrics: Dict[str, float] = {}
-        should_validate = (epoch + 1) % args.val_interval == 0 or epoch + 1 == args.epochs
-        if should_validate:
-            if distributed_active():
-                for tensor in ema.module.state_dict().values():
-                    dist.broadcast(tensor, src=0)
-            validation_metrics = validate(ema.module, val_loader, device, args)
-            fixed = validation_metrics["fixed_road_iou"]
-            calibrated = validation_metrics["calibrated_road_iou"]
-            fixed_improved, calibrated_improved = fixed > best_fixed, calibrated > best_calibrated
-            best_fixed, best_calibrated = max(best_fixed, fixed), max(best_calibrated, calibrated)
-            rank_zero_print(
-                f"train loss={train_metrics['total']:.5f} | "
-                f"throughput={train_metrics['images_per_second']:.1f} img/s | "
-                f"fixed@.50 road IoU={fixed:.5f} | "
-                f"calibrated road IoU={calibrated:.5f} "
-                f"@{validation_metrics['calibrated_threshold']:.2f} | "
-                f"F1={validation_metrics['fixed_f1']:.5f} | "
-                f"{format_gate_routes(gate_metrics)}"
-            )
-            if is_main_process():
-                state = checkpoint_state(
-                    model,
-                    ema,
-                    optimizer,
-                    scheduler,
-                    scaler,
-                    epoch,
-                    best_fixed,
-                    best_calibrated,
-                    validation_metrics,
-                    args,
-                )
-                if fixed_improved:
-                    atomic_torch_save(state, save_dir / "best_fixed_road_iou.pt")
-                if calibrated_improved:
-                    atomic_torch_save(
-                        state, save_dir / "best_calibrated_road_iou.pt"
-                    )
-                atomic_torch_save(state, save_dir / "last.pt")
-        elif is_main_process():
+        rank_zero_print(
+            f"train loss={train_metrics['total']:.5f} | "
+            f"throughput={train_metrics['images_per_second']:.1f} img/s | "
+            f"{format_gate_routes(gate_metrics)}"
+        )
+        if is_main_process():
             state = checkpoint_state(
-                model,
-                ema,
-                optimizer,
-                scheduler,
-                scaler,
-                epoch,
-                best_fixed,
-                best_calibrated,
-                validation_metrics,
-                args,
+                model, ema, optimizer, scheduler, scaler, epoch, args
             )
             atomic_torch_save(state, save_dir / "last.pt")
-
-        if is_main_process():
             append_jsonl(
                 log_path,
                 {
@@ -2316,7 +1841,6 @@ def main() -> None:
                     "trainable_parameters": trainable,
                     "train": train_metrics,
                     "fusion_gates": gate_metrics,
-                    "validation": validation_metrics,
                 },
             )
     rank_zero_print(f"Finished. Checkpoints: {save_dir.resolve()}")
