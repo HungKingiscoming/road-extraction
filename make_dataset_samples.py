@@ -199,18 +199,18 @@ def random_crop_pair(
 def build_augment_transform() -> A.Compose:
     return A.Compose(
         [
-            A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.5),
+            A.HorizontalFlip(p=0.7),
+            A.VerticalFlip(p=0.7),
             A.RandomRotate90(p=1.0),
             # "brightness and contrast jitter (p = 0.60)" -- one combined trigger.
-            A.RandomBrightnessContrast(brightness_limit=0.15, contrast_limit=0.15, p=0.60),
+            A.RandomBrightnessContrast(brightness_limit=0.30, contrast_limit=0.30, p=0.80),
             # "saturation jitter (p = 0.35)" -- ColorJitter with every other
             # channel pinned to a no-op range so only saturation moves.
             A.ColorJitter(
-                brightness=(1.0, 1.0), contrast=(1.0, 1.0), saturation=(0.90, 1.10), hue=(0.0, 0.0), p=0.35
+                brightness=(1.2, 1.2), contrast=(1.2, 1.2), saturation=(0.1, 1.30), hue=(0.2, 0.2), p=0.35
             ),
-            A.GaussianBlur(blur_limit=0, sigma_limit=(0.1, 1.1), p=0.15),
-            A.GaussNoise(std_range=(2 / 255, 7 / 255), p=0.15),
+            A.GaussianBlur(blur_limit=1, sigma_limit=(0.2, 1.4), p=0.3),
+            A.GaussNoise(std_range=(5 / 255, 10 / 255), p=0.30),
         ]
     )
 
