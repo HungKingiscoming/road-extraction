@@ -1,13 +1,17 @@
 """Render post-augmentation image/mask sample grids for the paper figure.
 
-Mirrors the training augmentation pipeline in train.py (road-guided random
-crop, dihedral flips/rotations, photometric jitter) so the figure shows what
-the model actually trains on, not raw dataset crops. road_occlusion is
-omitted entirely, matching the current baseline's road_occlusion_probability
-= 0.0. This script is intentionally standalone (numpy + Pillow only, no
-torch) so it can run anywhere the datasets are mounted, including outside
-the training environment; if train.py's augmentation logic changes, mirror
-the change here too.
+The road-guided random crop is a custom data-sampling heuristic (max-pool
+the mask, sample a road-containing cell, keep the best-scoring candidate)
+that has no stock albumentations equivalent, so it stays hand-rolled. The
+flip/rotate/photometric augmentation stage uses albumentations, with
+probabilities matching the paper's stated pipeline: brightness+contrast
+jitter (p=0.60, combined under one trigger as the paper describes them),
+saturation jitter (p=0.35), Gaussian blur (p=0.15), Gaussian noise (p=0.15).
+road_occlusion is omitted entirely, matching the current baseline's
+road_occlusion_probability = 0.0. Because albumentations' brightness/
+contrast/blur/noise implementations differ numerically from train.py's PIL
+ImageEnhance/ImageFilter calls, this script is semantically equivalent to
+train.py's augmentation, not a bit-for-bit reproduction of it.
 
 Writes two separate PNGs (one per dataset) with no baked-in title/caption
 text, since the LaTeX figure environment supplies the "(a) ..." / "(b) ..."
@@ -30,8 +34,9 @@ import random
 from pathlib import Path
 from typing import List, Tuple
 
+import albumentations as A
 import numpy as np
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parent
 
@@ -186,34 +191,36 @@ def random_crop_pair(
 
 
 # ---------------------------------------------------------------------------
-# Augmentation (mirrors train.py: augment_pair, road_occlusion omitted since
+# Augmentation (albumentations; road_occlusion omitted since
 # road_occlusion_probability = 0.0 in the current baseline)
 # ---------------------------------------------------------------------------
 
 
-def augment_pair(image: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    if random.random() < 0.5:
-        image, mask = image[:, ::-1], mask[:, ::-1]
-    if random.random() < 0.5:
-        image, mask = image[::-1], mask[::-1]
-    rotations = random.randrange(4)
-    if rotations:
-        image, mask = np.rot90(image, rotations), np.rot90(mask, rotations)
+def build_augment_transform() -> A.Compose:
+    return A.Compose(
+        [
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.RandomRotate90(p=1.0),
+            # "brightness and contrast jitter (p = 0.60)" -- one combined trigger.
+            A.RandomBrightnessContrast(brightness_limit=0.15, contrast_limit=0.15, p=0.60),
+            # "saturation jitter (p = 0.35)" -- ColorJitter with every other
+            # channel pinned to a no-op range so only saturation moves.
+            A.ColorJitter(
+                brightness=(1.0, 1.0), contrast=(1.0, 1.0), saturation=(0.90, 1.10), hue=(0.0, 0.0), p=0.35
+            ),
+            A.GaussianBlur(blur_limit=0, sigma_limit=(0.1, 1.1), p=0.15),
+            A.GaussNoise(std_range=(2 / 255, 7 / 255), p=0.15),
+        ]
+    )
 
-    pil = Image.fromarray(np.ascontiguousarray(image))
-    if random.random() < 0.60:
-        pil = ImageEnhance.Brightness(pil).enhance(random.uniform(0.85, 1.15))
-    if random.random() < 0.60:
-        pil = ImageEnhance.Contrast(pil).enhance(random.uniform(0.85, 1.15))
-    if random.random() < 0.35:
-        pil = ImageEnhance.Color(pil).enhance(random.uniform(0.90, 1.10))
-    if random.random() < 0.15:
-        pil = pil.filter(ImageFilter.GaussianBlur(random.uniform(0.1, 1.1)))
-    image = np.asarray(pil, dtype=np.uint8).copy()
-    if random.random() < 0.15:
-        noise = np.random.normal(0.0, random.uniform(2.0, 7.0), image.shape)
-        image = np.clip(image.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-    return image, np.ascontiguousarray(mask)
+
+def augment_pair(image: np.ndarray, mask: np.ndarray, transform: A.Compose) -> Tuple[np.ndarray, np.ndarray]:
+    # Reseed per call from the already-seeded global `random` module so the
+    # whole pipeline stays reproducible from a single --seed.
+    transform.set_random_seed(random.getrandbits(32))
+    result = transform(image=np.ascontiguousarray(image), mask=np.ascontiguousarray(mask))
+    return result["image"], result["mask"]
 
 
 def overlay_mask_on_image(
@@ -242,6 +249,7 @@ def render_grid(
     tile_size: int,
     gap: int,
     out_path: Path,
+    transform: A.Compose,
     mode: str = "pairs",
 ) -> None:
     chosen = random.sample(pairs, n) if len(pairs) >= n else random.choices(pairs, k=n)
@@ -260,12 +268,12 @@ def render_grid(
             original_tile = Image.fromarray(image).resize((tile_size, tile_size), Image.BILINEAR)
             tiles_top.append(original_tile)
 
-            augmented, augmented_mask = augment_pair(image, mask)
+            augmented, augmented_mask = augment_pair(image, mask, transform)
             augmented = overlay_mask_on_image(augmented, augmented_mask, OVERLAY_COLOR, OVERLAY_ALPHA)
             augmented_tile = Image.fromarray(augmented).resize((tile_size, tile_size), Image.BILINEAR)
             tiles_bottom.append(augmented_tile)
         else:
-            image, mask = augment_pair(image, mask)
+            image, mask = augment_pair(image, mask, transform)
             image_tile = Image.fromarray(image).resize((tile_size, tile_size), Image.BILINEAR)
             mask_tile = Image.fromarray((mask * 255).astype(np.uint8)).resize((tile_size, tile_size), Image.NEAREST)
             tiles_top.append(image_tile)
@@ -307,6 +315,7 @@ def main() -> None:
 
     random.seed(args.seed)
     np.random.seed(args.seed)
+    transform = build_augment_transform()
 
     names = ["massachusetts", "deepglobe"] if args.dataset == "both" else [args.dataset]
     for name in names:
@@ -324,6 +333,7 @@ def main() -> None:
             args.tile_size,
             args.gap,
             args.out_dir / out_name,
+            transform,
             mode=args.mode,
         )
 
