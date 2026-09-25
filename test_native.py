@@ -7,7 +7,7 @@ transformed full image and inverse-transforms the complete blended map. TTA
 views can be merged as probabilities (recommended) or logits.
 
 There is no validation split: the decision threshold is fixed (--thr, default
-0.5) and the whole test split is evaluated.
+0.66) and the whole test split is evaluated.
 
 Test images: --dataset picks massachusetts or deepglobe (default: the one the
 checkpoint was trained on) and the images are read from data/<dataset>/test
@@ -709,7 +709,19 @@ def parse_args() -> argparse.Namespace:
             "convolutions after loading the checkpoint"
         ),
     )
-    ap.add_argument("--thr", type=float, default=0.50)
+    ap.add_argument("--thr", type=float, default=0.66)
+    ap.add_argument(
+        "--thr-sweep",
+        type=float,
+        nargs="+",
+        default=None,
+        metavar="THR",
+        help=(
+            "Also print the metrics for each of these thresholds (e.g. "
+            "--thr-sweep 0.4 0.5 0.6 0.7). Use with --out so the images are "
+            "only predicted once."
+        ),
+    )
     ap.add_argument(
         "--tta-mode",
         choices=("none", "roadx3", "flip4", "d4"),
@@ -824,6 +836,8 @@ def main() -> None:
         raise ValueError(f"Unsupported checkpoint dataset: {args.dataset}")
     if not 0.0 <= args.thr <= 1.0:
         raise ValueError("--thr must be in [0, 1]")
+    if any(not 0.0 <= thr <= 1.0 for thr in args.thr_sweep or []):
+        raise ValueError("--thr-sweep values must be in [0, 1]")
     if args.window < 32:
         raise ValueError("--window must be >= 32")
     if args.stride < 1 or args.stride > args.window:
@@ -956,6 +970,13 @@ def main() -> None:
         f"Acc={metrics['accuracy']:.4f}"
     )
     print("=" * 72)
+    for thr in args.thr_sweep or []:
+        m = score_maps(probabilities, ground_truths, thr)
+        print(
+            f"thr={thr:.2f} "
+            f"P={m['precision']:.4f} R={m['recall']:.4f} F1={m['f1']:.4f} "
+            f"IoU={m['iou']:.4f} Acc={m['accuracy']:.4f}"
+        )
 
 
 if __name__ == "__main__":
