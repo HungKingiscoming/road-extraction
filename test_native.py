@@ -9,16 +9,13 @@ views can be merged as probabilities (recommended) or logits.
 There is no validation split: the decision threshold is fixed (--thr, default
 0.5) and the whole test split is evaluated.
 
-Subsets (--subset):
-  Massachusetts: test178 -- every entry of test.txt.
-  DeepGlobe:     deepglobe_test -- the split_manifest.json "test" list next to
-                 the checkpoint when present, otherwise the entire labeled
-                 ROAD/eval pool (k4nngg/datadg source, e.g. 1226 images).
+Test images: --dataset picks massachusetts or deepglobe (default: the one the
+checkpoint was trained on) and the images are read from data/<dataset>/test
+(or <--data-root>/test); images and labels are paired by file name.
 """
 from __future__ import annotations
 
 import argparse
-import json
 import math
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
@@ -30,151 +27,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from data_paths import load_split, sample_key
 from modeling.model import build_model
 
 
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
-MASK_SUFFIXES = ("_mask", "_masks", "_gt", "_label", "_labels")
 IMAGENET_MEAN = np.asarray((0.485, 0.456, 0.406), dtype=np.float32)
 IMAGENET_STD = np.asarray((0.229, 0.224, 0.225), dtype=np.float32)
-
-
-def sample_key(path: Path) -> str:
-    key = path.stem.lower()
-    for suffix in (
-        "_image", "_images", "_img", "_sat",
-        "_mask", "_masks", "_gt", "_label", "_labels",
-    ):
-        if key.endswith(suffix):
-            return key[: -len(suffix)]
-    return key
-
-
-def index_files(
-    folder: str | Path,
-    role: str | None = None,
-) -> Dict[str, Path]:
-    folder = Path(folder)
-    if not folder.is_dir():
-        raise FileNotFoundError(f"Dataset directory not found: {folder}")
-
-    files = sorted(
-        p for p in folder.rglob("*")
-        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
-    )
-    if role is not None:
-        if role not in {"image", "mask"}:
-            raise ValueError("role must be image, mask, or None")
-        files = [
-            path
-            for path in files
-            if any(path.stem.lower().endswith(s) for s in MASK_SUFFIXES)
-            == (role == "mask")
-        ]
-    if not files:
-        raise RuntimeError(f"No supported images found in {folder}")
-
-    indexed: Dict[str, Path] = {}
-    for path in files:
-        key = sample_key(path)
-        if key in indexed:
-            raise RuntimeError(
-                f"Duplicate sample key '{key}': {indexed[key]} and {path}"
-            )
-        indexed[key] = path
-    return indexed
-
-
-def build_pairs(
-    image_dir: str | Path,
-    mask_dir: str | Path,
-) -> List[Tuple[Path, Path]]:
-    """Pair files by stem, including DeepGlobe's shared train directory."""
-    image_dir, mask_dir = Path(image_dir), Path(mask_dir)
-    same_folder = image_dir.resolve() == mask_dir.resolve()
-    images = index_files(image_dir, role="image" if same_folder else None)
-    masks = index_files(mask_dir, role="mask" if same_folder else None)
-    common = sorted(images.keys() & masks.keys())
-    if len(common) != len(images) or len(common) != len(masks):
-        raise RuntimeError(
-            "Image/mask pairing mismatch: "
-            f"images={len(images)}, masks={len(masks)}, pairs={len(common)}"
-        )
-    return [(images[key], masks[key]) for key in common]
-
-
-def pairs_from_list(
-    image_dir: str | Path,
-    mask_dir: str | Path,
-    list_path: str | Path,
-) -> List[Tuple[Path, Path]]:
-    """Resolve image/mask pairs in exactly the order listed by test.txt."""
-    list_path = Path(list_path)
-    if not list_path.is_file():
-        raise FileNotFoundError(f"Split txt not found: {list_path}")
-
-    images = index_files(image_dir)
-    masks = index_files(mask_dir)
-    pairs: List[Tuple[Path, Path]] = []
-    missing: List[str] = []
-    seen: set[str] = set()
-
-    with list_path.open("r", encoding="utf-8-sig") as handle:
-        for raw_line in handle:
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            first_field = line.replace(",", " ").split()[0]
-            key = sample_key(Path(first_field))
-            if key in seen:
-                continue
-            seen.add(key)
-            ip, mp = images.get(key), masks.get(key)
-            if ip is None or mp is None:
-                missing.append(first_field)
-                continue
-            pairs.append((ip, mp))
-
-    if missing:
-        raise RuntimeError(
-            f"{list_path} contains {len(missing)} samples that could not be paired. "
-            f"First missing entries: {missing[:10]}"
-        )
-    if not pairs:
-        raise RuntimeError(f"No pairs resolved from {list_path}")
-    return pairs
-
-
-def pairs_from_manifest(
-    manifest_path: str | Path,
-    split: str,
-) -> Tuple[List[Tuple[Path, Path]], dict]:
-    """Load an exact train.py split without regenerating random indices."""
-    manifest_path = Path(manifest_path)
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"Split manifest not found: {manifest_path}")
-    with manifest_path.open("r", encoding="utf-8") as handle:
-        manifest = json.load(handle)
-    if not isinstance(manifest, dict):
-        raise TypeError(f"Invalid split manifest: {manifest_path}")
-    raw_pairs = manifest.get(split)
-    if not isinstance(raw_pairs, list) or not raw_pairs:
-        raise RuntimeError(
-            f"Manifest split '{split}' is absent or empty: {manifest_path}"
-        )
-    pairs: List[Tuple[Path, Path]] = []
-    for index, item in enumerate(raw_pairs):
-        if not isinstance(item, list) or len(item) != 2:
-            raise RuntimeError(
-                f"Invalid {split}[{index}] entry in {manifest_path}: {item!r}"
-            )
-        image_path, mask_path = Path(item[0]), Path(item[1])
-        if not image_path.is_file() or not mask_path.is_file():
-            raise FileNotFoundError(
-                f"Manifest pair does not exist: {image_path} | {mask_path}"
-            )
-        pairs.append((image_path, mask_path))
-    return pairs, manifest
 
 
 def read_rgb(path: Path) -> np.ndarray:
@@ -830,7 +688,7 @@ def parse_args() -> argparse.Namespace:
         "--dataset",
         choices=("massachusetts", "deepglobe"),
         default=None,
-        help="Auto-read checkpoint args.dataset when omitted",
+        help="Dataset to test on, read from data/<dataset>/test; default: the checkpoint's",
     )
     ap.add_argument("--weights", choices=("ema", "model"), default="ema")
     ap.add_argument(
@@ -886,19 +744,10 @@ def parse_args() -> argparse.Namespace:
         default="auto",
     )
     ap.add_argument(
-        "--subset",
-        choices=("test178", "deepglobe_test"),
-        default=None,
-        help=(
-            "Default is test178 for Massachusetts (all of test.txt) and "
-            "deepglobe_test for DeepGlobe (the whole test split)."
-        ),
-    )
-    ap.add_argument(
         "--limit",
         type=int,
         default=None,
-        help="Optional debug limit applied after subset selection",
+        help="Optional debug limit applied to the test images",
     )
     ap.add_argument("--relaxed-buffer-px", type=int, default=3)
     ap.add_argument("--out", default=None, help="Optional .npz probability/GT cache")
@@ -936,29 +785,7 @@ def parse_args() -> argparse.Namespace:
         "--data-root",
         default=None,
         help=(
-            "Auto-select the known Massachusetts/DeepGlobe Kaggle root. For "
-            "DeepGlobe, defaults to "
-            "/kaggle/input/datasets/k4nngg/datadg/datasetdg/ROAD "
-            "(images/masks resolved as <root>/eval/images, <root>/eval/masks)."
-        ),
-    )
-    ap.add_argument(
-        "--image-dir",
-        default=None,
-        help="Overrides the resolved image directory for any subset",
-    )
-    ap.add_argument(
-        "--mask-dir",
-        default=None,
-        help="Overrides the resolved mask directory for any subset",
-    )
-    ap.add_argument("--test-list", default=None)
-    ap.add_argument(
-        "--split-manifest",
-        default=None,
-        help=(
-            "split_manifest.json to reproduce an exact train.py test split; "
-            "defaults to split_manifest.json beside the checkpoint"
+            "Folder with a test/ sub-folder, used instead of data/<dataset>/"
         ),
     )
     ap.add_argument(
@@ -974,8 +801,6 @@ def main() -> None:
     if args.tta is not None:
         args.tta_mode = "flip4" if args.tta else "none"
 
-    # Resolve the dataset before selecting pairs. This small metadata load also
-    # lets a DeepGlobe checkpoint find the manifest beside itself by default.
     resolved_ckpt = resolve_checkpoint(args.ckpt)
     if args.dataset is None:
         try:
@@ -989,10 +814,6 @@ def main() -> None:
         del metadata
     if args.dataset not in {"massachusetts", "deepglobe"}:
         raise ValueError(f"Unsupported checkpoint dataset: {args.dataset}")
-    if args.subset is None:
-        args.subset = (
-            "deepglobe_test" if args.dataset == "deepglobe" else "test178"
-        )
     if not 0.0 <= args.thr <= 1.0:
         raise ValueError("--thr must be in [0, 1]")
     if args.window < 32:
@@ -1007,44 +828,10 @@ def main() -> None:
         raise ValueError("--relaxed-buffer-px cannot be negative")
     overlay_color = parse_color(args.overlay_color)
 
-    if args.dataset == "deepglobe":
-        if args.subset != "deepglobe_test":
-            raise ValueError("DeepGlobe requires --subset deepglobe_test")
-        eval_root = Path(
-            args.data_root
-            or "/kaggle/input/datasets/k4nngg/datadg/datasetdg/ROAD"
-        )
-        image_dir = (
-            Path(args.image_dir) if args.image_dir else eval_root / "eval" / "images"
-        )
-        mask_dir = (
-            Path(args.mask_dir) if args.mask_dir else eval_root / "eval" / "masks"
-        )
-        manifest_path = (
-            Path(args.split_manifest)
-            if args.split_manifest
-            else resolved_ckpt.parent / "split_manifest.json"
-        )
-        if manifest_path.is_file():
-            pairs, _manifest = pairs_from_manifest(manifest_path, "test")
-            split_source = manifest_path
-        else:
-            pairs = build_pairs(image_dir, mask_dir)
-            split_source = f"{image_dir} (entire labeled eval pool)"
-    else:
-        if args.subset != "test178":
-            raise ValueError("Massachusetts requires --subset test178")
-        root = Path(
-            args.data_root
-            or "/kaggle/input/datasets/datnguyentien204/massachu/massachusets"
-        )
-        image_dir = Path(args.image_dir) if args.image_dir else root / "images"
-        mask_dir = Path(args.mask_dir) if args.mask_dir else root / "labels"
-        test_list = Path(args.test_list) if args.test_list else root / "test.txt"
-        pairs = pairs_from_list(image_dir, mask_dir, test_list)
-        split_source = test_list
+    pairs = load_split(args.dataset, "test", args.data_root)
+    split_source = args.data_root or f"data/{args.dataset}"
     if not pairs:
-        raise RuntimeError(f"Subset {args.subset} contains no images")
+        raise RuntimeError(f"No test images found for {args.dataset}")
     if args.limit is not None:
         pairs = pairs[: args.limit]
     expected_names = [image_path.stem for image_path, _ in pairs]
@@ -1058,12 +845,12 @@ def main() -> None:
         probabilities, ground_truths, names = load_cache(cache)
         if len(probabilities) != len(pairs) or len(ground_truths) != len(pairs):
             raise RuntimeError(
-                f"Cache has {len(probabilities)} predictions but subset "
-                f"{args.subset} requires {len(pairs)}; use a new --out path"
+                f"Cache has {len(probabilities)} predictions but the test split "
+                f"has {len(pairs)} images; use a new --out path"
             )
         if names and names != expected_names:
             raise RuntimeError(
-                "Cache image order does not match the selected subset; "
+                "Cache image order does not match the test split; "
                 "use a new --out path"
             )
     else:
@@ -1084,8 +871,7 @@ def main() -> None:
         print(f"Epoch      : {epoch if epoch > 0 else 'unknown'}")
         print(f"Device     : {device}")
         print(f"Dataset    : {args.dataset}")
-        print(f"Split file : {split_source}")
-        print(f"Subset     : {args.subset}")
+        print(f"Test folder: {split_source}/test")
         print(f"Images     : {len(pairs)}")
         if args.tta_mode == "roadx3":
             inference_profile = (

@@ -44,7 +44,6 @@ events.out.tfevents.*
 # Local datasets and prepared data
 /RGB_1.0_meter/
 /CoANet_prepared_reference/
-/data/
 /datasets/
 
 # Paper build products (source remains tracked)
@@ -60,7 +59,13 @@ paper/**/*.abs
 paper/**/*.spl
 paper/main.pdf
 
-# Raw datasets and generated prediction dumps (never commit)
+# Datasets live in data/<name>/: keep the folder skeleton, ignore the images
+/data/**/*
+!/data/**/
+!/data/**/.gitkeep
+!/data/README.md
+
+# Generated prediction dumps (never commit)
 /deepglobe/datasetdg/ROAD/
 /massachusetts/
 /images/

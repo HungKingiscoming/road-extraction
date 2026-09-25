@@ -27,12 +27,11 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
+from data_paths import load_pairs
 from modeling.decoder import RoadSegClDiceLoss
 from modeling.model import DualBranchRoadNet, build_model
 
 
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
-MASK_SUFFIXES = ("_mask", "_masks", "_gt", "_label", "_labels")
 IMAGENET_MEAN = np.asarray((0.485, 0.456, 0.406), dtype=np.float32)
 IMAGENET_STD = np.asarray((0.229, 0.224, 0.225), dtype=np.float32)
 
@@ -115,197 +114,8 @@ def seed_worker(worker_id: int) -> None:
     np.random.seed(worker_seed)
 
 
-# ---------------------------------------------------------------------------
+
 # Dataset discovery, native crop, and augmentation
-# ---------------------------------------------------------------------------
-
-
-def sample_key(path: Path) -> str:
-    key = path.stem.lower()
-    for suffix in (
-        "_image",
-        "_images",
-        "_img",
-        "_sat",
-        "_mask",
-        "_masks",
-        "_gt",
-        "_label",
-        "_labels",
-    ):
-        if key.endswith(suffix):
-            return key[: -len(suffix)]
-    return key
-
-
-def index_files(folder: str | Path, role: Optional[str] = None) -> Dict[str, Path]:
-    folder = Path(folder)
-    if not folder.is_dir():
-        raise FileNotFoundError(f"Dataset directory not found: {folder}")
-    files = sorted(
-        path
-        for path in folder.rglob("*")
-        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
-    )
-    if role is not None:
-        if role not in {"image", "mask"}:
-            raise ValueError("role must be image, mask, or None")
-        files = [
-            path
-            for path in files
-            if any(path.stem.lower().endswith(s) for s in MASK_SUFFIXES)
-            == (role == "mask")
-        ]
-    if not files:
-        raise RuntimeError(f"No supported files found in {folder}")
-    indexed: Dict[str, Path] = {}
-    for path in files:
-        key = sample_key(path)
-        if key in indexed:
-            raise RuntimeError(
-                f"Duplicate sample key '{key}': {indexed[key]} and {path}"
-            )
-        indexed[key] = path
-    return indexed
-
-
-def build_pairs(image_dir: str | Path, mask_dir: str | Path) -> List[Tuple[Path, Path]]:
-    image_dir = Path(image_dir)
-    mask_dir = Path(mask_dir)
-    same_folder = image_dir.resolve() == mask_dir.resolve()
-    images = index_files(image_dir, role="image" if same_folder else None)
-    masks = index_files(mask_dir, role="mask" if same_folder else None)
-    common = sorted(images.keys() & masks.keys())
-    if len(common) != len(images) or len(common) != len(masks):
-        raise RuntimeError(
-            "Image/mask pairing mismatch: "
-            f"images={len(images)}, masks={len(masks)}, pairs={len(common)}, "
-            f"missing masks={sorted(images.keys() - masks.keys())[:5]}, "
-            f"missing images={sorted(masks.keys() - images.keys())[:5]}"
-        )
-    return [(images[key], masks[key]) for key in common]
-
-
-def pairs_from_list(
-    image_dir: str | Path,
-    mask_dir: str | Path,
-    list_path: str | Path,
-) -> List[Tuple[Path, Path]]:
-    """Resolve pairs in exactly the order given by a txt split file."""
-    image_dir = Path(image_dir)
-    mask_dir = Path(mask_dir)
-    list_path = Path(list_path)
-    if not list_path.is_file():
-        raise FileNotFoundError(f"Split txt not found: {list_path}")
-
-    images = index_files(image_dir)
-    masks = index_files(mask_dir)
-    pairs: List[Tuple[Path, Path]] = []
-    missing: List[str] = []
-    seen: set[str] = set()
-
-    with list_path.open("r", encoding="utf-8-sig") as handle:
-        for raw_line in handle:
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            first_field = line.replace(",", " ").split()[0]
-            key = sample_key(Path(first_field))
-            if key in seen:
-                continue
-            seen.add(key)
-            image_path = images.get(key)
-            mask_path = masks.get(key)
-            if image_path is None or mask_path is None:
-                missing.append(first_field)
-                continue
-            pairs.append((image_path, mask_path))
-
-    if missing:
-        raise RuntimeError(
-            f"{list_path} contains {len(missing)} unpaired samples. "
-            f"First missing entries: {missing[:10]}"
-        )
-    if not pairs:
-        raise RuntimeError(f"No image/mask pairs resolved from {list_path}")
-    return pairs
-
-
-def _first_existing_pair(
-    candidates: Sequence[Tuple[Path, Path]],
-) -> Tuple[Path, Path]:
-    for image_dir, mask_dir in candidates:
-        if image_dir.is_dir() and mask_dir.is_dir():
-            return image_dir, mask_dir
-    return candidates[0]
-
-
-def _first_labeled_pair(
-    candidates: Sequence[Tuple[Path, Path]],
-) -> Optional[Tuple[Path, Path]]:
-    """Return the first directory pair that contains matched masks.
-
-    Some DeepGlobe mirrors ship unlabeled image folders, so a directory
-    existing is not enough to call it a labeled test split.
-    """
-    for image_dir, mask_dir in candidates:
-        if not image_dir.is_dir() or not mask_dir.is_dir():
-            continue
-        try:
-            if build_pairs(image_dir, mask_dir):
-                return image_dir, mask_dir
-        except RuntimeError:
-            continue
-    return None
-
-
-def configure_dataset_paths(args: argparse.Namespace) -> None:
-    """Resolve common Kaggle layouts while keeping explicit CLI paths final."""
-    if args.dataset == "massachusetts":
-        root = Path(
-            args.data_root
-            or "/kaggle/input/datasets/datnguyentien204/massachu/massachusets"
-        )
-        args.train_image_dir = args.train_image_dir or str(root / "images")
-        args.train_mask_dir = args.train_mask_dir or str(root / "labels")
-        args.train_list = args.train_list or str(root / "train.txt")
-        args.test_list = args.test_list or str(root / "test.txt")
-        args.test_image_dir = None
-        args.test_mask_dir = None
-        return
-
-    # k4nngg/datadg source: ROAD/training/{images,masks} (fully labeled,
-    # used entirely for training) and ROAD/eval/{images,masks} (fully
-    # labeled, used entirely as the test split).
-    root = Path(
-        args.data_root
-        or "/kaggle/input/datasets/k4nngg/datadg/datasetdg/ROAD"
-    )
-    train_images, train_masks = _first_existing_pair(
-        (
-            (root / "training" / "images", root / "training" / "masks"),
-            # Fallbacks for the older balraj98 DeepGlobe layout.
-            (root / "train" / "images", root / "train" / "gt"),
-            (root / "train" / "images", root / "train" / "masks"),
-            (root / "images", root / "gt"),
-            (root / "train", root / "train"),
-            (root, root),
-        )
-    )
-    args.train_image_dir = args.train_image_dir or str(train_images)
-    args.train_mask_dir = args.train_mask_dir or str(train_masks)
-    if args.test_image_dir is None and args.test_mask_dir is None:
-        labeled_test = _first_labeled_pair(
-            (
-                (root / "eval" / "images", root / "eval" / "masks"),
-                (root / "test" / "images", root / "test" / "masks"),
-                (root / "test" / "images", root / "test" / "gt"),
-            )
-        )
-        if labeled_test is not None:
-            test_images, test_masks = labeled_test
-            args.test_image_dir = str(test_images)
-            args.test_mask_dir = str(test_masks)
 
 
 def read_rgb(path: Path) -> np.ndarray:
@@ -587,94 +397,11 @@ class RoadCropDataset(Dataset):
 def resolve_splits(
     args: argparse.Namespace,
 ) -> Tuple[List[Tuple[Path, Path]], List[Tuple[Path, Path]]]:
-    """Return (train_pairs, test_pairs)."""
-    if args.dataset == "massachusetts":
-        train_pairs = pairs_from_list(
-            args.train_image_dir, args.train_mask_dir, args.train_list
-        )
-        test_pairs = pairs_from_list(
-            args.train_image_dir, args.train_mask_dir, args.test_list
-        )
-        train_keys = {sample_key(image) for image, _ in train_pairs}
-        test_keys = {sample_key(image) for image, _ in test_pairs}
-        overlap = train_keys & test_keys
-        if overlap:
-            raise RuntimeError(
-                f"train.txt and test.txt overlap on {len(overlap)} samples; "
-                f"examples={sorted(overlap)[:10]}"
-            )
-        rank_zero_print(
-            f"TXT split: train={len(train_pairs)}, test={len(test_pairs)}"
-        )
-        return train_pairs, test_pairs
-
-    all_pairs = build_pairs(args.train_image_dir, args.train_mask_dir)
-    if args.test_image_dir and args.test_mask_dir:
-        test_images, test_masks = Path(args.test_image_dir), Path(args.test_mask_dir)
-        if test_images.is_dir() and test_masks.is_dir():
-            try:
-                test_pairs = build_pairs(test_images, test_masks)
-            except RuntimeError:
-                if args.dataset != "deepglobe":
-                    raise
-                rank_zero_print(
-                    "DeepGlobe test directory has no matched masks; "
-                    "using a labeled deterministic holdout from train instead."
-                )
-            else:
-                rank_zero_print(
-                    f"Provided split: train={len(all_pairs)}, "
-                    f"test={len(test_pairs)}"
-                )
-                return all_pairs, test_pairs
-
-    generator = np.random.default_rng(args.split_seed)
-    indices = generator.permutation(len(all_pairs))
-
-    if args.dataset == "deepglobe":
-        train_count = int(args.deepglobe_train_count)
-        total_count = len(all_pairs)
-        if train_count <= 0 or train_count >= total_count:
-            raise ValueError(
-                f"deepglobe_train_count must be in [1, {total_count - 1}], "
-                f"got {train_count}"
-            )
-
-        # Single-pool fallback, used only when no separate labeled test
-        # directory is found (see configure_dataset_paths): randomly choose
-        # exactly deepglobe_train_count samples for training; the remaining
-        # samples form the full test holdout.
-        train_pairs = [all_pairs[int(i)] for i in indices[:train_count]]
-        test_pairs = [all_pairs[int(i)] for i in indices[train_count:]]
-
-        train_keys = {sample_key(image) for image, _ in train_pairs}
-        test_keys = {sample_key(image) for image, _ in test_pairs}
-        if train_keys & test_keys:
-            raise RuntimeError("DeepGlobe train/test overlap detected unexpectedly")
-
-        rank_zero_print(
-            "DeepGlobe single-pool random-split protocol (no labeled test "
-            f"dir found): train={len(train_pairs)}, test={len(test_pairs)}, "
-            f"seed={args.split_seed}"
-        )
-        return train_pairs, test_pairs
-
-    test_count = (
-        max(1, round(len(all_pairs) * args.test_ratio))
-        if args.test_ratio > 0.0
-        else 0
-    )
-    test_indices = set(indices[:test_count].tolist())
-    train_pairs = [
-        pair for index, pair in enumerate(all_pairs) if index not in test_indices
-    ]
-    test_pairs = [
-        pair for index, pair in enumerate(all_pairs) if index in test_indices
-    ]
+    """Return (train_pairs, test_pairs) from data/<dataset>/{train,test}."""
+    train_pairs, test_pairs = load_pairs(args.dataset, args.data_root)
     rank_zero_print(
-        "Deterministic labeled split: "
-        f"train={len(train_pairs)}, test={len(test_pairs)}, "
-        f"seed={args.split_seed}"
+        f"Dataset {args.dataset}: train={len(train_pairs)}, "
+        f"test={len(test_pairs)} image/label pairs"
     )
     return train_pairs, test_pairs
 
@@ -1221,35 +948,17 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument(
-        "--dataset", choices=("deepglobe", "massachusetts"), required=True
+        "--dataset",
+        choices=("deepglobe", "massachusetts"),
+        required=True,
+        help="Which dataset to use; it is read from data/<dataset>/{train,test}",
     )
-    parser.add_argument("--data_root", default=None)
-    parser.add_argument("--train_image_dir", default=None)
-    parser.add_argument("--train_mask_dir", default=None)
-    parser.add_argument("--train_list", default=None)
-    parser.add_argument("--test_list", default=None)
     parser.add_argument(
-        "--test_image_dir",
+        "--data_root",
         default=None,
-        help="Labeled test images (DeepGlobe: auto-detected ROAD/eval/images)",
-    )
-    parser.add_argument("--test_mask_dir", default=None)
-    parser.add_argument(
-        "--test_ratio",
-        type=float,
-        default=0.10,
-        help="Fraction held out as the test split when no explicit test split exists",
-    )
-    parser.add_argument("--split_seed", type=int, default=3407)
-    parser.add_argument(
-        "--deepglobe_train_count",
-        type=int,
-        default=5000,
         help=(
-            "Single-pool fallback (only used when no labeled test "
-            "directory is found): randomly select exactly this many "
-            "labeled pairs for training; the remaining pairs form the "
-            "test split."
+            "Folder with train/ and test/ sub-folders, used instead of "
+            "data/<dataset>/"
         ),
     )
 
@@ -1475,15 +1184,8 @@ def check_args(args: argparse.Namespace) -> None:
         raise ValueError("crop_size must be >=64 and divisible by 16")
     if args.batch_size < 1 or args.accumulation_steps < 1:
         raise ValueError("batch_size and accumulation_steps must be positive")
-    if args.dataset == "massachusetts":
-        if not args.train_list or not args.test_list:
-            raise ValueError("Massachusetts requires --train_list and --test_list")
     if args.fixed_road_weight is not None and args.fixed_road_weight <= 0.0:
         raise ValueError("fixed_road_weight must be positive")
-    if not 0.0 <= args.test_ratio < 1.0:
-        raise ValueError("test_ratio must be in [0, 1)")
-    if args.deepglobe_train_count < 1:
-        raise ValueError("deepglobe_train_count must be positive")
     if args.resume and args.pretrained_checkpoint:
         raise ValueError("Use either --resume or --pretrained_checkpoint, not both")
     if not args.dappm_pool_sizes or min(args.dappm_pool_sizes) < 1:
@@ -1533,10 +1235,8 @@ def save_split_manifest(
     save_dir: Path,
     train_pairs: Sequence[Tuple[Path, Path]],
     test_pairs: Sequence[Tuple[Path, Path]],
-    split_seed: int,
 ) -> None:
     manifest = {
-        "split_seed": int(split_seed),
         "counts": {
             "train": len(train_pairs),
             "test": len(test_pairs),
@@ -1605,7 +1305,6 @@ def main() -> None:
             )
         else:
             args.progressive_unfreeze = args.pretrained_checkpoint is not None
-    configure_dataset_paths(args)
     check_args(args)
     rank_zero_print(
         f"[startup 1/5] DDP initialized: world_size={world_size}, device={device}"
@@ -1635,7 +1334,6 @@ def main() -> None:
             save_dir,
             train_pairs,
             test_pairs,
-            args.split_seed,
         )
     if args.fixed_road_weight is None:
         rank_zero_print(
@@ -1760,13 +1458,6 @@ def main() -> None:
             f"{args.crop_size}x{args.crop_size}; native-resolution "
             "inference still runs unresized -- this is "
             "a real train/inference scale mismatch, not a bug."
-        )
-    if args.dataset == "deepglobe":
-        rank_zero_print(
-            f"deepglobe data source: train_dir={args.train_image_dir} | "
-            f"test_dir={args.test_image_dir} "
-            "(if no labeled test dir was found, falls back to the "
-            f"single-pool protocol with train_count={args.deepglobe_train_count})"
         )
     rank_zero_print(
         f"shared ResNet34 to S8 | detail={args.detail_channels}ch S8 | "
