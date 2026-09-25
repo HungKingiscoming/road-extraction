@@ -32,11 +32,9 @@ road-extraction
 
 The folders `train` and `test` work as well. Inside them, images and labels can be in one folder or in sub-folders such as `images/` and `masks/`. They are paired by file name (without extension); a file is a label if its name ends with `_mask`, `_gt` or `_label`, or it is inside a folder named `labels`, `masks` or `gt`. Files without a partner are ignored.
 
-To read a dataset from another place (for example a Kaggle input), pass its folder with `--data_root`:
+To read a dataset from another place, pass its folder with `--data_root` (`--data-root` for `test_native.py`):
 ```shell
-python train.py --dataset massachusetts --data_root /kaggle/input/datasets/k4nngg/massa-road/datasetmassa/ROAD --save_dir ./checkpoints/mass
-python train.py --dataset deepglobe --data_root /kaggle/input/datasets/k4nngg/datadg/datasetdg/ROAD --save_dir ./checkpoints/dg
-python test_native.py --ckpt ./checkpoints/dg/last.pt --dataset deepglobe --data-root /kaggle/input/datasets/k4nngg/datadg/datasetdg/ROAD
+python train.py --dataset massachusetts --data_root /path/to/massachusetts
 ```
 
 ## Training
