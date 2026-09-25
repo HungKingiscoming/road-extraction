@@ -1,4 +1,4 @@
-"""Trainer-matched Massachusetts/DeepGlobe evaluation with TTA and WeavingUnet-compatible metrics.
+"""Trainer-matched Massachusetts/DeepGlobe evaluation with TTA.
 
 The default inference path is native resolution with ImageNet normalization,
 reflect padding, a 1024 window with 256 overlap (stride 768), and Hann-weighted
@@ -17,8 +17,9 @@ from __future__ import annotations
 
 import argparse
 import math
+import re
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image
@@ -27,12 +28,93 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from data_paths import load_split, sample_key
 from modeling.model import build_model
 
 
 IMAGENET_MEAN = np.asarray((0.485, 0.456, 0.406), dtype=np.float32)
 IMAGENET_STD = np.asarray((0.229, 0.224, 0.225), dtype=np.float32)
+
+
+# Dataset folders: data/<dataset>/{train,test} (or training/eval). Inside a
+# folder, files are classified as image or label and paired by file name.
+DATA_DIR = Path(__file__).resolve().parent / "data"
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+MASK_SUFFIXES = ("_mask", "_masks", "_gt", "_label", "_labels")
+MASK_DIR_WORDS = {
+    "label", "labels", "mask", "masks", "gt", "groundtruth",
+    "annotation", "annotations",
+}
+SPLIT_DIRS = {"train": ("train", "training"), "test": ("test", "eval")}
+
+Pair = Tuple[Path, Path]
+
+
+def sample_key(path: Path) -> str:
+    key = path.stem.lower()
+    for suffix in (
+        "_image", "_images", "_img", "_sat",
+        "_mask", "_masks", "_gt", "_label", "_labels",
+    ):
+        if key.endswith(suffix):
+            return key[: -len(suffix)]
+    return key
+
+
+def is_mask_file(path: Path, folder: Path) -> bool:
+    if any(path.stem.lower().endswith(s) for s in MASK_SUFFIXES):
+        return True
+    for part in path.relative_to(folder).parts[:-1]:
+        if MASK_DIR_WORDS & set(re.split(r"[^a-z0-9]+", part.lower())):
+            return True
+    return False
+
+
+def collect_pairs(folder: Path) -> List[Pair]:
+    """Find every image and label under ``folder`` and pair them by name."""
+    if not folder.is_dir():
+        raise FileNotFoundError(
+            f"Dataset folder not found: {folder}. Create it and put the "
+            "images and their labels inside (see README.md)."
+        )
+    images: Dict[str, Path] = {}
+    masks: Dict[str, Path] = {}
+    for path in sorted(folder.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in IMAGE_EXTENSIONS:
+            continue
+        target = masks if is_mask_file(path, folder) else images
+        target.setdefault(sample_key(path), path)
+    common = sorted(images.keys() & masks.keys())
+    if not common:
+        raise RuntimeError(
+            f"No image/label pairs found in {folder} ({len(images)} images, "
+            f"{len(masks)} labels). Put the images and their labels in that "
+            "folder (see README.md)."
+        )
+    unmatched = (images.keys() | masks.keys()) - set(common)
+    if unmatched:
+        print(
+            f"[data] {folder}: {len(common)} image/label pairs, ignored "
+            f"{len(unmatched)} files without a partner "
+            f"(e.g. {sorted(unmatched)[:3]})"
+        )
+    return [(images[key], masks[key]) for key in common]
+
+
+def load_split(
+    dataset: str, split: str, data_root: Optional[str | Path] = None
+) -> List[Pair]:
+    """Image/label pairs of ``split`` ("train" or "test") for ``dataset``."""
+    if split not in SPLIT_DIRS:
+        raise ValueError(f"split must be one of {tuple(SPLIT_DIRS)}, got {split!r}")
+    root = Path(data_root).expanduser() if data_root else DATA_DIR / dataset
+    for name in SPLIT_DIRS[split]:
+        if (root / name).is_dir():
+            return collect_pairs(root / name)
+    raise FileNotFoundError(
+        f"No {split} folder in {root}: create {root / SPLIT_DIRS[split][0]} "
+        f"(or {root / SPLIT_DIRS[split][1]}) and put the images and their "
+        "labels inside (see README.md)."
+    )
 
 
 def read_rgb(path: Path) -> np.ndarray:
@@ -491,49 +573,14 @@ def metrics_from_counts(tp: int, fp: int, fn: int, tn: int) -> Dict[str, float]:
     }
 
 
-def relaxed_components(
-    pred: np.ndarray,
-    gt: np.ndarray,
-    buffer_px: int,
-) -> Tuple[int, int, int, int]:
-    pred_t = torch.from_numpy(pred.astype(np.float32))[None, None]
-    gt_t = torch.from_numpy(gt.astype(np.float32))[None, None]
-    kernel = 2 * buffer_px + 1
-    pred_dilated = F.max_pool2d(
-        pred_t, kernel, stride=1, padding=buffer_px
-    ) > 0
-    gt_dilated = F.max_pool2d(
-        gt_t, kernel, stride=1, padding=buffer_px
-    ) > 0
-    pred_b = pred_t.bool()
-    gt_b = gt_t.bool()
-    return (
-        int((pred_b & gt_dilated).sum()),
-        int((gt_b & pred_dilated).sum()),
-        int(pred_b.sum()),
-        int(gt_b.sum()),
-    )
-
-
 def score_maps(
     probabilities: Sequence[np.ndarray],
     ground_truths: Sequence[np.ndarray],
     threshold: float,
-    relaxed_buffer_px: int,
-) -> Tuple[Dict[str, float], Dict[str, float], float, float]:
-    """Score predictions using both pooled and WeavingUnet-style aggregation.
+) -> Dict[str, float]:
+    """Precision, recall, F1 and accuracy averaged over images, plus road IoU.
 
-    POOLED metrics are computed from one global confusion matrix over all pixels.
-
-    WEAVING-STYLE follows the public WeavingUnet evaluation code for BOTH
-    Massachusetts and DeepGlobe (their eval scripts use the same aggregation):
-      * Precision  = mean(per-image precision)
-      * Recall     = mean(per-image recall)
-      * F1         = mean(per-image F1)
-      * Accuracy   = mean(per-image accuracy)
-      * IoU        = global/pooled road IoU
-
-    Mean-image IoU and relaxed F1 are retained as additional diagnostics.
+    IoU comes from one confusion matrix accumulated over the whole test split.
     """
     if len(probabilities) != len(ground_truths):
         raise ValueError("probabilities and ground_truths must have equal length")
@@ -541,58 +588,20 @@ def score_maps(
         raise ValueError("No predictions to score")
 
     pooled = [0, 0, 0, 0]
-    per_image_precision: List[float] = []
-    per_image_recall: List[float] = []
-    per_image_f1: List[float] = []
-    per_image_iou: List[float] = []
-    per_image_accuracy: List[float] = []
-    relaxed = [0, 0, 0, 0]
+    per_image = {"precision": [], "recall": [], "f1": [], "accuracy": []}
 
     for probability, gt in zip(probabilities, ground_truths):
-        pred = probability >= threshold
-        tp, fp, fn, tn = counts(pred, gt)
-
-        # Global confusion counts used for pooled metrics and WeavingUnet road IoU.
+        tp, fp, fn, tn = counts(probability >= threshold, gt)
         for i, value in enumerate((tp, fp, fn, tn)):
             pooled[i] += value
-
-        # Per-image metrics, averaged later to reproduce WeavingUnet's P/R/F1/Acc.
         m = metrics_from_counts(tp, fp, fn, tn)
-        per_image_precision.append(m["precision"])
-        per_image_recall.append(m["recall"])
-        per_image_f1.append(m["f1"])
-        per_image_iou.append(m["iou"])
-        per_image_accuracy.append(m["accuracy"])
+        for name, values in per_image.items():
+            values.append(m[name])
 
-        components = relaxed_components(pred, gt, relaxed_buffer_px)
-        for i, value in enumerate(components):
-            relaxed[i] += value
-
-    pooled_metrics = metrics_from_counts(*pooled)
-
-    weaving_metrics = {
-        "precision": float(np.mean(per_image_precision)),
-        "recall": float(np.mean(per_image_recall)),
-        "f1": float(np.mean(per_image_f1)),
-        # Their IOUMetric first accumulates the dataset confusion histogram,
-        # therefore road IoU corresponds to our pooled/global road IoU.
-        "iou": float(pooled_metrics["iou"]),
-        "accuracy": float(np.mean(per_image_accuracy)),
+    return {
+        **{name: float(np.mean(values)) for name, values in per_image.items()},
+        "iou": metrics_from_counts(*pooled)["iou"],
     }
-
-    relaxed_precision = relaxed[0] / max(relaxed[2], 1)
-    relaxed_recall = relaxed[1] / max(relaxed[3], 1)
-    relaxed_f1 = (
-        2.0 * relaxed_precision * relaxed_recall
-        / max(relaxed_precision + relaxed_recall, 1e-12)
-    )
-
-    return (
-        pooled_metrics,
-        weaving_metrics,
-        float(np.mean(per_image_iou)),
-        float(relaxed_f1),
-    )
 
 
 def parse_color(text: str) -> Tuple[int, int, int]:
@@ -749,7 +758,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional debug limit applied to the test images",
     )
-    ap.add_argument("--relaxed-buffer-px", type=int, default=3)
     ap.add_argument("--out", default=None, help="Optional .npz probability/GT cache")
     ap.add_argument(
         "--save-preds",
@@ -824,8 +832,6 @@ def main() -> None:
         raise ValueError("--tile-batch-size must be >= 1")
     if args.limit is not None and args.limit < 1:
         raise ValueError("--limit must be >= 1")
-    if args.relaxed_buffer_px < 0:
-        raise ValueError("--relaxed-buffer-px cannot be negative")
     overlay_color = parse_color(args.overlay_color)
 
     pairs = load_split(args.dataset, "test", args.data_root)
@@ -940,42 +946,15 @@ def main() -> None:
         )
         print(f"Saved {len(pairs)} prediction image pairs to {save_dir}")
 
-    pooled, weaving, mean_iou, relaxed_f1 = score_maps(
-        probabilities,
-        ground_truths,
-        args.thr,
-        args.relaxed_buffer_px,
-    )
+    metrics = score_maps(probabilities, ground_truths, args.thr)
     print("=" * 72)
-    print(f"THRESHOLD {args.thr:.3f}")
     print(
-        f"METRIC PROTOCOL : WeavingUnet-compatible for {args.dataset} "
-        "(mean-image P/R/F1/Acc + pooled/global road IoU)"
+        f"P={metrics['precision']:.4f} "
+        f"R={metrics['recall']:.4f} "
+        f"F1={metrics['f1']:.4f} "
+        f"IoU={metrics['iou']:.4f} "
+        f"Acc={metrics['accuracy']:.4f}"
     )
-    print(
-        f"POOLED       P={pooled['precision']:.4f} "
-        f"R={pooled['recall']:.4f} "
-        f"F1={pooled['f1']:.4f} "
-        f"IoU={pooled['iou']:.4f} "
-        f"BG-IoU={pooled['background_iou']:.4f} "
-        f"mIoU={pooled['miou']:.4f} "
-        f"Acc={pooled['accuracy']:.4f}"
-    )
-    print(
-        f"WEAVING-STYLE P={weaving['precision']:.4f} "
-        f"R={weaving['recall']:.4f} "
-        f"F1={weaving['f1']:.4f} "
-        f"IoU={weaving['iou']:.4f} "
-        f"Acc={weaving['accuracy']:.4f}"
-    )
-    print(
-        f"MEAN-IMG     F1={weaving['f1']:.4f} "
-        f"IoU={mean_iou:.4f}"
-    )
-    print(
-        f"RELAXED ±{args.relaxed_buffer_px}px F1={relaxed_f1:.4f}"
-    )
-
     print("=" * 72)
 
 

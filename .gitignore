@@ -59,11 +59,8 @@ paper/**/*.abs
 paper/**/*.spl
 paper/main.pdf
 
-# Datasets live in data/<name>/: keep the folder skeleton, ignore the images
-/data/**/*
-!/data/**/
-!/data/**/.gitkeep
-!/data/README.md
+# Datasets live in data/<name>/{train,test} and are never committed
+/data/
 
 # Generated prediction dumps (never commit)
 /deepglobe/datasetdg/ROAD/

@@ -6,6 +6,7 @@ import json
 import math
 import os
 import random
+import re
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
@@ -27,7 +28,6 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
-from data_paths import load_pairs
 from modeling.decoder import RoadSegClDiceLoss
 from modeling.model import DualBranchRoadNet, build_model
 
@@ -116,6 +116,103 @@ def seed_worker(worker_id: int) -> None:
 
 
 # Dataset discovery, native crop, and augmentation
+
+
+# Dataset folders: data/<dataset>/{train,test} (or training/eval). Inside a
+# folder, files are classified as image or label and paired by file name.
+DATA_DIR = Path(__file__).resolve().parent / "data"
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+MASK_SUFFIXES = ("_mask", "_masks", "_gt", "_label", "_labels")
+MASK_DIR_WORDS = {
+    "label", "labels", "mask", "masks", "gt", "groundtruth",
+    "annotation", "annotations",
+}
+SPLIT_DIRS = {"train": ("train", "training"), "test": ("test", "eval")}
+
+Pair = Tuple[Path, Path]
+
+
+def sample_key(path: Path) -> str:
+    key = path.stem.lower()
+    for suffix in (
+        "_image", "_images", "_img", "_sat",
+        "_mask", "_masks", "_gt", "_label", "_labels",
+    ):
+        if key.endswith(suffix):
+            return key[: -len(suffix)]
+    return key
+
+
+def is_mask_file(path: Path, folder: Path) -> bool:
+    if any(path.stem.lower().endswith(s) for s in MASK_SUFFIXES):
+        return True
+    for part in path.relative_to(folder).parts[:-1]:
+        if MASK_DIR_WORDS & set(re.split(r"[^a-z0-9]+", part.lower())):
+            return True
+    return False
+
+
+def collect_pairs(folder: Path) -> List[Pair]:
+    """Find every image and label under ``folder`` and pair them by name."""
+    if not folder.is_dir():
+        raise FileNotFoundError(
+            f"Dataset folder not found: {folder}. Create it and put the "
+            "images and their labels inside (see README.md)."
+        )
+    images: Dict[str, Path] = {}
+    masks: Dict[str, Path] = {}
+    for path in sorted(folder.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in IMAGE_EXTENSIONS:
+            continue
+        target = masks if is_mask_file(path, folder) else images
+        target.setdefault(sample_key(path), path)
+    common = sorted(images.keys() & masks.keys())
+    if not common:
+        raise RuntimeError(
+            f"No image/label pairs found in {folder} ({len(images)} images, "
+            f"{len(masks)} labels). Put the images and their labels in that "
+            "folder (see README.md)."
+        )
+    unmatched = (images.keys() | masks.keys()) - set(common)
+    if unmatched:
+        print(
+            f"[data] {folder}: {len(common)} image/label pairs, ignored "
+            f"{len(unmatched)} files without a partner "
+            f"(e.g. {sorted(unmatched)[:3]})"
+        )
+    return [(images[key], masks[key]) for key in common]
+
+
+def load_split(
+    dataset: str, split: str, data_root: Optional[str | Path] = None
+) -> List[Pair]:
+    """Image/label pairs of ``split`` ("train" or "test") for ``dataset``."""
+    if split not in SPLIT_DIRS:
+        raise ValueError(f"split must be one of {tuple(SPLIT_DIRS)}, got {split!r}")
+    root = Path(data_root).expanduser() if data_root else DATA_DIR / dataset
+    for name in SPLIT_DIRS[split]:
+        if (root / name).is_dir():
+            return collect_pairs(root / name)
+    raise FileNotFoundError(
+        f"No {split} folder in {root}: create {root / SPLIT_DIRS[split][0]} "
+        f"(or {root / SPLIT_DIRS[split][1]}) and put the images and their "
+        "labels inside (see README.md)."
+    )
+
+
+def load_pairs(
+    dataset: str, data_root: Optional[str | Path] = None
+) -> Tuple[List[Pair], List[Pair]]:
+    """(train_pairs, test_pairs) for ``dataset``, checked to be disjoint."""
+    train = load_split(dataset, "train", data_root)
+    test = load_split(dataset, "test", data_root)
+    overlap = {sample_key(i) for i, _ in train} & {sample_key(i) for i, _ in test}
+    if overlap:
+        raise RuntimeError(
+            f"train/ and test/ share {len(overlap)} samples; "
+            f"examples={sorted(overlap)[:10]}"
+        )
+    return train, test
 
 
 def read_rgb(path: Path) -> np.ndarray:
