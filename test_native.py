@@ -6,8 +6,8 @@ LOGIT blending. Optional flip4 or D4 TTA applies this complete path to each
 transformed full image and inverse-transforms the complete blended map. TTA
 views can be merged as probabilities (recommended) or logits.
 
-There is no validation split: the decision threshold is fixed (--thr, default
-0.66) and the whole test split is evaluated.
+There is no validation split: the decision threshold is fixed (--thr; default 0.72
+for massachusetts, 0.66 for deepglobe) and the whole test split is evaluated.
 
 Test images: --dataset picks massachusetts or deepglobe (default: the one the
 checkpoint was trained on) and the images are read from data/<dataset>/test
@@ -31,6 +31,7 @@ from torch import Tensor
 from modeling.model import build_model
 
 
+DEFAULT_THRESHOLDS = {"massachusetts": 0.72, "deepglobe": 0.66}
 IMAGENET_MEAN = np.asarray((0.485, 0.456, 0.406), dtype=np.float32)
 IMAGENET_STD = np.asarray((0.229, 0.224, 0.225), dtype=np.float32)
 
@@ -709,7 +710,12 @@ def parse_args() -> argparse.Namespace:
             "convolutions after loading the checkpoint"
         ),
     )
-    ap.add_argument("--thr", type=float, default=0.66)
+    ap.add_argument(
+        "--thr",
+        type=float,
+        default=None,
+        help="Decision threshold; default: 0.72 for massachusetts, 0.66 for deepglobe",
+    )
     ap.add_argument(
         "--thr-sweep",
         type=float,
@@ -834,6 +840,8 @@ def main() -> None:
         del metadata
     if args.dataset not in {"massachusetts", "deepglobe"}:
         raise ValueError(f"Unsupported checkpoint dataset: {args.dataset}")
+    if args.thr is None:
+        args.thr = DEFAULT_THRESHOLDS[args.dataset]
     if not 0.0 <= args.thr <= 1.0:
         raise ValueError("--thr must be in [0, 1]")
     if any(not 0.0 <= thr <= 1.0 for thr in args.thr_sweep or []):
