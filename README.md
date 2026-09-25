@@ -58,3 +58,8 @@ python train.py --dataset massachusetts --resume ./checkpoints/mass/last.pt
 python test_native.py --ckpt ./checkpoints/mass/last.pt --dataset massachusetts
 python test_native.py --ckpt ./checkpoints/dg/last.pt --dataset deepglobe
 ```
+
+Test-time augmentation (`none` | `roadx3` | `flip4` | `d4`):
+```shell
+python test_native.py --ckpt ./checkpoints/mass/last.pt --dataset massachusetts --tta-mode flip4
+```
